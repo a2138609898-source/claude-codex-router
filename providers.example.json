@@ -1,0 +1,87 @@
+{
+  "version": 1,
+  "updated_at": "1970-01-01T00:00:00Z",
+  "providers": [
+    {
+      "id": "primary",
+      "name": "Primary Relay",
+      "base_url": "https://relay-a.example.com",
+      "prefix": "",
+      "is_default": true,
+      "enabled": true,
+      "allow_failover": false,
+      "protected": false,
+      "protocols": ["messages"],
+      "workspace": "claude",
+      "auth_type": "dpapi",
+      "auth_header": "Authorization",
+      "auth_prefix": "Bearer ",
+      "secret_file": "primary-api-key.dpapi",
+      "entropy": "ExampleApp.Primary.v1",
+      "extra_headers": {},
+      "messages_path": "/v1/messages",
+      "models_path": "/v1/models",
+      "responses_path": "/responses",
+      "timeout_seconds": 120,
+      "models": [
+        {
+          "id": "claude-opus-5",
+          "enabled": true,
+          "publish_as": "",
+          "display_name": "Opus 5",
+          "description": "默认供应商的 prefix 必须为空，所以这个模型的可选 slug 就是裸的 claude-opus-5。Claude Desktop 的连通性探测会挑最短的那个 opus slug，也就是这一条。",
+          "last_test_status": "untested",
+          "fast_tier_status": "unknown",
+          "fast_tier_effect": "untested",
+          "fast_tier_forced": false
+        }
+      ]
+    },
+    {
+      "id": "alt_relay",
+      "name": "Alternate Relay",
+      "base_url": "https://relay-b.example.com",
+      "prefix": "alt-relay.anthropic.",
+      "is_default": false,
+      "enabled": true,
+      "allow_failover": false,
+      "protected": false,
+      "protocols": ["messages"],
+      "workspace": "claude",
+      "auth_type": "dpapi",
+      "auth_header": "Authorization",
+      "auth_prefix": "Bearer ",
+      "secret_file": "alt-relay-api-key.dpapi",
+      "entropy": "ExampleApp.AltRelay.v1",
+      "extra_headers": {},
+      "messages_path": "/v1/messages",
+      "models_path": "/v1/models",
+      "responses_path": "/responses",
+      "timeout_seconds": 120,
+      "models": [
+        {
+          "id": "claude-opus-5-thinking",
+          "enabled": true,
+          "publish_as": "alt-relay.anthropic.claude-opus-5",
+          "display_name": "Opus 5 (thinking)",
+          "description": "publish_as 的典型用途：上游真实模型名叫 claude-opus-5-thinking，而这个名字规范化之后仍是它自己、不在 Claude Desktop 的能力表里，思考档滑杆就出不来。改名成 alt-relay.anthropic.claude-opus-5 之后规范化能落到 claude-opus-5，滑杆回来了，发给上游的仍然是 id 里那个原名。",
+          "last_test_status": "untested",
+          "fast_tier_status": "unknown",
+          "fast_tier_effect": "untested",
+          "fast_tier_forced": false
+        },
+        {
+          "id": "claude-sonnet-5",
+          "enabled": false,
+          "publish_as": "",
+          "display_name": "Sonnet 5",
+          "description": "enabled=false 的模型不会进入可选 slug，也不参与唯一性检查。",
+          "last_test_status": "untested",
+          "fast_tier_status": "unknown",
+          "fast_tier_effect": "untested",
+          "fast_tier_forced": false
+        }
+      ]
+    }
+  ]
+}

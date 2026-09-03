@@ -1,0 +1,6 @@
+# 统一行尾，避免 Windows / 类 Unix 之间来回抖动。
+* text=auto
+
+# 二进制资源不要做任何转换。
+*.png binary
+*.ico binary
