@@ -1306,6 +1306,96 @@ class RegistryRecoveryRegressionTests(unittest.TestCase):
             stop.assert_called_once_with(workspace)
             restart.assert_not_called()
 
+    def protected_workspace(self, temporary: str, port: int = 19995):
+        """A workspace whose single default provider is protected, written to disk."""
+        root = Path(temporary)
+        workspace = registry.Workspace(
+            name="test",
+            label="test",
+            root=root,
+            router_starter=root / "starter.ps1",
+            router_port=port,
+            protocol="responses",
+        )
+        provider = provider_config(
+            "borrowed_login", "https://example.invalid/v1", prefix="", is_default=True
+        )
+        provider.update({"workspace": "test", "protected": True, "auth_type": "codex_auth"})
+        write_registry(workspace.registry_path, [provider])
+        return workspace, provider
+
+    def test_a_protected_provider_accepts_model_edits_but_pins_its_identity(self) -> None:
+        """Refusing every write to a protected provider left its model list unreachable.
+
+        `protected` exists so the codex_auth entry's borrowed identity -- the Codex App's own
+        login, base URL and model prefix -- cannot be rewritten from the manager.  But the guard
+        was a blanket refusal, and on the Codex side the protected entry is also the *default*
+        provider, so the models a user most needs to switch on were the ones they could never
+        touch: the editor was fully disabled and save_provider rejected the write anyway.  Now the
+        identity fields are pinned back to whatever is on disk and everything else goes through.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace, on_disk = self.protected_workspace(temporary)
+            candidate = deepcopy(on_disk)
+            candidate["models"] = [
+                {"id": "shared-model", "enabled": True},
+                {"id": "newly-discovered", "enabled": True},
+            ]
+            candidate["name"] = "Renamed"
+            candidate["timeout_seconds"] = 42
+            # Every one of these is an identity field and must not survive the write.
+            candidate["base_url"] = "https://hijacked.invalid/v1"
+            candidate["auth_header"] = "X-Hijack"
+            candidate["auth_prefix"] = "Token "
+            candidate["models_path"] = "/hijacked-models"
+            candidate["responses_path"] = "/hijacked-responses"
+            candidate["messages_path"] = "/hijacked-messages"
+            candidate["protocols"] = ["responses", "messages"]
+
+            # The catalog rebuild wants a source template this fixture has no reason to carry; what
+            # is under test is which fields reach providers.json.
+            with mock.patch.dict(registry.WORKSPACES, {"test": workspace}, clear=False), \
+                mock.patch.object(
+                    registry, "rebuild_catalog", return_value={"status": "ok"}
+                ):
+                result = registry.apply_provider(
+                    candidate, api_key=None, workspace=workspace, restart=False
+                )
+
+            self.assertEqual(result["status"], "ready")
+            saved = json.loads(workspace.registry_path.read_text(encoding="utf-8"))
+            written = saved["providers"][0]
+            self.assertEqual(
+                [model["id"] for model in written["models"]],
+                ["shared-model", "newly-discovered"],
+            )
+            self.assertEqual(written["name"], "Renamed")
+            self.assertEqual(written["timeout_seconds"], 42)
+            self.assertTrue(written["protected"])
+            for key in registry.PROTECTED_PINNED_PROVIDER_KEYS:
+                with self.subTest(pinned=key):
+                    self.assertEqual(written[key], on_disk[key])
+
+    def test_a_protected_provider_still_cannot_be_deleted(self) -> None:
+        """Editing one is now allowed; removing one is still not.
+
+        The entry is recreated from the Codex App's own login, so a delete is never what someone
+        means by it -- and unlike a field edit there is nothing to pin it back to.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace, _on_disk = self.protected_workspace(temporary, port=19994)
+            before = workspace.registry_path.read_text(encoding="utf-8")
+
+            with mock.patch.dict(registry.WORKSPACES, {"test": workspace}, clear=False), \
+                mock.patch.object(registry, "stop_router") as stop, \
+                mock.patch.object(registry, "restart_router") as restart:
+                with self.assertRaises(ValueError):
+                    registry.delete_provider("borrowed_login", workspace)
+
+            self.assertEqual(workspace.registry_path.read_text(encoding="utf-8"), before)
+            stop.assert_not_called()
+            restart.assert_not_called()
+
 
 class Variable:
     def __init__(self, value: object = ""):
@@ -1552,6 +1642,162 @@ class ManagerRegressionTests(unittest.TestCase):
             # Probe bookkeeping is written by this app between load and save; counting it as
             # someone else's edit would put a warning in front of every ordinary save.
             self.assertNotIn("模型清单", drifted)
+
+    def test_a_protected_editor_locks_identity_but_not_the_model_list(self) -> None:
+        """The protected editor used to be disabled wholesale, model list and save button included.
+
+        On the Codex side the protected entry is the default provider, so that made the one model
+        list the user most needs to curate permanently read-only -- a freshly discovered model
+        could be listed but never switched on, and 保存并应用 stayed greyed out because no edit
+        could be made in the first place. Only the borrowed identity needs locking.
+        """
+
+        class Widget:
+            def __init__(self) -> None:
+                self.state_value: object = None
+                self.tree_state: object = None
+
+            def configure(self, **kwargs: object) -> None:
+                if "state" in kwargs:
+                    self.state_value = kwargs["state"]
+
+            def state(self, spec: object = None) -> tuple[()]:
+                if spec is not None:
+                    self.tree_state = spec
+                return ()
+
+        locked = (
+            "id_entry",
+            "base_url_entry",
+            "prefix_entry",
+            "api_key_entry",
+            "models_path_entry",
+            "responses_path_entry",
+            "messages_path_entry",
+            "auth_header_entry",
+            "auth_prefix_entry",
+            "proto_responses_check",
+            "proto_messages_check",
+            "show_key_button",
+            "delete_button",
+        )
+        editable = (
+            "name_entry",
+            "timeout_spin",
+            "enabled_check",
+            "failover_check",
+            "headers_text",
+            "add_model_button",
+            "select_models_button",
+            "clear_models_button",
+            "remove_models_button",
+            "save_button",
+        )
+        probes = (
+            "fetch_button",
+            "connection_button",
+            "test_models_button",
+            "measure_fast_button",
+            "speed_button",
+            "rank_button",
+        )
+        names = locked + editable + probes + ("model_tree", "reasoning_combo")
+        form = SimpleNamespace(_busy=False, **{name: Widget() for name in names})
+
+        manager.CodexSotaApp._set_editor_protected(form, True)
+
+        self.assertTrue(form._protected)
+        for name in locked:
+            with self.subTest(locked=name):
+                self.assertEqual(getattr(form, name).state_value, "disabled")
+        for name in editable + probes:
+            with self.subTest(editable=name):
+                self.assertEqual(getattr(form, name).state_value, "normal")
+        # The rows themselves have to stay clickable; toggling a model is a tree click.
+        self.assertEqual(form.model_tree.tree_state, ["!disabled"])
+
+        # An unprotected provider locks nothing, and busy still locks everything.
+        form = SimpleNamespace(_busy=False, **{name: Widget() for name in names})
+        manager.CodexSotaApp._set_editor_protected(form, False)
+        for name in locked + editable + probes:
+            with self.subTest(unprotected=name):
+                self.assertEqual(getattr(form, name).state_value, "normal")
+        form = SimpleNamespace(_busy=True, **{name: Widget() for name in names})
+        manager.CodexSotaApp._set_editor_protected(form, False)
+        for name in locked + editable + probes:
+            with self.subTest(busy=name):
+                self.assertEqual(getattr(form, name).state_value, "disabled")
+        self.assertEqual(form.model_tree.tree_state, ["disabled"])
+
+    def test_a_protected_providers_identity_survives_whatever_the_form_shows(self) -> None:
+        """Widget states are a UI affordance, not the guarantee.
+
+        The identity fields are read-only for a protected provider, so in practice the form shows
+        the on-disk values. _provider_from_form pins them anyway, so a stale editor -- or a future
+        change to which widgets get disabled -- cannot quietly rewrite the borrowed identity.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workspace = registry.Workspace(
+                name="codex",
+                label="Codex CLI",
+                root=root / "workspace",
+                router_port=19992,
+                router_starter=root / "starter.ps1",
+                protocol="responses",
+                needs_catalog=False,
+            )
+            provider = provider_config(
+                "borrowed_login", "https://example.invalid/v1", prefix="", is_default=True
+            )
+            provider.update({"protected": True, "auth_type": "codex_auth"})
+            write_registry(workspace.registry_path, [provider])
+            loaded = registry.load_registry(workspace.registry_path, allow_missing_secrets=True)
+
+            form = new_provider_form(workspace)
+            form.current_id = "borrowed_login"
+            form.registry = loaded
+            form.loaded_provider = deepcopy(
+                registry.find_provider(loaded, "borrowed_login")
+            )
+            form.id_var.set("borrowed_login")
+            # What the user is allowed to change.
+            form.name_var.set("Renamed")
+            form.timeout_var.set("42")
+            form.enabled_var.set(True)
+            form.failover_var.set(False)
+            form.draft_models = [
+                {"id": "shared-model", "enabled": True},
+                {"id": "newly-discovered", "enabled": True},
+            ]
+            # What it must not matter that the form says.
+            form.base_url_var.set("https://hijacked.invalid/v1")
+            form.models_path_var.set("/hijacked-models")
+            form.responses_path_var.set("/hijacked-responses")
+            form.messages_path_var.set("/hijacked-messages")
+            form.auth_header_var.set("X-Hijack")
+            form.auth_prefix_var.set("Token ")
+            form.prefix_var.set("hijack--")
+            form.proto_responses_var.set(True)
+            form.proto_messages_var.set(True)
+            form._enabled_default_exists = lambda: True
+
+            saved = manager.CodexSotaApp._provider_from_form(form)
+
+            self.assertEqual(saved["name"], "Renamed")
+            self.assertEqual(saved["timeout_seconds"], 42)
+            self.assertEqual(
+                [model["id"] for model in saved["models"]],
+                ["shared-model", "newly-discovered"],
+            )
+            for key in registry.PROTECTED_PINNED_PROVIDER_KEYS:
+                with self.subTest(pinned=key):
+                    self.assertEqual(saved[key], provider[key])
+            # And the drift warning must not claim a save would overwrite a pinned field.
+            outside = deepcopy(provider)
+            outside["base_url"] = "https://moved.invalid/v1"
+            write_registry(workspace.registry_path, [outside])
+            self.assertEqual(form._outside_edits("borrowed_login"), [])
 
     def test_save_treats_a_provider_deleted_elsewhere_as_a_fresh_draft(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

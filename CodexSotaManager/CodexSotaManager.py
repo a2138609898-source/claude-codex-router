@@ -191,6 +191,7 @@ from sota_registry import (  # noqa: E402
     CLAUDE,
     CODEX,
     MESSAGES_PREFIX_SUFFIX,
+    PROTECTED_PINNED_PROVIDER_KEYS,
     WORKSPACES,
     REGISTRY_PATH,
     SOTA_ROOT,
@@ -2330,10 +2331,23 @@ class CodexSotaApp(tk.Tk):
         self.status_var.set(provider["name"])
 
     def _set_editor_protected(self, protected: bool) -> None:
+        """Lock what a protected provider's identity is, not what it can be used for.
+
+        `protected` marks an entry this app does not own the identity of -- on the Codex side that
+        is the codex_auth provider, which borrows the Codex App's own login, base URL and model
+        prefix.  Editing those renames slugs config.toml has pinned or points them at the wrong
+        endpoint, so they stay read-only.
+
+        This used to disable the whole editor including the model list and the save button, which
+        went too far in a way that had no workaround: the protected entry is also the default
+        provider, so its models are the ones most worth curating, and a freshly discovered model
+        could never be switched on.  The model list, display name, timeout, headers and the
+        enable/failover toggles are ordinary user data and stay editable; save_provider pins the
+        identity fields back to disk regardless, so the lock does not depend on the widget states.
+        """
         self._protected = protected
         state = "disabled" if protected or self._busy else "normal"
         for widget in (
-            self.name_entry,
             self.id_entry,
             self.base_url_entry,
             self.prefix_entry,
@@ -2343,24 +2357,25 @@ class CodexSotaApp(tk.Tk):
             self.messages_path_entry,
             self.auth_header_entry,
             self.auth_prefix_entry,
-            self.timeout_spin,
         ):
             widget.configure(state=state)
-        self.enabled_check.configure(state=state)
-        self.failover_check.configure(state=state)
         self.proto_responses_check.configure(state=state)
         self.proto_messages_check.configure(state=state)
-        self.headers_text.configure(state=state)
         self.show_key_button.configure(state=state)
-        edit_models_state = "disabled" if protected or self._busy else "normal"
+        editable_state = "disabled" if self._busy else "normal"
         for widget in (
+            self.name_entry,
+            self.timeout_spin,
             self.add_model_button,
             self.select_models_button,
             self.clear_models_button,
             self.remove_models_button,
         ):
-            widget.configure(state=edit_models_state)
-        if protected or self._busy:
+            widget.configure(state=editable_state)
+        self.enabled_check.configure(state=editable_state)
+        self.failover_check.configure(state=editable_state)
+        self.headers_text.configure(state=editable_state)
+        if self._busy:
             self.model_tree.state(["disabled"])
         else:
             self.model_tree.state(["!disabled"])
@@ -2372,7 +2387,9 @@ class CodexSotaApp(tk.Tk):
         self.speed_button.configure(state=probe_state)
         self.rank_button.configure(state=probe_state)
         self.reasoning_combo.configure(state="disabled" if self._busy else "readonly")
-        self.save_button.configure(state="disabled" if protected or self._busy else "normal")
+        self.save_button.configure(state="disabled" if self._busy else "normal")
+        # Deleting stays refused: the entry is recreated from the Codex App's own login, so a
+        # delete here is never what someone means, and delete_provider rejects it anyway.
         self.delete_button.configure(state="disabled" if protected or self._busy else "normal")
 
     def _new_provider(self) -> None:
@@ -2478,7 +2495,12 @@ class CodexSotaApp(tk.Tk):
             "models": "模型清单",
         }
         drifted = []
+        # A protected provider's identity fields are pinned to disk on save, so a change to one of
+        # them is not something this save would overwrite -- warning about it would be a lie.
+        pinned = set(PROTECTED_PINNED_PROVIDER_KEYS) if current.get("protected") else set()
         for key in FORM_OWNED_PROVIDER_KEYS:
+            if key in pinned:
+                continue
             before, after = baseline.get(key), current.get(key)
             if key == "models":
                 # Probe bookkeeping is written by this app between load and save, so comparing
@@ -2520,6 +2542,21 @@ class CodexSotaApp(tk.Tk):
             "secret_file": provider_id + "-api-key.dpapi",
             "entropy": "CodexSota.Provider." + provider_id + ".v1",
         }
+        # The identity widgets are read-only for a protected provider, so the form is already
+        # showing the on-disk values -- but reading them back through StringVars would let a stale
+        # editor, or a future change to which widgets get disabled, quietly rewrite them.  Pin them
+        # explicitly, the same way apply_provider does before it writes.  Snapshot them *now*:
+        # `provider` is the on-disk dict itself, so taking them after the merge below would just
+        # read back whatever the form put there.
+        pinned = (
+            {
+                key: deepcopy(existing[key])
+                for key in PROTECTED_PINNED_PROVIDER_KEYS
+                if key in existing
+            }
+            if existing and existing.get("protected")
+            else {}
+        )
         prefix = "" if first_in_workspace else self.prefix_var.get().strip()
         provider.update(
             {
@@ -2545,6 +2582,7 @@ class CodexSotaApp(tk.Tk):
                 "models": deepcopy(self.draft_models),
             }
         )
+        provider.update(pinned)
         return validate_provider(provider, allow_missing_secret=True)
 
     def _render_models(self) -> None:
@@ -2590,7 +2628,7 @@ class CodexSotaApp(tk.Tk):
         return None
 
     def _toggle_model_event(self, event: tk.Event[Any]) -> str:
-        if self._busy or self._protected:
+        if self._busy:
             return "break"
         item = self.model_tree.identify_row(event.y) if event.type == tk.EventType.ButtonPress else self.model_tree.focus()
         index = self._model_index_from_item(item)
@@ -2602,7 +2640,7 @@ class CodexSotaApp(tk.Tk):
         return "break"
 
     def _set_all_models(self, enabled: bool) -> None:
-        if self._busy or self._protected:
+        if self._busy:
             return
         query = self.model_filter_var.get().strip().lower()
         for model in self.draft_models:
@@ -2612,7 +2650,7 @@ class CodexSotaApp(tk.Tk):
         self._render_models()
 
     def _add_custom_model(self) -> None:
-        if self._busy or self._protected:
+        if self._busy:
             return
         dialog = ModelDialog(self)
         self.wait_window(dialog)
@@ -2625,7 +2663,7 @@ class CodexSotaApp(tk.Tk):
         self._render_models()
 
     def _remove_selected_models(self) -> None:
-        if self._busy or self._protected:
+        if self._busy:
             return
         indices = sorted(
             [index for item in self.model_tree.selection() if (index := self._model_index_from_item(item)) is not None],

@@ -144,6 +144,23 @@ PROBE_ORIGINATOR = "codex_cli_rs"
 PROTOCOLS = ("responses", "messages")
 # How many vendors one request may be handed to before giving up.
 FAILOVER_MAX_ATTEMPTS = 3
+# What `protected` actually protects.  A protected entry is one whose *identity* this app does not
+# own: the codex_auth provider borrows the Codex App's own login, base URL and model prefix, and
+# rewriting any of these either points its models at the wrong endpoint or renames slugs the app
+# already has pinned in config.toml.  Everything else about such a provider -- above all its model
+# list -- is ordinary user data, so these keys are pinned back to whatever is on disk instead of the
+# whole write being refused.  `auth_type`, `secret_file`, `entropy`, `is_default` and `protected`
+# itself are not listed because no editor form owns them; they are already carried over untouched.
+PROTECTED_PINNED_PROVIDER_KEYS = (
+    "base_url",
+    "prefix",
+    "protocols",
+    "auth_header",
+    "auth_prefix",
+    "models_path",
+    "responses_path",
+    "messages_path",
+)
 ID_PATTERN = re.compile(r"^[a-z][a-z0-9_]{1,39}$")
 # Two prefix shapes, both self-delimiting so `prefix + model id` stays one unambiguous slug:
 #   `vendor--`           the original form, used wherever a provider speaks responses.
@@ -1816,7 +1833,20 @@ def apply_provider(
             if current["id"] == candidate["id"]:
                 existing_index = index
                 if current.get("protected"):
-                    raise ValueError("Protected provider cannot be changed in the manager")
+                    # Refusing the whole write here was too blunt.  It also made the model list of
+                    # a protected provider permanently uncurateable -- and on the Codex side the
+                    # protected entry is the default one, so its models are exactly the ones a user
+                    # most needs to switch on.  Pin the identity fields back to disk and let the
+                    # rest through; see PROTECTED_PINNED_PROVIDER_KEYS for why each is pinned.
+                    candidate = validate_provider(
+                        candidate
+                        | {
+                            key: deepcopy(current[key])
+                            for key in PROTECTED_PINNED_PROVIDER_KEYS
+                            if key in current
+                        },
+                        allow_missing_secret=True,
+                    )
                 break
         paths = [workspace.registry_path, workspace.catalog_path]
         if candidate.get("auth_type") == "dpapi":
