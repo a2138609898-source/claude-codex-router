@@ -34,7 +34,7 @@ def registry_triples() -> list[tuple[str, str, str]]:
     """One (provider id, model id, slug) per prefixed provider in the live registry.
 
     The slug is the model's published slug -- normally prefix + model id, and not
-    id + "--" + model id, because a prefix is not always the id (xlinks_gateway is not).
+    id + "--" + model id, because a prefix is not always the id (xray_gateway is not).
     A model carrying `publish_as` answers under that instead, which is also what the router
     puts in forced_fast, so asking for prefix + id would force a slug nothing dispatches on.
     Such a model also shadows the sibling whose plain slug it borrowed: enabling that sibling
@@ -95,6 +95,7 @@ TRIPLES = registry_triples()
 print("=== 1) forced_fast_models 读取 ===")
 set_forced(reg_path, {(P1, M1)})
 state = R.RouterState(reg_path, AUTH_PATH, work / "log.jsonl")
+state.signature_throttle_seconds = 0.0
 check("只开一个", state.forced_fast_models(), {S1})
 
 print("=== 2) providers.json 改动后免重启热更新 ===")
@@ -124,6 +125,7 @@ print("=== 5) 健康窗口：连续失败的上游会被标成待避开 ===")
 # 而不是集合整体为空 —— 否则真实配置里本来就挂掉的几家会让判据永远失败。
 shutil.copy(REGISTRY_PATH, reg_path)
 state = R.RouterState(reg_path, AUTH_PATH, work / "log2.jsonl")
+state.signature_throttle_seconds = 0.0
 seeded = set(state.unhealthy_vendors())
 print(f"  已保存结论判定全挂的家（开局就避开）: {sorted(seeded)}")
 fresh = [pid for pid, _m, _s in TRIPLES if pid not in seeded]

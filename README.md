@@ -51,21 +51,22 @@ Codex 各自只能填**一个**网关地址。所以在本地立一个收口：
 
 这几个概念不看代码猜不出来，先说清楚。
 
-**prefix（前缀）与默认供应商。** 多家可能都提供 `claude-opus-5`，所以每家非默认供应商都带一个
-前缀，客户端看到的是 `<prefix><model_id>`。**默认供应商的 prefix 必须为空**（`validate_registry`
-强制），它的模型以裸名出现。合法前缀有两种形状：`vendor--` 和 `vendor.anthropic.`，后者不允许
-下划线，所以 id 里的 `_` 会被 `derive_model_prefix` 转成 `-`。
+**prefix（前缀）与默认供应商。** 多家可能都提供同一个上游模型，所以每家供应商都应带一个
+可辨认来源的前缀，客户端看到的是 `<prefix><model_id>`。Codex/Responses 供应商（包括默认家）
+必须使用前缀；空前缀只保留给 Claude 的旧版 Messages-only 默认配置。这样即使客户端丢了模型
+选择，也不会把裸模型名静默送进默认账户。合法前缀有两种形状：`vendor--` 和
+`vendor.anthropic.`，后者不允许下划线，所以 id 里的 `_` 会被 `derive_model_prefix` 转成 `-`。
 
-**published slug ≠ upstream model id。** 客户端选择用的 slug 由 `published_slug()` 决定：有
-`publish_as` 就用它，否则是 `prefix + id`；而**发给上游的永远是 `model["id"]`**。这一层分开是为了
-救 Claude Desktop 的能力表——它按规范化后的模型名去查思考档和 1M 上下文，`claude-opus-5-thinking`
-规范化之后还是它自己、不在表里，滑杆就出不来。改个 `publish_as` 让它规范化到 `claude-opus-5`，
-控件回来了，上游收到的仍是原来那个 `-thinking` 名字。同理，说 `responses` 协议的供应商禁止用
-`publish_as`（Codex 侧不需要这套障眼法）。
+**published slug ≠ upstream model id。** 客户端选择用的 slug 由 `published_slug()` 决定：通常是
+`prefix + id`，而**发给上游的永远是 `model["id"]`**。`publish_as` 只保留给 Claude 的旧版
+Messages-only 默认配置；其它供应商禁止用它绕过命名空间，否则一个裸别名仍可能落到错误账户。
+Claude 的能力表仍可通过旧版默认配置的 `publish_as` 处理 `-thinking` 等特殊模型名。
 
 **model_routes 与 failover。** 校验通过的注册表会摊平成一张 `published_slug -> (vendor,
 upstream_model)` 的表。请求进来先查表，查不到直接 400（不联网）。查到之后按 `failover_candidates`
 拿一串候选，逐个试；`allow_failover` 默认关，关掉时候选只有一个，上游的错误状态和原文直接透传。
+请求缺少 `model`、模型不是字符串、或使用无供应商前缀的裸 slug 时，同样在本地 400，绝不会构造
+默认供应商候选或触碰任何上游密钥。唯一例外是 Claude 的 Messages-only 旧版默认模型。
 
 **热加载。** 路由器不监听文件事件，而是算一个「配置签名」（`providers.json` 加各密钥文件的
 mtime/size），每次请求前比一下，变了就重建路由表。改完 `providers.json` 不用重启，`/healthz` 的
@@ -74,9 +75,9 @@ mtime/size），每次请求前比一下，变了就重建路由表。改完 `pr
 
 **ROUTER_VERSION 和 `/healthz` 的三元比较。** `/healthz` 回 `status` + `version` +
 `registry_hash` + `upstreams`。启动脚本 `Start-CodexSotaRouter.ps1` 是**幂等的 ensure-running**：
-四项全对就认为已经在跑，直接返回不动进程。这里有个坑值得单独记：改
-`codex_sota_router.py` 的代码既不动 `ROUTER_VERSION` 也不动 `registry_hash`，所以健康检查照样匹配，
-「重启」会变成什么都没做。真要换进程必须走 `-Stop`，或者调用方传 `force=True`。
+四项全对就认为已经在跑，直接返回不动进程。涉及路由安全语义的改动必须递增
+`ROUTER_VERSION`；当前 v15 加入了裸模型拒绝。若只改了未递增版本的代码，健康检查仍可能匹配，
+「重启」会变成什么都没做；真要换进程必须走 `-Stop`，或者调用方传 `force=True`。
 
 ## 目录结构
 

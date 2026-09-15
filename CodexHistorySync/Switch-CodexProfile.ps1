@@ -866,7 +866,7 @@ else {
     ''
 }
 $serviceLine = ''
-$watcherLine = "`n关闭 $profileLabel App 后会自动再执行一次 Cockpit、GPT Plus 与 True SOTA 三方同步。"
+$watcherLine = "`n关闭 $profileLabel App 后会自动再执行一次 Cockpit、GPT Plus 与 Tango Relay 三方同步。"
 $messageIcon = 'Information'
 
 Show-ProfileMessage -Title "Codex 已切换到 $profileLabel" -Icon $messageIcon -Message @"

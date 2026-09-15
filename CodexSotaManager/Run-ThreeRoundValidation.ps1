@@ -91,8 +91,6 @@ try {
         'test_codex_sota_regressions.ConfigRestoreTests',
         'test_codex_sota_regressions.HeaderValidationTests',
         'test_codex_sota_regressions.RegistryRecoveryRegressionTests',
-        'test_codex_sota_regressions.UsageAccountingTests',
-        'test_codex_sota_regressions.UsageUiTests',
         'test_codex_sota_regressions.LauncherAndArtifactTests',
         'test_sync_build_regressions.SyncAndBuildRegressionTests'
     )

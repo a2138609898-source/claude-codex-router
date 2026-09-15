@@ -6,6 +6,18 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+# Native output (python, nested PowerShell) is decoded through [Console]::OutputEncoding.
+# Pin everything to UTF-8 so Chinese diagnostics and the JSON sync result survive the
+# capture instead of turning into mojibake in the error dialogs.
+try {
+    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+    $OutputEncoding = [System.Text.Encoding]::UTF8
+}
+catch {
+    # A console-less context cannot change its codepage; python still emits UTF-8 because
+    # of PYTHONIOENCODING below, which is the side that matters for captured output.
+}
+$env:PYTHONIOENCODING = 'utf-8'
 $sotaRoot = Join-Path $env:USERPROFILE '.codex-sota'
 $cockpitRoot = Join-Path $env:USERPROFILE '.codex-personal'
 $plusRoot = Join-Path $env:USERPROFILE '.codex-plus'
@@ -13,6 +25,7 @@ $configPath = Join-Path $sotaRoot 'config.toml'
 $authPath = Join-Path $sotaRoot 'auth.json'
 $registryPath = Join-Path $sotaRoot 'providers.json'
 $catalogPath = Join-Path $sotaRoot 'sota-multi-vendor-model-catalog.json'
+$syncLogPath = Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) 'logs\sync.log'
 $runnerPath = Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) 'Run-CodexHistorySync.ps1'
 $postExitWatcherPath = Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) 'sync_after_codex_exit.py'
 $routerStarterPath = Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) 'Start-CodexSotaRouter.ps1'
@@ -418,6 +431,22 @@ function Invoke-SotaConfigValidator {
     return [pscustomobject]@{ valid = $false; reason = 'validator_failed' }
 }
 
+function Get-EffectiveModelPrefix {
+    param([object]$Provider)
+
+    $prefix = [string]$Provider.prefix
+    if (-not [string]::IsNullOrWhiteSpace($prefix)) {
+        return $prefix
+    }
+
+    # Codex/Responses providers may not publish a bare model.  This mirrors
+    # sota_registry.derive_model_prefix for an old providers.json that has not
+    # been rewritten yet; the catalog and router therefore converge on the same
+    # safe slug during the next launch.
+    $providerId = ([string]$Provider.id).Replace('_', '-')
+    return $providerId + '--'
+}
+
 function Set-ActiveSotaProfileMarker {
     $payload = [ordered]@{
         profile = 'Sota'
@@ -519,6 +548,57 @@ function Test-StructuredSyncSuccess {
     return $true
 }
 
+function Test-RecentSuccessfulSync {
+    param([int]$WithinMinutes = 10)
+
+    # The post-exit watcher and a previous launch both leave a fully successful three-way
+    # sync in the log.  When one just finished, the histories are already merged: running
+    # the same 3-5 minute sync again before every launch only adds dead wait time.
+    if (-not (Test-Path -LiteralPath $syncLogPath)) {
+        return $false
+    }
+    try {
+        $tail = @(Get-Content -Tail 10 -LiteralPath $syncLogPath -ErrorAction Stop)
+    }
+    catch {
+        return $false
+    }
+    for ($index = $tail.Count - 1; $index -ge 0; $index--) {
+        $line = [string]$tail[$index]
+        if ($line -notmatch 'INFO Three-way sync completed' -or $line -notmatch "'status': 'ok'") {
+            continue
+        }
+        $stamp = $null
+        if ($line -match '^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})') {
+            $stamp = [datetime]::ParseExact($Matches[1], 'yyyy-MM-dd HH:mm:ss', $null)
+        }
+        if (-not $stamp) {
+            return $true
+        }
+        return ((Get-Date) - $stamp).TotalMinutes -le $WithinMinutes
+    }
+    return $false
+}
+
+function Wait-HistorySyncIdle {
+    param([int]$TimeoutSeconds = 900)
+
+    # The msvcrt byte-range lock is process-lifetime, so "already running" clears when the
+    # holding python process exits.  Wait for that process instead of spinning the whole
+    # runner every 500 ms: a real three-way sync takes minutes, and the old 15-second retry
+    # budget burned out and failed the launch while the first sync was still doing its job.
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ((Get-Date) -lt $deadline) {
+        $holders = @(Get-CimInstance Win32_Process -Filter "Name LIKE 'python%'" -ErrorAction SilentlyContinue |
+            Where-Object { ([string]$_.CommandLine) -match 'sync_codex_histories' })
+        if ($holders.Count -eq 0) {
+            return $true
+        }
+        Start-Sleep -Seconds 2
+    }
+    return $false
+}
+
 function Invoke-ThreeWayHistorySync {
     param([switch]$AuditOnly)
 
@@ -530,9 +610,13 @@ function Invoke-ThreeWayHistorySync {
         $powershell = 'powershell.exe'
     }
 
+    if (-not $AuditOnly -and (Test-RecentSuccessfulSync -WithinMinutes 10)) {
+        return
+    }
+
     $lastExitCode = 1
     $lastDetail = ''
-    for ($attempt = 1; $attempt -le 30; $attempt++) {
+    for ($attempt = 1; $attempt -le 4; $attempt++) {
         $runnerArguments = @(
             '-NoLogo',
             '-NoProfile',
@@ -559,6 +643,13 @@ function Invoke-ThreeWayHistorySync {
         }
         if ($lastDetail -notmatch '已经在运行|already running') {
             break
+        }
+        # Another sync (usually the post-exit watcher of the previous session) owns the
+        # lock.  Wait for it to finish; if it completed cleanly its work counts and the
+        # launch proceeds instead of punishing the user with a failure dialog.
+        Wait-HistorySyncIdle -TimeoutSeconds 900 | Out-Null
+        if (-not $AuditOnly -and (Test-RecentSuccessfulSync -WithinMinutes 10)) {
+            return
         }
         Start-Sleep -Milliseconds 500
     }
@@ -605,7 +696,7 @@ if ($registryExists) {
                     break
                 }
                 foreach ($modelEntry in @($provider.models | Where-Object { $_.enabled -eq $true })) {
-                    $expectedCatalogModels += ([string]$provider.prefix + [string]$modelEntry.id)
+                    $expectedCatalogModels += ((Get-EffectiveModelPrefix -Provider $provider) + [string]$modelEntry.id)
                 }
             }
         }
@@ -702,7 +793,7 @@ foreach ($provider in @($registryProviders | Where-Object { $_.enabled -eq $true
         id = [string]$provider.id
         name = [string]$provider.name
         base_url = [string]$provider.base_url
-        prefix = [string]$provider.prefix
+        prefix = Get-EffectiveModelPrefix -Provider $provider
         models = @($provider.models | Where-Object { $_.enabled -eq $true } | ForEach-Object { [string]$_.id })
     }
 }
@@ -749,7 +840,7 @@ if ($AuditOnly) {
         api_key_present = $authStatus.key_present
         api_key_shape_valid = $authStatus.key_shape_valid
         app_exists = -not [string]::IsNullOrEmpty($appExecutable)
-        model_provider = 'true_sota'
+        model_provider = 'tango_relay'
         default_model = $defaultModel
         selectable_models = $catalogModels
         upstreams = $upstreamAudit
@@ -782,7 +873,7 @@ if ($PrepareOnly) {
             throw "Multi-vendor SOTA model catalog is missing: $catalogPath"
         }
         if ($authStatus.state -ne 'ready') {
-            throw "True SOTA API key is not configured correctly (state: $($authStatus.state))."
+            throw "Tango Relay API key is not configured correctly (state: $($authStatus.state))."
         }
         $routerResult = Invoke-SotaRouterManager
         if ($NoGui) {
@@ -817,7 +908,7 @@ try {
         throw "Multi-vendor SOTA model catalog is missing: $catalogPath"
     }
     if ($authStatus.state -ne 'ready') {
-        throw "True SOTA API key is not configured correctly (state: $($authStatus.state)). Run codex-sota again and paste only the API key when prompted."
+        throw "Tango Relay API key is not configured correctly (state: $($authStatus.state)). Run codex-sota again and paste only the API key when prompted."
     }
     if (-not $appExecutable) {
         throw 'ChatGPT/Codex App was not found.'

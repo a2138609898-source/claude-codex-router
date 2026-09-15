@@ -1,4 +1,4 @@
-"""count_tokens and same-vendor retry: the router must not forward a call it knows 404s.
+"""count_tokens and billing safety: the router must not forward a call it knows 404s.
 
 Three fake Anthropic gateways and a shadow router, all on OS-assigned ports against a temp
 registry, so the live routers and the real vendors are never involved.
@@ -171,11 +171,19 @@ def healthz() -> dict | None:
     return payload if payload.get("status") == "ok" else None
 
 
-def post(path: str, body: dict, timeout: int = 30) -> tuple[int, object]:
+def post(
+    path: str,
+    body: dict,
+    timeout: int = 30,
+    idempotency_key: str | None = None,
+) -> tuple[int, object]:
+    headers = {"Content-Type": "application/json", "x-api-key": "client-key"}
+    if idempotency_key:
+        headers["Idempotency-Key"] = idempotency_key
     request = urllib.request.Request(
         f"http://127.0.0.1:{ROUTER_PORT}{path}",
         data=json.dumps(body).encode(),
-        headers={"Content-Type": "application/json", "x-api-key": "client-key"},
+        headers=headers,
         method="POST")
     try:
         with urllib.request.urlopen(request, timeout=timeout) as r:
@@ -281,32 +289,34 @@ if __name__ == "__main__":
         results.append(not_memoized)
         print(f"  {'PASS' if not_memoized else 'FAIL'}  没被误记成「不支持」：后续 3 次仍然转发了 {len(seen['ct'])} 次")
 
-        print("\n=== 4) 同一家的瞬时 503 原地重试，不换供应商 ===")
+        print("\n=== 4) 生成请求即使带幂等键，也只发送一次 ===")
         seen["flaky"].clear()
         seen["noct"].clear()
         seen["ct"].clear()
         flaky_failures_left["count"] = 1
         status, body = post("/v1/messages", {
             "model": "flaky--claude-opus-5", "max_tokens": 8,
-            "messages": [{"role": "user", "content": "hi"}]})
-        retried_ok = status == 200 and len(seen["flaky"]) == 2
-        results.append(retried_ok)
-        print(f"  {'PASS' if retried_ok else 'FAIL'}  HTTP {status}，这一家收到 {len(seen['flaky'])} 次（1 次 503 + 1 次重试）")
-        # allow_failover 是关着的，也不该因为「原地重试」偷偷跑去别家计费。
+            "messages": [{"role": "user", "content": "hi"}]},
+            idempotency_key="count-retry-transient")
+        single_shot_ok = status == 503 and len(seen["flaky"]) == 1
+        results.append(single_shot_ok)
+        print(f"  {'PASS' if single_shot_ok else 'FAIL'}  HTTP {status}，这一家收到 {len(seen['flaky'])} 次（带幂等键也不重放）")
+        # allow_failover 是关着的，也不该因为错误偷偷跑去别家计费。
         stayed_ok = not seen["noct"] and not seen["ct"]
         results.append(stayed_ok)
         print(f"  {'PASS' if stayed_ok else 'FAIL'}  没有溜到别家：其余两家收到 {len(seen['noct'])} / {len(seen['ct'])} 次")
 
-        print("\n=== 5) 持续 503 的重试有上限，最后把上游状态透出 ===")
+        print("\n=== 5) 持续 503 也不重试，原样把上游状态透出 ===")
         seen["flaky"].clear()
         flaky_failures_left["count"] = 99
         status, body = post("/v1/messages", {
             "model": "flaky--claude-opus-5", "max_tokens": 8,
-            "messages": [{"role": "user", "content": "hi"}]})
+            "messages": [{"role": "user", "content": "hi"}]},
+            idempotency_key="count-retry-bounded")
         attempts = len(seen["flaky"])
-        bounded_ok = status == 503 and attempts == 3
+        bounded_ok = status == 503 and attempts == 1
         results.append(bounded_ok)
-        print(f"  {'PASS' if bounded_ok else 'FAIL'}  HTTP {status}，一共只试了 {attempts} 次（1 + 2 次重试）")
+        print(f"  {'PASS' if bounded_ok else 'FAIL'}  HTTP {status}，一共只试了 {attempts} 次（没有重试）")
         surfaced_ok = "no channel for model" in str(body)
         results.append(surfaced_ok)
         print(f"  {'PASS' if surfaced_ok else 'FAIL'}  上游正文原样透给客户端：{str(body)[:80]}")

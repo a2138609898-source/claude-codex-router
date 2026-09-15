@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 from copy import deepcopy
-import csv
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
@@ -174,6 +173,7 @@ from claude_desktop import (  # noqa: E402
     SOTA_ENTRY_NAME as CLAUDE_ENTRY_NAME,
     apply_entry as apply_claude_entry,
     build_inference_models,
+    canonical_model_id as claude_canonical_model_id,
     claim_slot as claim_claude_slot,
     ensure_deployment_mode,
     library_status as claude_library_status,
@@ -181,6 +181,7 @@ from claude_desktop import (  # noqa: E402
     reconcile_slot as reconcile_claude_slot,
     release_slot as release_claude_slot,
     slot_state as claude_slot_state,
+    supports_1m_context as claude_supports_1m_context,
     thinking_effort_levels as claude_thinking_effort_levels,
     thinking_summary as claude_thinking_summary,
     write_profile as write_claude_profile,
@@ -192,9 +193,11 @@ from sota_registry import (  # noqa: E402
     CODEX,
     MESSAGES_PREFIX_SUFFIX,
     PROTECTED_PINNED_PROVIDER_KEYS,
+    uses_responses_to_anthropic_messages,
     WORKSPACES,
     REGISTRY_PATH,
     SOTA_ROOT,
+    allows_legacy_bare_model,
     apply_provider,
     audit_registry,
     auto_repair_messages_path,
@@ -202,13 +205,16 @@ from sota_registry import (  # noqa: E402
     delete_provider,
     derive_model_prefix,
     discover_models,
+    effective_model_prefix,
     failover_chain,
     find_provider,
     lint_registry,
     load_registry,
     measure_fast_tier,
     measure_latency,
+    pin_protected_provider_identity,
     probe_fast_tier,
+    published_slug,
     rebuild_catalog,
     redacted_registry,
     registry_digest,
@@ -387,6 +393,10 @@ def merge_restored_registry(
     taken from the provider of the same id still on disk, and only genuinely absent secrets
     are reported as needing attention.
 
+    A protected provider is stricter: its live routing and credential identity always wins over
+    the backup, including the default flag, model prefix, workspace, and protocol adapter.  The
+    report names every discarded field so restoring an old file is safe without being silent.
+
     `workspace_name` is the workspace being restored into. Every provider carries the home it
     belongs to, and a Codex backup dropped onto the Claude registry would validate cleanly
     while quietly pointing one side's router at the other side's providers — so entries from
@@ -400,6 +410,7 @@ def merge_restored_registry(
         "added": [],
         "removed": [],
         "protected_removed": [],
+        "protected_identity_pinned": [],
         "needs_key": [],
         "kept_headers": [],
         "foreign_workspace": [],
@@ -416,6 +427,16 @@ def merge_restored_registry(
         previous = on_disk.get(provider_id)
         if previous is None:
             report["added"].append(provider_id)
+        elif previous.get("protected"):
+            # A backup is user-editable JSON, not an authority for a borrowed account.  Keep the
+            # model/settings edits from it, but force every routing and credential identity field
+            # back to the live protected entry.  This also prevents an old backup with a bare
+            # default prefix, a different workspace, or a different request adapter from
+            # silently changing where future requests are billed.
+            provider, pinned = pin_protected_provider_identity(provider, previous)
+            report["protected_identity_pinned"].extend(
+                f"{provider_id}.{field}" for field in pinned
+            )
         elif "entropy" not in provider and "entropy" in previous:
             provider["entropy"] = previous["entropy"]
         headers = provider.get("extra_headers")
@@ -513,288 +534,6 @@ def degraded_vendors(health: dict[str, dict[str, Any]]) -> list[tuple[str, dict[
         key=lambda item: item[0],
     )
 
-
-# The health board asks "is this vendor up right now" and 200 recent lines answer that. Usage
-# asks "what have I spent", which needs a much longer reach back through the same file.
-USAGE_LOG_TAIL_BYTES = 8 * 1024 * 1024
-USAGE_SAMPLE = 50000
-DEFAULT_PRICE = {"in": 0.0, "out": 0.0}
-
-
-def load_usage_prices(path: Path) -> dict[str, Any]:
-    """Per-million-token prices, or an empty table when the file is absent or unusable.
-
-    Never raises: a hand-edited price file with a typo in it must degrade to "cost unknown"
-    rather than take the usage panel — or the app — down with it.
-    """
-    table: dict[str, Any] = {"version": 1, "currency": "USD", "models": {}}
-    try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return table
-    if not isinstance(raw, dict):
-        return table
-    currency = raw.get("currency")
-    if isinstance(currency, str) and currency.strip():
-        table["currency"] = currency.strip()[:8]
-    models = raw.get("models")
-    if isinstance(models, dict):
-        for model, price in models.items():
-            if not isinstance(model, str) or not isinstance(price, dict):
-                continue
-            entry = {}
-            for side in ("in", "out"):
-                value = price.get(side)
-                if isinstance(value, (int, float)) and value >= 0:
-                    entry[side] = float(value)
-            if entry:
-                table["models"][model] = {**DEFAULT_PRICE, **entry}
-    return table
-
-
-def save_usage_prices(path: Path, table: dict[str, Any]) -> None:
-    """Write the price table atomically, the same way the registry is written.
-
-    Prices are only reference data, but a half-written file would read back as "no prices" and
-    silently zero every cost figure, so the temp-then-replace dance is worth it here too.
-    """
-    clean = load_usage_prices_payload(table)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.parent / f".{path.name}.{os.getpid()}.tmp"
-    try:
-        with temporary.open("w", encoding="utf-8", newline="\n") as handle:
-            handle.write(json.dumps(clean, ensure_ascii=False, indent=2) + "\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, path)
-    finally:
-        try:
-            temporary.unlink()
-        except OSError:
-            pass
-
-
-def load_usage_prices_payload(table: dict[str, Any]) -> dict[str, Any]:
-    """Normalise a price table in memory, using the same rules as reading one off disk."""
-    models = {}
-    for model, price in (table.get("models") or {}).items():
-        if not isinstance(model, str) or not isinstance(price, dict):
-            continue
-        entry = {
-            side: float(price[side])
-            for side in ("in", "out")
-            if isinstance(price.get(side), (int, float)) and price[side] >= 0
-        }
-        if entry:
-            models[model] = {**DEFAULT_PRICE, **entry}
-    currency = str(table.get("currency") or "USD").strip()[:8] or "USD"
-    return {"version": 1, "currency": currency, "models": models}
-
-
-def price_for_model(prices: dict[str, Any], model: str) -> dict[str, float] | None:
-    """The price row for a model, tolerating the vendor prefixes the router strips.
-
-    A slug reaches the log as the vendor's own model id, but users type prices as the
-    familiar name, so `openai/gpt-5` in the table still matches `gpt-5` in the log.
-    Both prefix shapes are stripped: `vendor--` and the messages-side `vendor.anthropic.`.
-    """
-    table = prices.get("models") or {}
-    if model in table:
-        return table[model]
-    for key, value in table.items():
-        tail = key.rsplit("/", 1)[-1].rsplit("--", 1)[-1].rsplit(MESSAGES_PREFIX_SUFFIX, 1)[-1]
-        if tail and tail == model:
-            return value
-    return None
-
-
-def entry_cost(entry_tokens: dict[str, int], price: dict[str, float] | None) -> float:
-    """Cost of one rollup at per-million-token prices, 0.0 when the model has no price."""
-    if not price:
-        return 0.0
-    return (
-        entry_tokens.get("tokens_in", 0) * price.get("in", 0.0)
-        + entry_tokens.get("tokens_out", 0) * price.get("out", 0.0)
-    ) / 1_000_000
-
-
-def utc_day_boundaries(days_back: int = 0) -> tuple[str, str]:
-    """The UTC timestamps bracketing a local calendar day, in the log's own text format.
-
-    The log stores UTC but the user thinks in local days, so the window is computed once here
-    and compared as fixed-width strings. That is exact for this format and avoids parsing tens
-    of thousands of timestamps to answer "how much today".
-    """
-    local_midnight = datetime.now().astimezone().replace(
-        hour=0, minute=0, second=0, microsecond=0
-    ) - timedelta(days=days_back)
-    start = local_midnight.astimezone(timezone.utc)
-    end = start + timedelta(days=1)
-    stamp = "%Y-%m-%dT%H:%M:%SZ"
-    return start.strftime(stamp), end.strftime(stamp)
-
-
-def _blank_rollup() -> dict[str, Any]:
-    return {"requests": 0, "ok": 0, "tokens_in": 0, "tokens_out": 0, "durations": []}
-
-
-def _finish_rollup(bucket: dict[str, Any], prices: dict[str, Any], model: str = "") -> None:
-    durations = bucket.pop("durations", [])
-    bucket["p50_ms"] = round(percentile(durations, 0.50))
-    bucket["p95_ms"] = round(percentile(durations, 0.95))
-    bucket["success_rate"] = bucket["ok"] / bucket["requests"] if bucket["requests"] else 0.0
-    bucket["tokens"] = bucket["tokens_in"] + bucket["tokens_out"]
-    if model:
-        price = price_for_model(prices, model)
-        bucket["priced"] = price is not None
-        bucket["cost"] = entry_cost(bucket, price)
-
-
-def read_router_usage(
-    log_path: Path,
-    prices: dict[str, Any] | None = None,
-    sample: int = USAGE_SAMPLE,
-    tail_bytes: int = USAGE_LOG_TAIL_BYTES,
-) -> dict[str, Any]:
-    """Roll the router's request log up into per-vendor and per-model usage and cost.
-
-    Reads the tail of a plain file — no upstream calls, nothing to authenticate, and safe to
-    run against a log the router is appending to. Lines written before token accounting
-    existed are still counted as requests and reported separately, so the panel can say the
-    totals start from the upgrade instead of quietly implying the vendor sent no tokens.
-    """
-    prices = prices or {"models": {}, "currency": "USD"}
-    summary: dict[str, Any] = {
-        "currency": prices.get("currency", "USD"),
-        "lines": 0,
-        "legacy_lines": 0,
-        "totals": _blank_rollup(),
-        "today": _blank_rollup(),
-        "vendors": {},
-        "models": {},
-        "first_time": "",
-        "last_time": "",
-        "log_bytes": 0,
-        "truncated": False,
-    }
-    try:
-        with log_path.open("rb") as handle:
-            handle.seek(0, os.SEEK_END)
-            size = handle.tell()
-            summary["log_bytes"] = size
-            summary["truncated"] = size > tail_bytes
-            handle.seek(max(0, size - tail_bytes))
-            raw = handle.read()
-    except OSError:
-        _finish_rollup(summary["totals"], prices)
-        _finish_rollup(summary["today"], prices)
-        return summary
-
-    day_start, day_end = utc_day_boundaries()
-    # Tokens per (vendor, model) so a vendor is only ever billed for what it actually served.
-    pairs: dict[tuple[str, str], dict[str, int]] = {}
-    today_pairs: dict[tuple[str, str], dict[str, int]] = {}
-    lines = raw.decode("utf-8", errors="replace").splitlines()
-    if summary["truncated"] and lines:
-        # The seek lands mid-line; that first fragment is not valid JSON anyway, but dropping
-        # it explicitly keeps "lines" honest rather than counting a parse failure.
-        lines = lines[1:]
-    for line in lines[-sample:]:
-        try:
-            entry = json.loads(line)
-        except ValueError:
-            continue
-        if not isinstance(entry, dict):
-            continue
-        vendor = entry.get("vendor")
-        status = entry.get("status")
-        if not isinstance(vendor, str) or not isinstance(status, int):
-            continue
-        # 499 is our own client walking away. It is a real request that really cost tokens
-        # upstream, so it counts here even though the health board ignores it.
-        summary["lines"] += 1
-        stamp = str(entry.get("time") or "")
-        if stamp:
-            summary["first_time"] = summary["first_time"] or stamp
-            summary["last_time"] = stamp
-        tokens_in = entry.get("tokens_in")
-        tokens_out = entry.get("tokens_out")
-        model = str(entry.get("model") or "")
-        if not model:
-            # Written before the router logged models at all. Counting these as "reported no
-            # tokens" would understate every total, so they are reported as their own figure.
-            summary["legacy_lines"] += 1
-        counted = {
-            "tokens_in": tokens_in if isinstance(tokens_in, int) else 0,
-            "tokens_out": tokens_out if isinstance(tokens_out, int) else 0,
-        }
-        succeeded = 200 <= status < 300
-        duration = entry.get("duration_ms")
-        is_today = bool(stamp) and day_start <= stamp < day_end
-        targets = [summary["totals"], summary["vendors"].setdefault(vendor, _blank_rollup())]
-        if model:
-            targets.append(summary["models"].setdefault(model, _blank_rollup()))
-            for book in (pairs, today_pairs) if is_today else (pairs,):
-                pair = book.setdefault((vendor, model), {"tokens_in": 0, "tokens_out": 0})
-                pair["tokens_in"] += counted["tokens_in"]
-                pair["tokens_out"] += counted["tokens_out"]
-        if is_today:
-            targets.append(summary["today"])
-        for bucket in targets:
-            bucket["requests"] += 1
-            bucket["ok"] += 1 if succeeded else 0
-            bucket["tokens_in"] += counted["tokens_in"]
-            bucket["tokens_out"] += counted["tokens_out"]
-            if isinstance(duration, (int, float)) and succeeded:
-                bucket["durations"].append(float(duration))
-        if model:
-            summary["models"][model].setdefault("vendors", set()).add(vendor)
-
-    for name, bucket in summary["models"].items():
-        bucket["vendors"] = sorted(bucket.get("vendors") or [])
-        _finish_rollup(bucket, prices, name)
-    for bucket in summary["vendors"].values():
-        _finish_rollup(bucket, prices)
-        bucket["cost"] = 0.0
-    # A vendor rollup mixes models, so its cost is built from what that vendor actually served
-    # of each model.  Fanning a model's whole cost out to every vendor that ever answered for
-    # it would bill a vendor for tokens a different vendor delivered.
-    total_cost = 0.0
-    for (vendor, model), tokens in pairs.items():
-        cost = entry_cost(tokens, price_for_model(prices, model))
-        total_cost += cost
-        row = summary["vendors"].get(vendor)
-        if row is not None:
-            row["cost"] = row.get("cost", 0.0) + cost
-    _finish_rollup(summary["totals"], prices)
-    _finish_rollup(summary["today"], prices)
-    summary["totals"]["cost"] = total_cost
-    summary["today"]["cost"] = sum(
-        entry_cost(tokens, price_for_model(prices, model))
-        for (_vendor, model), tokens in today_pairs.items()
-    )
-    summary["unpriced"] = sorted(
-        name for name, row in summary["models"].items() if not row["priced"] and row["tokens"]
-    )
-    return summary
-
-
-def format_tokens(value: int) -> str:
-    """Compact token counts; a million-token month should not read as seven digits."""
-    if value >= 1_000_000:
-        return f"{value / 1_000_000:.2f}M"
-    if value >= 1_000:
-        return f"{value / 1_000:.1f}K"
-    return str(value)
-
-
-def format_cost(value: float, currency: str = "USD") -> str:
-    symbol = {"USD": "$", "CNY": "¥", "RMB": "¥", "EUR": "€"}.get(currency.upper(), "")
-    if not value:
-        return "—"
-    if value < 0.01:
-        return f"{symbol}{value:.4f}" if symbol else f"{value:.4f} {currency}"
-    return f"{symbol}{value:,.2f}" if symbol else f"{value:,.2f} {currency}"
 
 
 def speed_label(model: dict[str, Any]) -> str:
@@ -1182,7 +921,10 @@ def auto_repair_active_inference_path(
 ) -> dict[str, Any]:
     """Repair the endpoint for the protocol this provider's workspace actually probes."""
     protocols = provider.get("protocols") or ["responses"]
-    use_messages = provider.get("workspace") == CLAUDE.name and "messages" in protocols
+    use_messages = (
+        uses_responses_to_anthropic_messages(provider)
+        or (provider.get("workspace") == CLAUDE.name and "messages" in protocols)
+    )
     repair = (
         auto_repair_messages_path(provider, temporary_key)
         if use_messages
@@ -1265,121 +1007,158 @@ class ModelDialog(tk.Toplevel):
         self.destroy()
 
 
-class PriceDialog(tk.Toplevel):
-    """Per-million-token prices for the models this workspace actually uses.
+class ModelMappingDialog(tk.Toplevel):
+    """Edit one model's published alias (``publish_as``).
 
-    A form rather than a JSON file the user has to hand-edit, because a typo in that file is
-    the difference between a cost figure and a silently wrong one. Prices are reference data
-    only: nothing here is ever written back into providers.json.
+    The published alias is the name the app's picker shows and the router answers, while
+    the upstream still receives the real model id.  It exists for opposite reasons on the
+    two sides: Claude Desktop only offers thinking controls and picker entries for
+    claude-* ids it recognises, so a GPT model publishes under a Claude-shaped alias
+    (``juno.anthropic.claude-opus-5``); the Codex App reads capability metadata from
+    the generated catalog whose templates are keyed on known GPT slugs, so a non-GPT
+    model publishes under a catalog-shaped alias (``sierra--gpt-5.6-sol``) to get correct
+    reasoning levels.  Either way the alias stays inside the provider's own namespace.
+    Empty input clears the mapping.
     """
 
-    def __init__(self, parent: tk.Misc, models: list[str], prices: dict[str, Any]):
+    def __init__(
+        self,
+        parent: tk.Misc,
+        model_id: str,
+        current: str,
+        prefix: str,
+        suggestions: list[str],
+        *,
+        workspace_name: str = "claude",
+    ):
         super().__init__(parent)
-        self.title("模型价格（每百万 token）")
-        self.geometry("560x520")
-        self.minsize(520, 380)
+        self.title("模型映射（Claude）" if workspace_name == "claude" else "模型映射（Codex）")
+        self.geometry("560x340")
+        self.minsize(520, 310)
         self.configure(bg=SURFACE)
         self.transient(parent)
         self.grab_set()
-        self.result: dict[str, Any] | None = None
-        self.currency = tk.StringVar(value=str(prices.get("currency") or "USD"))
-        self.rows: dict[str, tuple[tk.StringVar, tk.StringVar]] = {}
+        self.result: str | None = None
+        self.prefix = prefix
+        self.workspace_name = workspace_name
 
-        body = ttk.Frame(self, padding=18, style="Surface.TFrame")
+        prompt = (
+            "在 Claude Desktop 里显示为（可下拉选一个 Claude 型号名，也可自己输入）："
+            if workspace_name == "claude"
+            else "在 Codex App 里显示为（可下拉选一个目录里有的型号名，也可自己输入）："
+        )
+        body = ttk.Frame(self, padding=20)
         body.pack(fill="both", expand=True)
         ttk.Label(
             body,
-            text="填上每百万 token 的单价，留空表示这个模型不计价。",
+            text=f"上游模型 ID：{model_id}",
+            style="Section.TLabel",
+        ).grid(row=0, column=0, sticky="w", pady=(0, 4))
+        ttk.Label(
+            body,
+            text=prompt,
             style="Field.TLabel",
-        ).pack(anchor="w")
-        head = ttk.Frame(body, style="Surface.TFrame")
-        head.pack(fill="x", pady=(8, 10))
-        ttk.Label(head, text="货币", style="Field.TLabel").pack(side="left")
-        ttk.Combobox(
-            head, textvariable=self.currency, width=8, state="readonly",
-            values=("USD", "CNY", "EUR"),
-        ).pack(side="left", padx=(8, 0))
-
-        canvas = tk.Canvas(body, bg=SURFACE, borderwidth=0, highlightthickness=0)
-        scroll = ttk.Scrollbar(body, orient="vertical", command=canvas.yview)
-        canvas.configure(yscrollcommand=scroll.set)
-        scroll.pack(side="right", fill="y")
-        canvas.pack(side="left", fill="both", expand=True)
-        grid = ttk.Frame(canvas, padding=(0, 4, 12, 4), style="Surface.TFrame")
-        window = canvas.create_window((0, 0), window=grid, anchor="nw")
-        grid.bind(
-            "<Configure>", lambda _e: canvas.configure(scrollregion=canvas.bbox("all"))
+            wraplength=520,
+            justify="left",
+        ).grid(row=1, column=0, sticky="w", pady=(0, 6))
+        self.alias_var = tk.StringVar(value=current or (suggestions[0] if suggestions else ""))
+        entry = ttk.Combobox(body, textvariable=self.alias_var, values=suggestions)
+        entry.grid(row=2, column=0, sticky="ew", pady=(0, 4))
+        ttk.Label(
+            body,
+            text=f"命名空间前缀：{prefix or '（旧版默认档，无前缀）'}",
+            style="Field.TLabel",
+        ).grid(row=3, column=0, sticky="w", pady=(0, 10))
+        self.preview_var = tk.StringVar(value="")
+        ttk.Label(
+            body,
+            textvariable=self.preview_var,
+            style="Field.TLabel",
+            wraplength=520,
+            justify="left",
+        ).grid(row=4, column=0, sticky="w", pady=(0, 10))
+        restart_note = (
+            "改完要点「保存并应用」并重新启动 Claude Desktop 才会生效；"
+            "同一个名字不能同时映射给两个模型。"
+            if workspace_name == "claude"
+            else "改完要点「保存并应用」并重新启动 Codex App 才会生效；"
+            "同一个名字不能同时映射给两个模型。"
         )
-        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(window, width=e.width))
-
-        ttk.Label(grid, text="模型", style="Section.TLabel").grid(row=0, column=0, sticky="w")
-        ttk.Label(grid, text="输入价", style="Section.TLabel").grid(row=0, column=1, padx=(12, 0))
-        ttk.Label(grid, text="输出价", style="Section.TLabel").grid(row=0, column=2, padx=(8, 0))
-        for index, model in enumerate(models, start=1):
-            existing = price_for_model(prices, model) or {}
-            money_in = tk.StringVar(value=self._as_text(existing.get("in")))
-            money_out = tk.StringVar(value=self._as_text(existing.get("out")))
-            self.rows[model] = (money_in, money_out)
-            ttk.Label(grid, text=model, style="Field.TLabel").grid(
-                row=index, column=0, sticky="w", pady=2
-            )
-            ttk.Entry(grid, textvariable=money_in, width=11).grid(
-                row=index, column=1, padx=(12, 0), pady=2
-            )
-            ttk.Entry(grid, textvariable=money_out, width=11).grid(
-                row=index, column=2, padx=(8, 0), pady=2
-            )
-        grid.columnconfigure(0, weight=1)
-        if not models:
-            ttk.Label(
-                grid, text="这个工作区还没有启用任何模型。", style="Field.TLabel"
-            ).grid(row=1, column=0, sticky="w")
-
-        actions = ttk.Frame(self, padding=(18, 0, 18, 16), style="Surface.TFrame")
-        actions.pack(fill="x")
-        ttk.Button(actions, text="取消", command=self.destroy).pack(side="right")
-        ttk.Button(
-            actions, text="保存价格", style="Accent.TButton", command=self._accept
-        ).pack(side="right", padx=(0, 8))
+        ttk.Label(
+            body,
+            text=restart_note,
+            style="Field.TLabel",
+            wraplength=520,
+            justify="left",
+        ).grid(row=5, column=0, sticky="w")
+        actions = ttk.Frame(body)
+        actions.grid(row=6, column=0, sticky="e", pady=(14, 0))
+        ttk.Button(actions, text="清除映射", command=self._clear).pack(side="left", padx=(0, 8))
+        ttk.Button(actions, text="取消", command=self.destroy).pack(side="left", padx=(0, 8))
+        ttk.Button(actions, text="确定", style="Accent.TButton", command=self._accept).pack(
+            side="left"
+        )
+        body.columnconfigure(0, weight=1)
+        entry.focus_set()
+        entry.icursor("end")
+        self.alias_var.trace_add("write", lambda *_args: self._update_preview())
+        self.bind("<Return>", lambda _event: self._accept())
         self.bind("<Escape>", lambda _event: self.destroy())
+        self._update_preview()
 
-    @staticmethod
-    def _as_text(value: Any) -> str:
-        if not isinstance(value, (int, float)) or not value:
-            return ""
-        return f"{float(value):g}"
+    def _update_preview(self) -> None:
+        alias = self.alias_var.get().strip()
+        if not alias:
+            self.preview_var.set("（无映射）按原名发布这个模型 ID。")
+            return
+        suffix = (
+            alias[len(self.prefix):]
+            if self.prefix and alias.startswith(self.prefix)
+            else alias
+        )
+        if self.workspace_name != "claude":
+            parts = [f"Codex 里显示为：{alias}"]
+            if suffix in ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"):
+                parts.append("使用完整 GPT 能力模板（含 ultra 推理档）")
+            else:
+                parts.append("⚠ 目录里没有这个名字的模板，会套用默认 GPT 模板")
+            self.preview_var.set("  ·  ".join(parts))
+            return
+        canonical = claude_canonical_model_id(alias)
+        levels = claude_thinking_effort_levels(alias)
+        parts = [f"Claude 解析为：{canonical}"]
+        parts.append(claude_thinking_summary(alias))
+        if claude_supports_1m_context(alias):
+            parts.append("会附加 [1m] 长上下文入口")
+        if canonical == alias:
+            parts.append("（本身就是标准 Claude 名）")
+        if levels is None and not canonical.startswith("claude-"):
+            parts.append("⚠ Claude 可能不认识这个名字，建议用 claude- 开头的型号名")
+        self.preview_var.set("  ·  ".join(parts))
+
+    def _clear(self) -> None:
+        self.result = ""
+        self.destroy()
 
     def _accept(self) -> None:
-        table: dict[str, dict[str, float]] = {}
-        for model, (money_in, money_out) in self.rows.items():
-            entry = {}
-            for side, variable in (("in", money_in), ("out", money_out)):
-                # NFKC folds the full-width digits and full-width period a Chinese IME produces
-                # into ASCII.  A comma is deliberately NOT stripped: "2,5" meant as a decimal
-                # comma would silently become 25, so it is rejected rather than guessed at.
-                text = unicodedata.normalize("NFKC", variable.get()).strip()
-                if not text:
-                    continue
-                try:
-                    value = float(text)
-                except ValueError:
-                    messagebox.showerror(
-                        "价格无效", f"{model} 的{'输入' if side == 'in' else '输出'}价"
-                        f"不是数字：{text}", parent=self,
-                    )
-                    return
-                if value < 0:
-                    messagebox.showerror("价格无效", f"{model} 的价格不能是负数。", parent=self)
-                    return
-                entry[side] = value
-            if entry:
-                table[model] = {**DEFAULT_PRICE, **entry}
-        self.result = {
-            "version": 1,
-            "currency": self.currency.get().strip() or "USD",
-            "models": table,
-        }
+        alias = self.alias_var.get().strip()
+        if alias and self.prefix and not alias.startswith(self.prefix):
+            messagebox.showerror(
+                "映射名必须在供应商命名空间里",
+                f"映射名必须以本供应商的前缀开头：\n{self.prefix}…\n\n"
+                "否则 Claude 里会看到一个无法追溯账号的裸名字，请求会被路由器拒绝。",
+                parent=self,
+            )
+            return
+        if alias and len(alias) <= len(self.prefix or ""):
+            messagebox.showerror(
+                "映射名无效", "映射名不能只有前缀，前缀后面要有型号名。", parent=self
+            )
+            return
+        self.result = alias
         self.destroy()
+
+
 
 
 class CodexSotaApp(tk.Tk):
@@ -1410,9 +1189,6 @@ class CodexSotaApp(tk.Tk):
         self._busy = False
         self.workspace = CODEX
         self.workspace_var = tk.StringVar(value=CODEX.name)
-        # Last usage roll-up, so the CSV export and the price dialog work off what is on screen
-        # instead of re-scanning a multi-megabyte log.
-        self._usage_summary: dict[str, Any] = {}
         self._launch_phase = "正在启动 Codex"
         self._protected = False
         self._id_touched = False
@@ -1637,16 +1413,12 @@ class CodexSotaApp(tk.Tk):
         self.config_tab = ttk.Frame(self.notebook, style="Surface.TFrame", padding=22)
         self.models_tab = ttk.Frame(self.notebook, style="Surface.TFrame", padding=18)
         self.tools_tab = ttk.Frame(self.notebook, style="Surface.TFrame", padding=20)
-        self.usage_tab = ttk.Frame(self.notebook, style="Surface.TFrame", padding=20)
         self.notebook.add(self.config_tab, text="供应商配置")
         self.notebook.add(self.models_tab, text="模型选择")
         self.notebook.add(self.tools_tab, text="状态工具")
-        self.notebook.add(self.usage_tab, text="用量花费")
         self._build_config_tab()
         self._build_models_tab()
         self._build_tools_tab()
-        self._build_usage_tab()
-        self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
         self._bind_shortcuts()
 
         footer = ttk.Frame(self, padding=(18, 11))
@@ -1809,8 +1581,12 @@ class CodexSotaApp(tk.Tk):
 
         model_actions = ttk.Frame(tab, style="Surface.TFrame")
         model_actions.grid(row=3, column=0, sticky="ew", pady=(12, 0))
+        self.map_model_button = ttk.Button(
+            model_actions, text="模型映射", command=self._edit_model_mapping
+        )
+        self.map_model_button.pack(side="left")
         self.test_models_button = ttk.Button(model_actions, text="测试已勾选模型", command=self._test_selected_models)
-        self.test_models_button.pack(side="left")
+        self.test_models_button.pack(side="left", padx=(8, 0))
         self.measure_fast_button = ttk.Button(model_actions, text="测量 Fast 提速", command=self._measure_fast_selected_models)
         self.measure_fast_button.pack(side="left", padx=(8, 0))
         self.speed_button = ttk.Button(model_actions, text="切换 标准/快速", command=self._toggle_speed_selected)
@@ -1827,16 +1603,18 @@ class CodexSotaApp(tk.Tk):
 
         table = ttk.Frame(tab, style="Surface.TFrame")
         table.grid(row=2, column=0, sticky="nsew")
-        columns = ("enabled", "model", "display", "status", "speed")
+        columns = ("enabled", "model", "publish", "display", "status", "speed")
         self.model_tree = ttk.Treeview(table, columns=columns, show="headings", selectmode="extended")
         self.model_tree.heading("enabled", text="启用")
         self.model_tree.heading("model", text="模型 ID")
+        self.model_tree.heading("publish", text="发布名（映射）")
         self.model_tree.heading("display", text="显示名称")
         self.model_tree.heading("status", text="测试")
         self.model_tree.heading("speed", text="速度")
         self.model_tree.column("enabled", width=56, minwidth=56, anchor="center", stretch=False)
-        self.model_tree.column("model", width=260, minwidth=180)
-        self.model_tree.column("display", width=260, minwidth=160)
+        self.model_tree.column("model", width=220, minwidth=160)
+        self.model_tree.column("publish", width=210, minwidth=140)
+        self.model_tree.column("display", width=220, minwidth=140)
         self.model_tree.column("status", width=92, minwidth=80, anchor="center", stretch=False)
         self.model_tree.column("speed", width=84, minwidth=72, anchor="center", stretch=False)
         scroll = ttk.Scrollbar(table, orient="vertical", command=self.model_tree.yview)
@@ -1868,10 +1646,12 @@ class CodexSotaApp(tk.Tk):
             return
         model = self.draft_models[index]
         if not model.get("enabled"):
-            self.route_chain_var.set(f"路由链：{model['id']} 未启用，Codex 里看不到它")
+            self.route_chain_var.set(
+                f"路由链：{model['id']} 未启用，{self.workspace.label} 里看不到它"
+            )
             return
         provider = self.registry_snapshot_with_form()
-        slug = str(provider.get("prefix") or "") + model["id"]
+        slug = published_slug(provider, model)
         chain = failover_chain(self._registry_for_routing(provider), slug)
         if not chain:
             self.route_chain_var.set(f"路由链：{slug} 目前不可路由（供应商或模型未启用）")
@@ -1880,7 +1660,14 @@ class CodexSotaApp(tk.Tk):
         arrow = "  →  ".join(names.get(vendor, vendor) for vendor, _model in chain)
         speed = "快速" if model.get("fast_tier_forced") else "标准"
         tail = "（只有这一家；勾上「这家失败时自动换别家」才会有备用）" if len(chain) == 1 else ""
-        self.route_chain_var.set(f"路由链：{slug}［{speed}］  {arrow}{tail}")
+        mapping = ""
+        mapping_value = str(model.get("publish_as") or "")
+        if self.workspace is CLAUDE and mapping_value:
+            mapping = (
+                f"  ·  Claude 里显示 {claude_canonical_model_id(mapping_value)}"
+                f"（{claude_thinking_summary(mapping_value)}）"
+            )
+        self.route_chain_var.set(f"路由链：{slug}［{speed}］  {arrow}{tail}{mapping}")
 
     def registry_snapshot_with_form(self) -> dict[str, Any]:
         """The provider as currently edited, falling back to the saved copy if the form is invalid."""
@@ -2025,120 +1812,6 @@ class CodexSotaApp(tk.Tk):
         )
         self.log_text.pack(fill="both", expand=True)
 
-    def _build_usage_tab(self) -> None:
-        """Spend and traffic, read out of the same router log the health board uses.
-
-        Reading only: nothing on this tab touches providers.json, and the price table it
-        multiplies by lives in its own file so a wrong number here can never break a launch.
-        """
-        tab = self.usage_tab
-        self.usage_total_var = tk.StringVar(value="全部：统计中")
-        self.usage_today_var = tk.StringVar(value="今日：统计中")
-        self.usage_span_var = tk.StringVar(value="")
-        self.usage_note_var = tk.StringVar(value="")
-
-        metrics = ttk.Frame(tab, style="Surface.TFrame")
-        metrics.pack(fill="x", pady=(0, 10))
-        ttk.Label(metrics, textvariable=self.usage_today_var, style="Section.TLabel").pack(
-            side="left"
-        )
-        ttk.Label(metrics, textvariable=self.usage_total_var, style="Section.TLabel").pack(
-            side="left", padx=(32, 0)
-        )
-        ttk.Label(tab, textvariable=self.usage_span_var, style="Field.TLabel").pack(
-            anchor="w", pady=(0, 12)
-        )
-
-        tools = ttk.Frame(tab, style="Surface.TFrame")
-        tools.pack(fill="x", pady=(0, 14))
-        self.usage_refresh_button = ttk.Button(
-            tools, text="刷新用量", command=lambda: self._refresh_usage(True)
-        )
-        self.usage_refresh_button.pack(side="left")
-        self.usage_price_button = ttk.Button(
-            tools, text="编辑价格表", command=self._edit_usage_prices
-        )
-        self.usage_price_button.pack(side="left", padx=(8, 0))
-        self.usage_open_price_button = ttk.Button(
-            tools,
-            text="打开价格文件",
-            command=lambda: self._open_path(self.workspace.usage_prices_path),
-        )
-        self.usage_open_price_button.pack(side="left", padx=(8, 0))
-        self.usage_export_button = ttk.Button(
-            tools, text="导出用量 CSV", command=self._export_usage_csv
-        )
-        self.usage_export_button.pack(side="left", padx=(8, 0))
-
-        ttk.Label(tab, text="按模型", style="Section.TLabel").pack(anchor="w", pady=(0, 6))
-        model_frame = ttk.Frame(tab, style="Surface.TFrame")
-        model_frame.pack(fill="both", expand=True, pady=(0, 14))
-        self.usage_model_tree = self._usage_tree(
-            model_frame,
-            (
-                ("model", "模型", 200, "w"),
-                ("vendors", "供应商", 150, "w"),
-                ("requests", "请求数", 80, "center"),
-                ("tokens_in", "输入 token", 104, "e"),
-                ("tokens_out", "输出 token", 104, "e"),
-                ("cost", "花费", 104, "e"),
-                ("priced", "计价", 60, "center"),
-            ),
-        )
-
-        ttk.Label(tab, text="按供应商", style="Section.TLabel").pack(anchor="w", pady=(0, 6))
-        vendor_frame = ttk.Frame(tab, style="Surface.TFrame")
-        vendor_frame.pack(fill="both", expand=True, pady=(0, 10))
-        self.usage_vendor_tree = self._usage_tree(
-            vendor_frame,
-            (
-                ("vendor", "供应商", 200, "w"),
-                ("requests", "请求数", 80, "center"),
-                ("rate", "成功率", 84, "center"),
-                ("p50", "p50 延迟", 96, "center"),
-                ("p95", "p95 延迟", 96, "center"),
-                ("tokens", "token 合计", 116, "e"),
-                ("cost", "花费", 104, "e"),
-            ),
-        )
-        ttk.Label(tab, textvariable=self.usage_note_var, style="Field.TLabel", wraplength=880).pack(
-            anchor="w"
-        )
-
-    def _on_tab_changed(self, _event: Any = None) -> None:
-        """Repaint the usage tab when it comes into view, so it is never showing stale spend.
-
-        Silent and cheap: one tail read of a local file, and skipped while a task holds the UI.
-        """
-        if self._closing or self._busy:
-            return
-        try:
-            if self.notebook.select() == str(self.usage_tab):
-                self._refresh_usage()
-        except tk.TclError:
-            pass
-
-    @staticmethod
-    def _usage_tree(
-        parent: ttk.Frame, columns: tuple[tuple[str, str, int, str], ...]
-    ) -> ttk.Treeview:
-        """A scrolled, read-only Treeview — the same shape the health board uses."""
-        names = tuple(column[0] for column in columns)
-        tree = ttk.Treeview(parent, columns=names, show="headings", height=6, selectmode="none")
-        for column, title, width, anchor in columns:
-            tree.heading(column, text=title)
-            tree.column(
-                column, width=width, minwidth=max(48, width - 24), anchor=anchor, stretch=False
-            )
-        scroll = ttk.Scrollbar(parent, orient="vertical", command=tree.yview)
-        tree.configure(yscrollcommand=scroll.set)
-        tree.pack(side="left", fill="both", expand=True)
-        scroll.pack(side="right", fill="y")
-        tree.tag_configure("good", foreground=SUCCESS)
-        tree.tag_configure("warn", foreground=WARNING)
-        tree.tag_configure("bad", foreground=DANGER)
-        return tree
-
     def _bind_shortcuts(self) -> None:
         """Accelerators for the actions that get used every session."""
         for sequence, handler in (
@@ -2188,8 +1861,6 @@ class CodexSotaApp(tk.Tk):
             self._show_error(f"无法载入 {wanted.label} 配置", error)
             return
         self._run_audit()
-        # Usage is per workspace too: the Claude router keeps its own log and its own prices.
-        self._refresh_usage()
 
     def _reset_editor(self) -> None:
         """Clear every editor field so nothing from the previous provider leaks forward."""
@@ -2222,7 +1893,6 @@ class CodexSotaApp(tk.Tk):
             self._run_audit()
         except Exception as error:
             self._show_error("无法载入 codex-sota 配置", error)
-        self._refresh_usage()
         self.after(HEALTH_REFRESH_MS, self._tick_health)
 
     def _load_registry(self, select_id: str | None = None) -> None:
@@ -2530,9 +2200,9 @@ class CodexSotaApp(tk.Tk):
             extra_headers = json.loads(self.headers_text.get("1.0", "end").strip() or "{}")
         except json.JSONDecodeError as error:
             raise ValueError("附加请求头不是有效 JSON。") from error
-        # A registry needs exactly one enabled default, and a default must carry an empty
-        # prefix. In a brand new workspace nothing holds that role, so the first provider
-        # saved takes it — otherwise the very first save can never pass validation.
+        # A registry needs exactly one enabled default.  Claude's legacy Messages profile keeps
+        # that first provider bare for compatibility; Codex must namespace it just like every
+        # other Responses provider so a lost model slug can never select the default account.
         first_in_workspace = existing is None and not self._enabled_default_exists()
         provider = existing or {
             "id": provider_id,
@@ -2557,7 +2227,14 @@ class CodexSotaApp(tk.Tk):
             if existing and existing.get("protected")
             else {}
         )
-        prefix = "" if first_in_workspace else self.prefix_var.get().strip()
+        protocols = draft_protocols(
+            self.proto_responses_var.get(),
+            self.proto_messages_var.get(),
+            self.workspace,
+        )
+        prefix = self.prefix_var.get().strip()
+        if first_in_workspace and self.workspace is not CLAUDE and not prefix:
+            prefix = derive_model_prefix(provider_id, protocols)
         provider.update(
             {
                 "id": provider_id,
@@ -2567,11 +2244,7 @@ class CodexSotaApp(tk.Tk):
                 "workspace": self.workspace.name,
                 "enabled": self.enabled_var.get(),
                 "allow_failover": self.failover_var.get(),
-                "protocols": draft_protocols(
-                    self.proto_responses_var.get(),
-                    self.proto_messages_var.get(),
-                    self.workspace,
-                ),
+                "protocols": protocols,
                 "auth_header": self.auth_header_var.get().strip(),
                 "auth_prefix": self.auth_prefix_var.get(),
                 "models_path": self.models_path_var.get().strip(),
@@ -2608,6 +2281,7 @@ class CodexSotaApp(tk.Tk):
                 values=(
                     "✓" if model.get("enabled") else "",
                     model["id"],
+                    str(model.get("publish_as") or ""),
                     display,
                     status_text,
                     speed_label(model),
@@ -2673,6 +2347,112 @@ class CodexSotaApp(tk.Tk):
             if 0 <= index < len(self.draft_models):
                 self.draft_models.pop(index)
         self._render_models()
+
+    def _model_mapping_prefix(self) -> str:
+        """The namespace a publish_as alias for the edited provider must stay inside."""
+        provider = self.registry_snapshot_with_form()
+        if provider.get("workspace") == CLAUDE.name and allows_legacy_bare_model(provider):
+            return ""
+        return str(provider.get("prefix") or "") or str(effective_model_prefix(provider) or "")
+
+    def _edit_model_mapping(self) -> None:
+        """Publish one model under a client-recognisable alias (``publish_as``)."""
+        if self._busy:
+            return
+        if self._blank_editor():
+            messagebox.showinfo("先选一家供应商", "先在左侧选中一家供应商，再设置模型映射。", parent=self)
+            return
+        selection = self.model_tree.selection()
+        if len(selection) != 1:
+            messagebox.showwarning(
+                "先选一个模型", "在模型列表里选中一行（只选一个），再点「模型映射」。", parent=self
+            )
+            return
+        index = self._model_index_from_item(selection[0])
+        if index is None or not 0 <= index < len(self.draft_models):
+            return
+        model = self.draft_models[index]
+        provider = self.registry_snapshot_with_form()
+        protocols = provider.get("protocols") or (
+            ["messages"] if self.workspace is CLAUDE else ["responses"]
+        )
+        if self.workspace is CLAUDE:
+            if "responses" in protocols or "messages" not in protocols:
+                messagebox.showerror(
+                    "这家供应商不支持映射",
+                    "Claude 侧的模型映射只对只说 Anthropic Messages 协议的供应商有效；\n"
+                    "这家还勾了 OpenAI Responses 协议，映射会被校验拒绝。",
+                    parent=self,
+                )
+                return
+        elif "responses" not in protocols:
+            messagebox.showerror(
+                "这家供应商不支持映射",
+                "Codex 侧的模型映射只对说 OpenAI Responses 协议的供应商有效；\n"
+                "这家只说 Anthropic Messages 协议。",
+                parent=self,
+            )
+            return
+        prefix = self._model_mapping_prefix()
+        current = str(model.get("publish_as") or "")
+        if self.workspace is CLAUDE:
+            # Claude families Claude Desktop actually recognises, most useful first. Opus
+            # and the fable/mythos family carry the full thinking slider. The suffix list
+            # mirrors claude_desktop's capability tables.
+            suffixes = (
+                "claude-opus-5",
+                "claude-opus-4-8",
+                "claude-fable-5",
+                "claude-mythos-5",
+                "claude-opus-4-7",
+                "claude-opus-4-6",
+                "claude-sonnet-5",
+                "claude-sonnet-4-6",
+                "claude-sonnet-4-5",
+                "claude-haiku-4-5",
+            )
+        else:
+            # Slugs the generated catalog has real templates for, so a mapped model picks
+            # up correct reasoning levels and context metadata.
+            suffixes = (
+                "gpt-5.6-sol",
+                "gpt-5.6-terra",
+                "gpt-5.6-luna",
+                "gpt-6-astra",
+                "gpt-5.5",
+                "gpt-5.4",
+                "gpt-5.4-mini",
+            )
+        suggestions = [prefix + suffix for suffix in suffixes]
+        dialog = ModelMappingDialog(
+            self,
+            model["id"],
+            current,
+            prefix,
+            suggestions,
+            workspace_name=self.workspace.name,
+        )
+        self.wait_window(dialog)
+        if dialog.result is None:
+            return
+        alias = dialog.result
+        model["publish_as"] = alias
+        self._render_models()
+        if self.model_tree.exists(f"model_{index}"):
+            self.model_tree.selection_set(f"model_{index}")
+        if alias:
+            if self.workspace is CLAUDE:
+                self._append_log(
+                    f"{model['id']} 已映射为 {alias}（Claude 里显示为 "
+                    f"{claude_canonical_model_id(alias)}）。点「保存并应用」后生效。"
+                )
+            else:
+                self._append_log(
+                    f"{model['id']} 已映射为 {alias}（Codex 里按这个名字选模型、套用对应能力模板）。"
+                    "点「保存并应用」后生效。"
+                )
+        else:
+            self._append_log(f"{model['id']} 的模型映射已清除。点「保存并应用」后生效。")
 
     def _probe_key(self) -> str | None:
         value = self.api_key_var.get().strip()
@@ -3202,7 +2982,7 @@ class CodexSotaApp(tk.Tk):
         if auth_problem:
             messagebox.showerror(
                 "启动失败",
-                "True SOTA API key 不可用。这样启动的话，启动器会停在一个你看不见的"
+                "Tango Relay API key 不可用。这样启动的话，启动器会停在一个你看不见的"
                 "输入提示上，永远不返回。\n\n"
                 f"{auth_problem}\n\n"
                 "请在 PowerShell 里运行 codex-sota，按提示粘贴 key，然后再回来启动。",
@@ -3916,6 +3696,12 @@ class CodexSotaApp(tk.Tk):
                 f"{len(report['kept_headers'])} 个打码的请求头沿用磁盘上的现值，"
                 "不会写成 <redacted>。"
             )
+        if report.get("protected_identity_pinned"):
+            lines.append(
+                "受保护供应商的身份字段沿用磁盘上的现值："
+                + "、".join(report["protected_identity_pinned"][:12])
+                + (" 等" if len(report["protected_identity_pinned"]) > 12 else "")
+            )
         if report["needs_key"]:
             lines.append("恢复后还缺 API Key：" + "、".join(report["needs_key"]))
         lines += [
@@ -4218,179 +4004,6 @@ class CodexSotaApp(tk.Tk):
             text=f"流量：最近 {total} 次请求 / {len(rows)} 家上游" if rows else "流量：还没有路由记录"
         )
 
-    def _refresh_usage(self, announce: bool = False) -> None:
-        """Re-read the router log and repaint the usage tab.
-
-        Both the log read and the price read are file reads that can be slow on a large log, so
-        they go through `_run_task` and off the UI thread. Nothing here contacts an upstream.
-        """
-        prices_path = self.workspace.usage_prices_path
-        log_path = self.workspace.log_path
-
-        def worker() -> dict[str, Any]:
-            return read_router_usage(log_path, load_usage_prices(prices_path))
-
-        def done(summary: dict[str, Any]) -> None:
-            self._render_usage(summary)
-            if announce:
-                self._append_log(
-                    f"用量已刷新：{summary['lines']} 条记录，"
-                    f"合计 {format_cost(summary['totals'].get('cost', 0.0), summary['currency'])}"
-                )
-
-        if announce:
-            self._run_task("统计用量…", worker, done)
-            return
-        # The first paint happens while the window is still opening, where _run_task's busy
-        # lock would fight the startup audit -- so do it inline; it is one bounded file read.
-        try:
-            done(worker())
-        except Exception:  # noqa: BLE001 - an empty usage tab must never block startup
-            self.usage_note_var.set("读取用量失败，点「刷新用量」重试。")
-
-    def _render_usage(self, summary: dict[str, Any]) -> None:
-        currency = summary.get("currency", "USD")
-        self._usage_summary = summary
-        today, totals = summary["today"], summary["totals"]
-        self.usage_today_var.set(
-            f"今日：{today['requests']} 次 / {format_tokens(today['tokens'])} token / "
-            f"{format_cost(today.get('cost', 0.0), currency)}"
-        )
-        self.usage_total_var.set(
-            f"全部：{totals['requests']} 次 / {format_tokens(totals['tokens'])} token / "
-            f"{format_cost(totals.get('cost', 0.0), currency)}"
-        )
-        span = ""
-        if summary["first_time"] and summary["last_time"]:
-            span = (
-                str(summary["first_time"]).replace("T", " ").rstrip("Z")
-                + " → "
-                + str(summary["last_time"]).replace("T", " ").rstrip("Z")
-                + f"（UTC，日志 {summary['log_bytes'] / 1024:.0f} KB）"
-            )
-        elif not summary["lines"]:
-            span = "还没有路由记录。启动 Codex 跑一次请求，这里就会有数字。"
-        self.usage_span_var.set(span)
-
-        self.usage_model_tree.delete(*self.usage_model_tree.get_children())
-        for model, row in sorted(
-            summary["models"].items(), key=lambda item: (-item[1]["tokens"], item[0])
-        ):
-            self.usage_model_tree.insert(
-                "",
-                "end",
-                values=(
-                    model,
-                    "、".join(row.get("vendors") or []),
-                    row["requests"],
-                    format_tokens(row["tokens_in"]),
-                    format_tokens(row["tokens_out"]),
-                    format_cost(row.get("cost", 0.0), currency),
-                    "是" if row.get("priced") else "未定价",
-                ),
-                tags=("good" if row.get("priced") else "warn",),
-            )
-        self.usage_vendor_tree.delete(*self.usage_vendor_tree.get_children())
-        for vendor, row in sorted(
-            summary["vendors"].items(), key=lambda item: (-item[1]["requests"], item[0])
-        ):
-            rate = row["success_rate"]
-            self.usage_vendor_tree.insert(
-                "",
-                "end",
-                values=(
-                    vendor,
-                    row["requests"],
-                    f"{rate * 100:.0f}%",
-                    f"{row['p50_ms']} ms" if row["p50_ms"] else "-",
-                    f"{row['p95_ms']} ms" if row["p95_ms"] else "-",
-                    format_tokens(row["tokens"]),
-                    format_cost(row.get("cost", 0.0), currency),
-                ),
-                tags=("good" if rate >= 0.95 else ("warn" if rate > 0 else "bad"),),
-            )
-
-        notes: list[str] = []
-        if summary["legacy_lines"]:
-            notes.append(
-                f"其中 {summary['legacy_lines']} 条是升级前写的旧记录，只有请求数没有 token，"
-                "花费统计从升级那一刻算起。"
-            )
-        if summary.get("unpriced"):
-            notes.append("这些模型还没填价格：" + "、".join(summary["unpriced"][:8]))
-        if summary["truncated"]:
-            notes.append("日志太大，只统计了最近 8 MB。")
-        self.usage_note_var.set("　".join(notes))
-
-    def _edit_usage_prices(self) -> None:
-        if self._busy:
-            return
-        prices = load_usage_prices(self.workspace.usage_prices_path)
-        # Everything worth pricing: the models the registry offers, plus anything the log has
-        # actually billed for (a model can outlive its provider entry) and any stale price row.
-        names = {
-            str(model.get("id") or "")
-            for provider in self.registry.get("providers", [])
-            for model in provider.get("models", [])
-            if model.get("id")
-        }
-        names.update(getattr(self, "_usage_summary", {}).get("models", {}))
-        names.update(prices.get("models") or {})
-        dialog = PriceDialog(self, sorted(names), prices)
-        self.wait_window(dialog)
-        if dialog.result is None:
-            return
-        try:
-            save_usage_prices(self.workspace.usage_prices_path, dialog.result)
-        except OSError as error:
-            self._show_error("价格未保存", error)
-            return
-        self._append_log(f"价格表已保存（{len(dialog.result['models'])} 个模型计价）")
-        self._refresh_usage()
-
-    def _export_usage_csv(self) -> None:
-        summary = getattr(self, "_usage_summary", None)
-        if not summary or not summary["lines"]:
-            messagebox.showinfo("没有用量", "还没有可导出的路由记录。", parent=self)
-            return
-        default = "codex-sota-usage-" + time.strftime("%Y%m%d-%H%M%S") + ".csv"
-        path = filedialog.asksaveasfilename(
-            parent=self,
-            title="导出用量",
-            defaultextension=".csv",
-            initialfile=default,
-            filetypes=[("CSV 文件", "*.csv"), ("所有文件", "*.*")],
-        )
-        if not path:
-            return
-        currency = summary.get("currency", "USD")
-        rows = [("类别", "名称", "供应商", "请求数", "成功率", "输入token", "输出token", f"花费({currency})")]
-        for model, row in sorted(summary["models"].items()):
-            rows.append((
-                "模型", model, " ".join(row.get("vendors") or []), row["requests"],
-                f"{row['success_rate'] * 100:.1f}%", row["tokens_in"], row["tokens_out"],
-                f"{row.get('cost', 0.0):.6f}",
-            ))
-        for vendor, row in sorted(summary["vendors"].items()):
-            rows.append((
-                "供应商", vendor, "", row["requests"], f"{row['success_rate'] * 100:.1f}%",
-                row["tokens_in"], row["tokens_out"], f"{row.get('cost', 0.0):.6f}",
-            ))
-        totals = summary["totals"]
-        rows.append((
-            "合计", "", "", totals["requests"], f"{totals['success_rate'] * 100:.1f}%",
-            totals["tokens_in"], totals["tokens_out"], f"{totals.get('cost', 0.0):.6f}",
-        ))
-        try:
-            # utf-8-sig: Excel on a Chinese Windows opens a plain UTF-8 CSV as mojibake, and the
-            # BOM is the only thing that makes it guess right without an import wizard.
-            with Path(path).open("w", encoding="utf-8-sig", newline="") as handle:
-                csv.writer(handle).writerows(rows)
-        except OSError as error:
-            self._show_error("导出失败", error)
-            return
-        self._append_log(f"用量已导出到 {path}")
-
     def _export_log(self) -> None:
         content = self.log_text.get("1.0", "end").strip()
         if not content:
@@ -4533,14 +4146,11 @@ class CodexSotaApp(tk.Tk):
             self.backup_config_button,
             self.restore_config_button,
             self.lint_button,
+            self.map_model_button,
             self.claude_publish_button,
             self.claude_release_button,
             self.claude_switch_button,
             self.claude_refresh_button,
-            self.usage_refresh_button,
-            self.usage_price_button,
-            self.usage_open_price_button,
-            self.usage_export_button,
         ):
             widget.configure(state=general_state)
         if busy:

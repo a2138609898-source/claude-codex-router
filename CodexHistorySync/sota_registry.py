@@ -64,7 +64,7 @@ class Workspace:
 
     @property
     def source_catalog_path(self) -> Path:
-        return self.root / "true-sota-model-catalog.json"
+        return self.root / "tango-relay-model-catalog.json"
 
     @property
     def secrets_root(self) -> Path:
@@ -85,16 +85,6 @@ class Workspace:
     @property
     def pid_path(self) -> Path:
         return self.root / "sota-router.pid"
-
-    @property
-    def usage_prices_path(self) -> Path:
-        """Per-million-token prices the usage panel multiplies the router log by.
-
-        Kept per workspace, and kept out of providers.json: it is reference data the user
-        types in, not routing configuration, so a bad price can never break a launch and
-        editing it never rewrites the registry the router is watching.
-        """
-        return self.root / "usage-prices.json"
 
     @property
     def health_url(self) -> str:
@@ -142,16 +132,29 @@ PROBE_ORIGINATOR = "codex_cli_rs"
 # Codex App uses; "messages" is the Anthropic Messages shape Claude Desktop speaks in
 # third-party inference mode. A gateway may offer both.
 PROTOCOLS = ("responses", "messages")
+# A Codex workspace still publishes this provider as a Responses model, but its upstream
+# inference endpoint is Anthropic Messages.  Keep the marker in the registry so probes and the
+# local router can opt into the translation without changing the protocol advertised to Codex.
+RESPONSES_TO_ANTHROPIC_MESSAGES_ADAPTER = "responses_to_anthropic_messages"
 # How many vendors one request may be handed to before giving up.
 FAILOVER_MAX_ATTEMPTS = 3
 # What `protected` actually protects.  A protected entry is one whose *identity* this app does not
-# own: the codex_auth provider borrows the Codex App's own login, base URL and model prefix, and
-# rewriting any of these either points its models at the wrong endpoint or renames slugs the app
-# already has pinned in config.toml.  Everything else about such a provider -- above all its model
-# list -- is ordinary user data, so these keys are pinned back to whatever is on disk instead of the
-# whole write being refused.  `auth_type`, `secret_file`, `entropy`, `is_default` and `protected`
-# itself are not listed because no editor form owns them; they are already carried over untouched.
+# own: the codex_auth provider borrows the Codex App's own login and base URL. Its model prefix is
+# also pinned because it is part of the published slug written into config.toml and the catalog;
+# changing it without a coordinated migration would retarget existing selections. Everything else
+# about such a provider -- above all its model list and the enable/failover switches -- is ordinary
+# user data, so it may still be edited.  Every field that can change where credentials, requests,
+# or model slugs go is pinned back to the copy on disk instead of trusting a stale form, backup, or
+# caller-supplied object.  Keep this list shared by the manager and the registry writer: adding an
+# identity field in only one of those paths would reopen the silent-default/account-switch bug.
 PROTECTED_PINNED_PROVIDER_KEYS = (
+    "protected",
+    "is_default",
+    "auth_type",
+    "secret_file",
+    "entropy",
+    "workspace",
+    "request_adapter",
     "base_url",
     "prefix",
     "protocols",
@@ -215,17 +218,113 @@ def derive_model_prefix(provider_id: str, protocols: Any = None) -> str:
     return label + "--"
 
 
+def allows_legacy_bare_model(provider: dict[str, Any]) -> bool:
+    """Whether this provider is allowed to publish a model without a vendor namespace.
+
+    Claude Desktop's Messages-only compatibility profile predates the multi-vendor router and
+    intentionally keeps its single default model bare.  Every other workspace/protocol must
+    carry an explicit namespace: a missing prefix is provenance loss, and provenance loss must
+    fail closed instead of selecting whichever account happens to be default.
+    """
+    workspace = str(provider.get("workspace") or CODEX.name)
+    protocols = provider.get("protocols") or ["responses"]
+    if isinstance(protocols, str):
+        protocols = [protocols]
+    return (
+        workspace == CLAUDE.name
+        and provider.get("is_default") is True
+        and "messages" in protocols
+        and "responses" not in protocols
+    )
+
+
+def effective_model_prefix(provider: dict[str, Any]) -> str:
+    """Return the namespace to use even when handed an old, unvalidated registry entry.
+
+    ``validate_provider`` repairs a missing prefix while loading the normal on-disk registry,
+    but catalog builders, previews, and recovery/import paths can receive a raw provider
+    dictionary.  Letting those callers concatenate ``"" + model_id`` recreates the exact
+    provenance loss the router is meant to prevent: the picker advertises a bare model and a
+    later request has no way to identify its billing account.  The only intentional exception is
+    Claude's original Messages-only default, whose bare name is part of that product's profile.
+    Invalid non-empty prefixes are left untouched here; the strict validator/router will reject
+    them rather than silently retargeting a hand-edited configuration.
+    """
+    raw_prefix = provider.get("prefix")
+    prefix = str(raw_prefix or "")
+    if prefix or allows_legacy_bare_model(provider):
+        return prefix
+    provider_id = str(provider.get("id") or "").strip().lower()
+    if not ID_PATTERN.fullmatch(provider_id):
+        # A malformed raw entry must not acquire a guessed namespace.  Returning the empty
+        # value keeps the caller's result visibly invalid; strict loading will fail closed.
+        return prefix
+    return derive_model_prefix(provider_id, provider.get("protocols"))
+
+
+def allows_provider_publish_as(
+    provider: dict[str, Any], publish_as: str, prefix: str | None = None
+) -> bool:
+    """Whether this provider's model may publish under ``publish_as`` safely.
+
+    ``publish_as`` must never become a second way to erase the provider identity, so the
+    alias always has to stay inside the provider's own published namespace:
+
+    * Claude Messages-only providers publish Claude-shaped names
+      (``juno.anthropic.claude-opus-5``) because Claude Desktop's capability lookup
+      only recognises claude-* ids.  The one legacy default Messages profile may use a
+      bare alias.
+    * Codex Responses providers publish catalog-shaped names
+      (``sierra--gpt-5.6-sol``) because the Codex App reads its capability metadata from
+      the generated catalog, whose templates are keyed on known model names -- an unknown
+      id silently falls back to the default GPT template with the wrong reasoning levels.
+
+    Either way the upstream still receives ``model["id"]``; only the selectable name and
+    the capability template change.
+    """
+    if not publish_as:
+        return False
+    protocols = provider.get("protocols") or ["responses"]
+    if isinstance(protocols, str):
+        protocols = [protocols]
+    workspace = str(provider.get("workspace") or CODEX.name)
+    if workspace == CLAUDE.name:
+        if "messages" not in protocols or "responses" in protocols:
+            return False
+        if allows_legacy_bare_model(provider):
+            return True
+    elif workspace == CODEX.name:
+        if "responses" not in protocols:
+            return False
+    else:
+        return False
+    namespace = prefix if prefix is not None else effective_model_prefix(provider)
+    # A non-default provider must have a namespace after validation.  Require a non-empty suffix
+    # as well, so the prefix itself cannot masquerade as a selectable model.
+    return bool(namespace) and publish_as.startswith(namespace) and len(publish_as) > len(namespace)
+
+
+# Historical name kept for callers written before the Codex side existed.
+allows_claude_messages_publish_as = allows_provider_publish_as
+
+
 def published_slug(provider: dict[str, Any], model: dict[str, Any]) -> str:
     """The slug clients select this model by -- `publish_as` when set, else `prefix + id`.
 
     Only the published slug is ever matched against a request or advertised to an app; the
     upstream always receives `model["id"]`. Keeping the two apart is what lets a model whose
-    vendor id defeats Claude Desktop's capability lookup still be offered under a name the app
-    recognizes. `publish_as` is rejected for anything that speaks responses (see
-    validate_provider), so on the Codex side this is always plain `prefix + id`.
+    vendor id defeats a client's capability lookup still be offered under a name the app
+    recognizes: a Claude-shaped alias for Claude Desktop, a catalog-shaped one for Codex.
+    The alias must always retain the provider namespace, or be the legacy default's bare
+    Claude alias.
     """
-    override = str(model.get("publish_as") or "")
-    return override or str(provider.get("prefix") or "") + str(model.get("id") or "")
+    # A raw or hand-edited registry may still contain a malformed/bare alias; ignoring it
+    # here prevents it from bypassing the provider namespace before strict validation has
+    # had a chance to run.
+    override = str(model.get("publish_as") or "").strip()
+    if override and allows_provider_publish_as(provider, override):
+        return override
+    return effective_model_prefix(provider) + str(model.get("id") or "")
 
 
 class DATA_BLOB(ctypes.Structure):
@@ -336,7 +435,7 @@ def read_codex_auth_key(auth_path: Path = AUTH_PATH) -> str:
     auth = json.loads(auth_path.read_text(encoding="utf-8-sig"))
     key = auth.get("OPENAI_API_KEY")
     if auth.get("auth_mode") != "apikey" or not isinstance(key, str) or not key.strip():
-        raise RuntimeError("True SOTA auth.json does not contain a usable API-key login")
+        raise RuntimeError("Tango Relay auth.json does not contain a usable API-key login")
     return key.strip()
 
 
@@ -362,6 +461,50 @@ def provider_workspace(provider: dict[str, Any]) -> Workspace:
         return WORKSPACES[name]
     except KeyError as error:
         raise ValueError(f"Provider {provider.get('id')!r} has an unknown workspace: {name!r}") from error
+
+
+def uses_responses_to_anthropic_messages(provider: dict[str, Any]) -> bool:
+    """Return whether the one explicitly supported Codex provider uses the Messages adapter."""
+    return (
+        str(provider.get("id") or "").lower() == "juno"
+        and provider.get("request_adapter") == RESPONSES_TO_ANTHROPIC_MESSAGES_ADAPTER
+    )
+
+
+def pin_protected_provider_identity(
+    candidate: dict[str, Any], current: dict[str, Any]
+) -> tuple[dict[str, Any], list[str]]:
+    """Pin a protected provider's routing/credential identity to its on-disk copy.
+
+    The manager normally edits a provider from a snapshot that may be stale, and restore files
+    are intentionally redacted.  Treating that snapshot as authoritative for a protected entry
+    can silently change the account used by a later request (or turn the default back into a bare
+    model).  The fields in :data:`PROTECTED_PINNED_PROVIDER_KEYS` therefore come from ``current``
+    whenever they exist.  A field absent on disk is removed from the candidate rather than being
+    invented by a stale caller.  The returned list contains field names whose incoming values were
+    discarded so UI callers can explain the repair; an empty list means the candidate already
+    matched the on-disk identity.
+
+    A fresh/unprotected provider is copied unchanged.  Returning a deep copy keeps this helper
+    side-effect free for callers that still need to inspect the submitted object after pinning.
+    """
+    pinned = deepcopy(candidate)
+    if not isinstance(current, dict) or not current.get("protected"):
+        return pinned, []
+
+    changed: list[str] = []
+    for key in PROTECTED_PINNED_PROVIDER_KEYS:
+        if key in current:
+            value = deepcopy(current[key])
+            if key not in pinned or pinned[key] != value:
+                changed.append(key)
+            pinned[key] = value
+        elif key in pinned:
+            # Do not let a newly introduced field smuggle an identity change into an older,
+            # protected entry whose on-disk representation never had that field.
+            changed.append(key)
+            pinned.pop(key, None)
+    return pinned, changed
 
 
 def _valid_secret_file_name(file_name: str) -> bool:
@@ -514,6 +657,36 @@ def _http_json(
         return status, body, text[:4000]
 
 
+def _probe_http_json(
+    url: str,
+    method: str,
+    headers: dict[str, str],
+    payload: dict[str, Any] | None,
+    timeout: int,
+    attempts: int = 3,
+) -> tuple[int, Any, str]:
+    """`_http_json` with bounded retries for transport-level failures.
+
+    Probes are tiny, idempotent, and the networks in front of these gateways drop a
+    connection mid-TLS-handshake often enough (SSL UNEXPECTED_EOF, remote reset, timeout)
+    that a single attempt reported healthy vendors as failed.  HTTP error statuses are NOT
+    retried: they come back inside a successful transport round trip and mean the vendor
+    answered, which is the thing being tested.
+    """
+    last_error: Exception | None = None
+    for attempt in range(max(1, attempts)):
+        if attempt:
+            time.sleep(1.5 * attempt)
+        try:
+            return _http_json(url, method, headers, payload, timeout)
+        except urllib.error.HTTPError:
+            raise
+        except Exception as error:  # noqa: BLE001 - transport failures are retryable here
+            last_error = error
+    assert last_error is not None
+    raise last_error
+
+
 def _redact_text(value: str, secrets: list[str]) -> str:
     result = value
     for secret in secrets:
@@ -649,7 +822,10 @@ def discover_responses_path(
     if model is None:
         return {"ok": False, "responses_path": None, "reason": "该供应商没有启用任何模型", "attempts": []}
     key = provider_key(item, temporary_key)
-    timeout = max(30, int(item.get("timeout_seconds") or 120))
+    # Probes are tiny health checks, not generations: the provider's inference
+    # timeout (300 s for long silent reasoning) must not turn a hung gateway into a
+    # five-minute stall per probe attempt in the GUI's test and checkup flows.
+    timeout = min(120, max(30, int(item.get("timeout_seconds") or 120)))
     payload = {
         "model": model,
         "input": "Reply exactly OK",
@@ -759,7 +935,10 @@ def discover_messages_path(
     if model is None:
         return {"ok": False, "messages_path": None, "reason": "该供应商没有启用任何模型", "attempts": []}
     key = provider_key(item, temporary_key)
-    timeout = max(30, int(item.get("timeout_seconds") or 120))
+    # Probes are tiny health checks, not generations: the provider's inference
+    # timeout (300 s for long silent reasoning) must not turn a hung gateway into a
+    # five-minute stall per probe attempt in the GUI's test and checkup flows.
+    timeout = min(120, max(30, int(item.get("timeout_seconds") or 120)))
     payload = {
         "model": model,
         "max_tokens": 64,
@@ -848,7 +1027,10 @@ def measure_latency(
     if not model:
         raise ValueError("Model ID is empty")
     key = provider_key(item, temporary_key)
-    timeout = max(30, int(item.get("timeout_seconds") or 120))
+    # Probes are tiny health checks, not generations: the provider's inference
+    # timeout (300 s for long silent reasoning) must not turn a hung gateway into a
+    # five-minute stall per probe attempt in the GUI's test and checkup flows.
+    timeout = min(120, max(30, int(item.get("timeout_seconds") or 120)))
     url, payload, extra, protocol = probe_request(item, model)
     timings: list[float] = []
     failures: list[str] = []
@@ -856,7 +1038,7 @@ def measure_latency(
         for _ in range(max(1, samples)):
             started = time.monotonic()
             try:
-                status, body, text = _http_json(
+                status, body, text = _probe_http_json(
                     url, "POST", auth_headers(item, key) | extra, payload, timeout
                 )
             except Exception as error:
@@ -920,6 +1102,8 @@ def probe_protocol(provider: dict[str, Any]) -> str:
     Anthropic Messages, not the OpenAI Responses shape, or a perfectly healthy gateway
     comes back "failed" purely because it was asked the wrong question.
     """
+    if uses_responses_to_anthropic_messages(provider):
+        return "messages"
     supported = [p for p in (provider.get("protocols") or ["responses"]) if p in PROTOCOLS]
     if not supported:
         supported = ["responses"]
@@ -976,7 +1160,7 @@ def test_model(
     redaction_key = key
     url, payload, extra, protocol = probe_request(item, model, reasoning_effort)
     try:
-        status, body, text = _http_json(
+        status, body, text = _probe_http_json(
             url,
             "POST",
             auth_headers(item, key) | extra,
@@ -1037,7 +1221,10 @@ def probe_fast_tier(
         raise ValueError("Model ID is empty")
     key = provider_key(item, temporary_key)
     redaction_key = key
-    timeout = max(30, int(item.get("timeout_seconds") or 120))
+    # Probes are tiny health checks, not generations: the provider's inference
+    # timeout (300 s for long silent reasoning) must not turn a hung gateway into a
+    # five-minute stall per probe attempt in the GUI's test and checkup flows.
+    timeout = min(120, max(30, int(item.get("timeout_seconds") or 120)))
 
     def attempt(with_tier: bool) -> tuple[int | None, str, float]:
         url, payload, extra, protocol = probe_request(
@@ -1045,7 +1232,7 @@ def probe_fast_tier(
         )
         started = time.monotonic()
         try:
-            status, body, text = _http_json(
+            status, body, text = _probe_http_json(
                 url, "POST", auth_headers(item, key) | extra, payload, timeout
             )
         except Exception as error:
@@ -1106,7 +1293,10 @@ def measure_fast_tier(
     if not model:
         raise ValueError("Model ID is empty")
     key = provider_key(item, temporary_key)
-    timeout = max(30, int(item.get("timeout_seconds") or 120))
+    # Probes are tiny health checks, not generations: the provider's inference
+    # timeout (300 s for long silent reasoning) must not turn a hung gateway into a
+    # five-minute stall per probe attempt in the GUI's test and checkup flows.
+    timeout = min(120, max(30, int(item.get("timeout_seconds") or 120)))
 
     def timed(with_tier: bool) -> float | None:
         url, payload, extra, _protocol = probe_request(
@@ -1115,7 +1305,7 @@ def measure_fast_tier(
         )
         started = time.monotonic()
         try:
-            status, _body, _text = _http_json(
+            status, _body, _text = _probe_http_json(
                 url, "POST", auth_headers(item, key) | extra, payload, timeout
             )
         except Exception:
@@ -1305,42 +1495,28 @@ def validate_provider(
     except (TypeError, ValueError):
         timeout = 120
     provider["timeout_seconds"] = min(900, max(5, timeout))
-    if provider["auth_type"] == "codex_auth":
-        # Shape-checked like a dpapi entry, but never derived: this one borrows the Codex App's
-        # own login, and an id-derived prefix would rename the models the app already sees.
-        # The check itself matters because the prefix is not decoration -- `prefix + model id`
-        # is the slug written into the generated catalog and matched by the router, so an
-        # unchecked value from a hand-edited or restored providers.json becomes a model entry
-        # the app cannot select and the router cannot route.
+    if provider["auth_type"] in {"codex_auth", "dpapi"}:
+        # A blank prefix is only a supported legacy shape for Claude's Messages-only default.
+        # Normalize every other provider to a deterministic namespace, including an old Codex
+        # registry loaded before this guard existed.  The router still rejects the old bare slug;
+        # normalization makes the repaired catalog and all future writes converge on one name.
         prefix = str(provider.get("prefix") or "")
+        if not prefix and not allows_legacy_bare_model(provider):
+            prefix = derive_model_prefix(provider_id, provider["protocols"])
         if prefix and not MODEL_PREFIX_PATTERN.fullmatch(prefix):
             raise ValueError(f"Provider {provider_id!r} has an invalid model prefix")
-    elif provider["auth_type"] == "dpapi":
-        # The default provider must keep an empty prefix, so do not derive one for it.
-        # Otherwise the first provider saved into a fresh workspace can never validate:
-        # it has to be the default, and deriving a prefix disqualifies it.
-        if provider.get("is_default"):
-            prefix = str(provider.get("prefix") or "")
-            if prefix and not MODEL_PREFIX_PATTERN.fullmatch(prefix):
-                raise ValueError(f"Provider {provider_id!r} has an invalid model prefix")
-        else:
-            prefix = str(
-                provider.get("prefix")
-                or derive_model_prefix(provider_id, provider["protocols"])
+        if provider["auth_type"] == "dpapi":
+            provider["secret_file"] = str(
+                provider.get("secret_file") or (provider_id + "-api-key.dpapi")
             )
-            if not MODEL_PREFIX_PATTERN.fullmatch(prefix):
-                raise ValueError(f"Provider {provider_id!r} has an invalid model prefix")
-        provider["secret_file"] = str(
-            provider.get("secret_file") or (provider_id + "-api-key.dpapi")
-        )
-        provider["entropy"] = str(
-            provider.get("entropy") or ("CodexSota.Provider." + provider_id + ".v1")
-        )
-        provider_secret_path = secret_path(provider)
-        # A disabled provider is still editable/deletable even if its old key file was
-        # removed. Only enabled entries must have a credential for strict routing checks.
-        if not allow_missing_secret and provider.get("enabled") and not provider_secret_path.exists():
-            raise FileNotFoundError(f"Encrypted API key is missing for {name}")
+            provider["entropy"] = str(
+                provider.get("entropy") or ("CodexSota.Provider." + provider_id + ".v1")
+            )
+            provider_secret_path = secret_path(provider)
+            # A disabled provider is still editable/deletable even if its old key file was
+            # removed. Only enabled entries must have a credential for strict routing checks.
+            if not allow_missing_secret and provider.get("enabled") and not provider_secret_path.exists():
+                raise FileNotFoundError(f"Encrypted API key is missing for {name}")
     else:
         raise ValueError(f"Provider {provider_id!r} has an unsupported auth_type")
     provider["prefix"] = prefix
@@ -1368,16 +1544,17 @@ def validate_provider(
     clean_models: list[dict[str, Any]] = []
     for model in models:
         clean = validate_model(dict(model))
-        # Responses slugs are pinned in two places we do not own -- config.toml's `model = ...`
-        # and the generated catalog -- so a model the Codex App can select must be reachable
-        # under `prefix + id` and nothing else. Refusing the override here is what keeps this
-        # feature from ever renaming something on the Codex side.
-        if clean["publish_as"] and "responses" in provider["protocols"]:
+        # The alias must stay inside the provider's own namespace.  Refusing anything else
+        # here is what keeps publish_as from ever becoming a second way to erase the
+        # provider identity -- on either the Claude or the Codex side of the split.
+        if clean["publish_as"] and not allows_provider_publish_as(
+            provider, clean["publish_as"], prefix=prefix
+        ):
             raise ValueError(
                 f"Provider {provider_id!r} model {clean['id']!r} cannot use publish_as: "
-                "it also speaks responses"
+                "the alias must keep this provider's model prefix"
             )
-        if clean["publish_as"] == str(provider.get("prefix") or "") + clean["id"]:
+        if clean["publish_as"] == prefix + clean["id"]:
             # Same slug either way; dropping it keeps the digest stable and the file readable.
             clean["publish_as"] = ""
         if clean["id"] in seen_models:
@@ -1418,8 +1595,15 @@ def validate_registry(
             default_count += 1
             if not clean["enabled"]:
                 raise ValueError("Default provider must be enabled")
-            if prefix:
-                raise ValueError("Default provider must use an empty model prefix")
+            # Claude's legacy Messages profile intentionally keeps its default model bare. Every
+            # other workspace/protocol must use the namespace normalized above.
+            if clean.get("workspace") == CLAUDE.name and allows_legacy_bare_model(clean):
+                if prefix:
+                    raise ValueError("Default Claude Messages provider must use an empty model prefix")
+            elif not prefix:
+                raise ValueError(
+                    "Default provider must use a non-empty model prefix outside Claude Messages"
+                )
         if clean["enabled"]:
             for model in clean["models"]:
                 if not model["enabled"]:
@@ -1505,7 +1689,8 @@ def upgrade_messages_prefixes(registry: dict[str, Any]) -> list[tuple[str, str, 
     there is nothing to do, so a caller can report what changed and re-run harmlessly. Left
     alone: providers already on the dotted form, providers that also speak responses (their
     slugs are pinned by the Codex catalog and config.toml), providers whose prefix was typed
-    by hand rather than derived, and the workspace default, which must keep an empty prefix.
+    by hand rather than derived, and Claude's legacy default, which intentionally keeps an empty
+    prefix for Messages compatibility.
     """
     changes: list[tuple[str, str, str]] = []
     for provider in registry.get("providers") or []:
@@ -1540,6 +1725,34 @@ def build_model_catalog(
     destination_path: Path = CATALOG_PATH,
 ) -> dict[str, Any]:
     registry = registry or load_registry()
+    # Catalog callers include recovery/import paths that may hand us a raw pre-guard registry.
+    # `published_slug` still advertises a safe derived namespace for those entries; hash the same
+    # canonical view or audit_registry will reject the freshly written catalog until the next
+    # save. Keep this intentionally lightweight: full validation belongs to load/write paths and
+    # would make a read-only catalog preview require credentials and every optional field.
+    catalog_registry = deepcopy(registry)
+    for provider in catalog_registry.get("providers") or []:
+        if not isinstance(provider, dict):
+            continue
+        if not str(provider.get("prefix") or ""):
+            derived = effective_model_prefix(provider)
+            if derived:
+                provider["prefix"] = derived
+        prefix = str(provider.get("prefix") or "")
+        for model in provider.get("models") or []:
+            if not isinstance(model, dict):
+                continue
+            override = str(model.get("publish_as") or "").strip()
+            model["publish_as"] = override
+            if override and not allows_provider_publish_as(provider, override, prefix=prefix):
+                # A raw hand-edited alias that validation would reject must not influence either
+                # the advertised slug or the catalog identity hash.
+                model["publish_as"] = ""
+            elif override and override == prefix + str(model.get("id") or ""):
+                # Match validate_provider's canonical representation so aliases that add no
+                # information do not change the registry digest.
+                model["publish_as"] = ""
+    registry = catalog_registry
     source = json.loads(source_path.read_text(encoding="utf-8-sig"))
     source_models = source.get("models")
     if not isinstance(source_models, list) or not source_models:
@@ -1560,7 +1773,15 @@ def build_model_catalog(
             if not model_config["enabled"]:
                 continue
             model_id = model_config["id"]
-            source_model = by_slug.get(model_id)
+            # The alias decides which template the entry is built from.  Mapping a non-GPT
+            # model onto a known slug (e.g. claude-opus-5 -> sierra--gpt-5.6-sol) is exactly
+            # how it picks up correct capability metadata; an unknown id would otherwise
+            # silently wear the default GPT template's reasoning levels.
+            override = str(model_config.get("publish_as") or "").strip()
+            template_key = model_id
+            if override and prefix and override.startswith(prefix):
+                template_key = override[len(prefix):]
+            source_model = by_slug.get(template_key) or by_slug.get(model_id)
             if source_model is None:
                 source_model = terra_template if "terra" in model_id.lower() else default_template
             model = deepcopy(source_model)
@@ -1821,39 +2042,50 @@ def apply_provider(
         # Let the manager load an incomplete existing entry so a user can replace its missing
         # key. The final write remains strict for enabled providers.
         registry = load_registry(workspace.registry_path, allow_missing_secrets=True)
-        candidate = validate_provider(
-            deepcopy(provider) | {"workspace": workspace.name}, allow_missing_secret=True
-        )
-        if candidate.get("auth_type") == "dpapi":
-            existing_secret = secret_path(candidate).exists()
-            if not api_key and not existing_secret:
-                raise ValueError("API key is required for a new provider")
+        submitted = deepcopy(provider)
+        if not isinstance(submitted, dict):
+            raise ValueError("Provider entries must be objects")
+        submitted["workspace"] = workspace.name
+        submitted_id = str(submitted.get("id") or "").strip().lower()
         existing_index = None
         for index, current in enumerate(registry["providers"]):
-            if current["id"] == candidate["id"]:
+            if current["id"] == submitted_id:
                 existing_index = index
                 if current.get("protected"):
                     # Refusing the whole write here was too blunt.  It also made the model list of
                     # a protected provider permanently uncurateable -- and on the Codex side the
                     # protected entry is the default one, so its models are exactly the ones a user
-                    # most needs to switch on.  Pin the identity fields back to disk and let the
-                    # rest through; see PROTECTED_PINNED_PROVIDER_KEYS for why each is pinned.
-                    candidate = validate_provider(
-                        candidate
-                        | {
-                            key: deepcopy(current[key])
-                            for key in PROTECTED_PINNED_PROVIDER_KEYS
-                            if key in current
-                        },
-                        allow_missing_secret=True,
+                    # most needs to switch on.  Pin *all* routing/credential identity fields back
+                    # to disk and let ordinary model/settings edits through.  The second validation
+                    # is important when pinning changes auth_type (for example a stale dpapi form
+                    # submitted for the codex_auth entry): it re-derives only the fields belonging
+                    # to the identity that actually survived the pin.
+                    submitted, _discarded_identity = pin_protected_provider_identity(
+                        submitted, current
                     )
                 break
+        # Validate after protected identity pinning.  Besides blocking writes, this means stale
+        # or hostile values in fields the caller is not allowed to own (an invalid secret path,
+        # adapter, endpoint or prefix) are discarded before their validators can interfere with
+        # an otherwise legitimate model/settings edit.
+        candidate = validate_provider(submitted, allow_missing_secret=True)
+        # Check credential availability only after a protected entry has restored its on-disk
+        # auth_type and secret identity.  Doing this against the caller's stale candidate first
+        # lets a forged dpapi shape fail before the codex_auth pin can neutralize it.
+        if candidate.get("auth_type") == "dpapi":
+            existing_secret = secret_path(candidate).exists()
+            if not api_key and not existing_secret:
+                raise ValueError("API key is required for a new provider")
         paths = [workspace.registry_path, workspace.catalog_path]
         if candidate.get("auth_type") == "dpapi":
             paths.append(secret_path(candidate))
         snapshot = _snapshot(paths)
         try:
-            if api_key:
+            # A codex_auth provider borrows the Codex App credential and has no DPAPI file to
+            # update.  The key field is disabled for protected entries, but callers may still
+            # pass a temporary probe key; never turn that into a secret-file write after identity
+            # pinning has restored auth_type=codex_auth.
+            if api_key and candidate.get("auth_type") == "dpapi":
                 dpapi_protect(api_key, secret_path(candidate), candidate["entropy"])
             if existing_index is None:
                 registry["providers"].append(candidate)
@@ -1931,7 +2163,17 @@ def delete_provider(
                 )
             if candidate is not None:
                 candidate["is_default"] = True
-                candidate["prefix"] = ""
+                # A Codex default must keep a provider namespace after promotion. Otherwise a
+                # later model-prefix loss would recreate the exact silent-default billing bug
+                # this registry guard is meant to prevent. Keep Claude's legacy bare default,
+                # whose Messages route remains compatible with the existing profile.
+                if candidate.get("workspace") == CODEX.name:
+                    candidate["prefix"] = str(
+                        candidate.get("prefix")
+                        or derive_model_prefix(candidate["id"], candidate.get("protocols"))
+                    )
+                else:
+                    candidate["prefix"] = ""
                 promoted = candidate["id"]
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         archive_root = workspace.deleted_root / (stamp + "-" + provider["id"])
@@ -2035,12 +2277,16 @@ def lint_registry(
         for label, full in endpoint_checks[1:]:
             endpoint_v1 = full.startswith("/v1/")
             if models_v1 != endpoint_v1:
+                # Mixed-prefix gateways genuinely exist: on this install /models + /v1/messages
+                # serves 160 models fine. The prefix heuristic cannot tell a working mixed
+                # layout from a broken one -- only an actual probe can -- so surface it as a
+                # hint, not an error, and say what to click.
                 add(
-                    "error",
+                    "info",
                     pid,
                     f"模型列表和 {label} 的版本前缀不一致：模型列表是 {models_full}，"
-                    f"{label} 是 {full}。少了 /v1 的那个多半会打到网站首页，返回 200 的 HTML"
-                    "（运行对应协议的测试会自动寻找正确路径）",
+                    f"{label} 是 {full}。这不一定是错的（有些网关就是混用前缀）；"
+                    "如果「拉取模型」拿不到列表，再用「测试」自动寻找正确路径",
                 )
         if provider.get("enabled"):
             enabled_models = [m for m in provider.get("models") or [] if m.get("enabled")]

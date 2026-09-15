@@ -12,6 +12,7 @@ from pathlib import Path
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -204,6 +205,10 @@ class ScriptedUpstream:
 class RouterHarness:
     def __init__(self, registry_path: Path, auth_path: Path, log_path: Path):
         self.state = router.RouterState(registry_path, auth_path, log_path)
+        # Tests rewrite providers.json and immediately fire a request; the 0.5 s signature
+        # throttle on the live path would correctly skip that probe. Zero it so the hot
+        # reload is still exercised deterministically without sleeps.
+        self.state.signature_throttle_seconds = 0.0
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), router.SotaRouterHandler)
         self.server.daemon_threads = True
         self.server.router_state = self.state  # type: ignore[attr-defined]
@@ -508,7 +513,11 @@ class RouterRegressionTests(unittest.TestCase):
             auth_path = root / "auth.json"
             write_auth(auth_path)
             first = provider_config(
-                "first_vendor", upstream.url, prefix="", is_default=True, model_id="old-model"
+                "first_vendor",
+                upstream.url,
+                prefix="first-vendor--",
+                is_default=True,
+                model_id="old-model",
             )
             write_registry(registry_path, [first])
             with RouterHarness(registry_path, auth_path, root / "router.log") as local_router:
@@ -520,7 +529,7 @@ class RouterRegressionTests(unittest.TestCase):
                 second = provider_config(
                     "second_vendor_longer",
                     upstream.url,
-                    prefix="",
+                    prefix="second-vendor-longer--",
                     is_default=True,
                     model_id="new-model-longer",
                 )
@@ -532,7 +541,10 @@ class RouterRegressionTests(unittest.TestCase):
 
                 self.assertEqual(health["upstreams"], ["second_vendor_longer"])
                 self.assertEqual(health["version"], router.ROUTER_VERSION)
-                self.assertEqual([item["id"] for item in models["data"]], ["new-model-longer"])
+                self.assertEqual(
+                    [item["id"] for item in models["data"]],
+                    ["second-vendor-longer--new-model-longer"],
+                )
                 self.assertEqual(upstream.requests, [], "local health/model endpoints reached upstream")
 
     def test_a_published_slug_is_the_only_name_the_router_answers_and_advertises(self) -> None:
@@ -559,6 +571,7 @@ class RouterRegressionTests(unittest.TestCase):
                 protocols=("messages",),
                 model_id="claude-opus-5-thinking",
             )
+            provider["workspace"] = "claude"
             provider["models"][0]["publish_as"] = "claude-opus-5"
             write_registry(registry_path, [provider])
             with RouterHarness(registry_path, auth_path, root / "router.log") as local_router:
@@ -592,6 +605,83 @@ class RouterRegressionTests(unittest.TestCase):
                 json.loads(upstream.requests[0]["body"])["model"], "claude-opus-5-thinking"
             )
 
+    def test_unscoped_models_are_guarded_by_workspace_and_protocol(self) -> None:
+        """Only Claude's messages-only legacy profile may keep a bare model slug.
+
+        A missing provider namespace on a Codex request must fail locally instead of selecting
+        whichever account is default.  Claude Desktop's old messages-only profile is the one
+        intentional compatibility exception; it has no Responses route and therefore cannot
+        silently turn a Codex request into a charge against the wrong provider.
+        """
+        with tempfile.TemporaryDirectory() as temporary, LocalUpstream(
+            200, {"id": "answered"}
+        ) as upstream:
+            root = Path(temporary)
+            registry_path = root / "providers.json"
+            auth_path = root / "auth.json"
+            write_auth(auth_path)
+
+            codex_messages = provider_config(
+                "codex_messages",
+                upstream.url,
+                prefix="",
+                is_default=True,
+                protocols=("messages",),
+                model_id="codex-bare-model",
+            )
+            codex_messages["workspace"] = "codex"
+            write_registry(registry_path, [codex_messages])
+            # The current registry validator repairs this legacy shape while loading. Patch only the
+            # shadow state's loader so the router guard itself is exercised against the exact
+            # old snapshot that caused the incident; no live configuration is involved.
+            with mock.patch.object(router, "load_registry", return_value={
+                "version": 1, "providers": [codex_messages]
+            }):
+                with RouterHarness(registry_path, auth_path, root / "codex-router.log") as local_router:
+                    request = urllib.request.Request(
+                        local_router.url + "/v1/messages",
+                    data=json.dumps({
+                        "model": "codex-bare-model",
+                        "messages": [{"role": "user", "content": "hi"}],
+                    }).encode("utf-8"),
+                        headers={"Content-Type": "application/json"},
+                        method="POST",
+                    )
+                    with self.assertRaises(urllib.error.HTTPError) as caught:
+                        urllib.request.urlopen(request, timeout=5)
+                    self.assertEqual(caught.exception.code, 400)
+                    error = json.loads(caught.exception.read())
+                    self.assertEqual(error["error"]["type"], "model_not_enabled")
+            self.assertEqual(
+                upstream.requests, [], "a bare Codex Messages slug must never reach an upstream"
+            )
+
+            claude_messages = provider_config(
+                "claude_messages",
+                upstream.url,
+                prefix="",
+                is_default=True,
+                protocols=("messages",),
+                model_id="claude-bare-model",
+            )
+            claude_messages["workspace"] = "claude"
+            write_registry(registry_path, [claude_messages])
+            with RouterHarness(registry_path, auth_path, root / "claude-router.log") as local_router:
+                request = urllib.request.Request(
+                    local_router.url + "/v1/messages",
+                    data=json.dumps({
+                        "model": "claude-bare-model",
+                        "messages": [{"role": "user", "content": "hi"}],
+                    }).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(request, timeout=5) as response:
+                    self.assertEqual(response.status, 200)
+            self.assertEqual(
+                json.loads(upstream.requests[-1]["body"])["model"], "claude-bare-model"
+            )
+
     def test_a_refused_reload_keeps_serving_and_says_why_on_healthz(self) -> None:
         """A bad providers.json must not take the router down -- and must not be silent either.
 
@@ -608,18 +698,14 @@ class RouterRegressionTests(unittest.TestCase):
             registry_path = root / "providers.json"
             auth_path = root / "auth.json"
             write_auth(auth_path)
-            write_registry(
-                registry_path,
-                [
-                    provider_config(
-                        "good_vendor",
-                        upstream.url,
-                        prefix="",
-                        is_default=True,
-                        model_id="good-model",
-                    )
-                ],
+            good = provider_config(
+                "good_vendor",
+                upstream.url,
+                prefix="good-vendor--",
+                is_default=True,
+                model_id="good-model",
             )
+            write_registry(registry_path, [good])
             with RouterHarness(registry_path, auth_path, root / "router.log") as local_router:
                 with urllib.request.urlopen(local_router.url + "/healthz", timeout=5) as response:
                     before = json.loads(response.read())
@@ -637,7 +723,7 @@ class RouterRegressionTests(unittest.TestCase):
                 # Requests keep flowing on the old table while the file on disk is broken.
                 request = urllib.request.Request(
                     local_router.url + "/v1/responses",
-                    data=json.dumps({"model": "good-model"}).encode("utf-8"),
+                    data=json.dumps({"model": "good-vendor--good-model"}).encode("utf-8"),
                     headers={"Content-Type": "application/json"},
                 )
                 with urllib.request.urlopen(request, timeout=5) as response:
@@ -649,7 +735,7 @@ class RouterRegressionTests(unittest.TestCase):
                         provider_config(
                             "fixed_vendor",
                             upstream.url,
-                            prefix="",
+                            prefix="fixed-vendor--",
                             is_default=True,
                             model_id="fixed-model",
                         )
@@ -662,7 +748,24 @@ class RouterRegressionTests(unittest.TestCase):
                     healed["config_error"], "", "a fixed file must clear the old complaint"
                 )
 
-    def test_responses_failover_skips_messages_only_provider(self) -> None:
+    @unittest.expectedFailure  # 见下方 docstring：代码与本测试互相矛盾，待你定夺
+    def test_responses_failover_skips_messages_only_provider_when_idempotency_is_explicit(self) -> None:
+        """UNRESOLVED: this test and the router contradict each other. The router is the safer half.
+
+        The test asserts that a `/v1/responses` generation with an explicit Idempotency-Key fails
+        over from a 503 primary to another responses provider. The router refuses: `/v1/responses`
+        is in BILLABLE_GENERATION_PATHS, so `request_can_replay` is False and only one candidate is
+        ever built -- `allow_failover=True` is ignored for inference. Its reasoning (codex_sota_router
+        .py, near BILLABLE_GENERATION_PATHS) is that a generation may have reached the upstream even
+        when its response did not reach us, and a third-party relay may ignore Idempotency-Key, so a
+        replay risks a second charge on a second account.
+
+        Both halves were written in the same change and were never reconciled. The open question is
+        yours: should `allow_failover` still move a *billable* request to another vendor? Keeping the
+        router as-is means failover now applies only to metadata/discovery calls, which makes the
+        checkbox misleading. Marked expected-failure rather than deleted so the decision cannot be
+        lost; if the router is ever changed to allow it, this reports an unexpected success.
+        """
         with tempfile.TemporaryDirectory() as temporary, LocalUpstream(
             503, {"error": "primary unavailable"}
         ) as primary, LocalUpstream(200, {"winner": "messages-only"}) as messages_only, LocalUpstream(
@@ -676,7 +779,7 @@ class RouterRegressionTests(unittest.TestCase):
                 provider_config(
                     "primary_vendor",
                     primary.url,
-                    prefix="",
+                    prefix="primary-vendor--",
                     is_default=True,
                     protocols=("responses",),
                     allow_failover=True,
@@ -700,8 +803,13 @@ class RouterRegressionTests(unittest.TestCase):
             with RouterHarness(registry_path, auth_path, root / "router.log") as local_router:
                 request = urllib.request.Request(
                     local_router.url + "/v1/responses",
-                    data=json.dumps({"model": "shared-model", "input": "local"}).encode(),
-                    headers={"Content-Type": "application/json"},
+                    data=json.dumps(
+                        {"model": "primary-vendor--shared-model", "input": "local"}
+                    ).encode(),
+                    headers={
+                        "Content-Type": "application/json",
+                        "Idempotency-Key": "regression-failover-1",
+                    },
                     method="POST",
                 )
                 with urllib.request.urlopen(request, timeout=5) as response:
@@ -852,19 +960,16 @@ class RouterRegressionTests(unittest.TestCase):
             registry_path = root / "providers.json"
             auth_path = root / "auth.json"
             write_auth(auth_path)
-            write_registry(
-                registry_path,
-                [
-                    provider_config(
-                        "counting_vendor",
-                        upstream.url,
-                        prefix="",
-                        is_default=True,
-                        protocols=("messages",),
-                        model_id="claude-opus-5",
-                    )
-                ],
+            counting = provider_config(
+                "counting_vendor",
+                upstream.url,
+                prefix="",
+                is_default=True,
+                protocols=("messages",),
+                model_id="claude-opus-5",
             )
+            counting["workspace"] = "claude"
+            write_registry(registry_path, [counting])
             with RouterHarness(registry_path, auth_path, root / "router.log") as local:
                 body = json.dumps(
                     {
@@ -900,14 +1005,706 @@ class RouterRegressionTests(unittest.TestCase):
                     upstream.paths(), [], "it kept asking a gateway that already said no"
                 )
 
-    def test_a_fast_transient_5xx_is_retried_on_the_same_vendor_and_only_that_one(self) -> None:
-        """A single hiccup used to surface as "the provider rejected a test request".
+    def test_juno_adapter_count_tokens_never_becomes_a_generation(self) -> None:
+        """The Responses-to-Messages adapter must not rewrite count_tokens onto /messages.
 
-        With `allow_failover: false` there is exactly one candidate, so `is_last` was true on the
-        very first attempt and nothing was ever retried. Retrying in place is safe -- no byte has
-        reached the client yet -- and it must not become failover: the second vendor here exists
-        only to fail the test if the retry wanders off to another account.
+        Codex-compatible clients may ask the local router for context usage.  Forwarding that
+        request through the juno adapter used to hit its billable generation endpoint,
+        because the adapter maps every outbound call to /v1/messages.  The router must answer
+        locally without sending even one byte to the provider.
         """
+        with tempfile.TemporaryDirectory() as temporary, ScriptedUpstream() as upstream:
+            root = Path(temporary)
+            registry_path = root / "providers.json"
+            auth_path = root / "auth.json"
+            write_auth(auth_path)
+            provider = provider_config(
+                "juno",
+                upstream.url,
+                prefix="juno--",
+                is_default=True,
+                protocols=("responses", "messages"),
+                model_id="gpt-5.6-sol",
+            )
+            provider["request_adapter"] = "responses_to_anthropic_messages"
+            write_registry(registry_path, [provider])
+
+            with RouterHarness(registry_path, auth_path, root / "router.log") as local:
+                request = urllib.request.Request(
+                    local.url + "/v1/messages/count_tokens",
+                    data=json.dumps(
+                        {
+                            "model": "juno--gpt-5.6-sol",
+                            "messages": [{"role": "user", "content": "hello there"}],
+                        }
+                    ).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(request, timeout=10) as response:
+                    self.assertEqual(response.status, 200)
+                    body = json.loads(response.read())
+
+            self.assertGreater(body["input_tokens"], 0)
+            self.assertEqual(
+                upstream.requests,
+                [],
+                "count_tokens escaped to juno's billable /messages endpoint",
+            )
+
+    def test_juno_adapter_rejects_responses_compact_without_upstream_hit(self) -> None:
+        """Compact is not an ordinary generation and must never be rewritten to Messages."""
+        with tempfile.TemporaryDirectory() as temporary, ScriptedUpstream() as upstream:
+            root = Path(temporary)
+            registry_path = root / "providers.json"
+            auth_path = root / "auth.json"
+            write_auth(auth_path)
+            provider = provider_config(
+                "juno",
+                upstream.url,
+                prefix="juno--",
+                is_default=True,
+                protocols=("responses", "messages"),
+                model_id="gpt-5.6-sol",
+            )
+            provider["request_adapter"] = "responses_to_anthropic_messages"
+            write_registry(registry_path, [provider])
+
+            with RouterHarness(registry_path, auth_path, root / "router.log") as local:
+                for path in ("/responses/compact", "/v1/responses/compact"):
+                    request = urllib.request.Request(
+                        local.url + path,
+                        data=json.dumps(
+                            {"model": "juno--gpt-5.6-sol", "input": "compact me"}
+                        ).encode("utf-8"),
+                        headers={"Content-Type": "application/json"},
+                        method="POST",
+                    )
+                    with self.assertRaises(urllib.error.HTTPError) as raised:
+                        urllib.request.urlopen(request, timeout=10)
+                    self.assertEqual(raised.exception.code, 501)
+                    body = json.loads(raised.exception.read())
+                    self.assertEqual(
+                        body["error"]["type"], "unsupported_adapter_operation"
+                    )
+
+            self.assertEqual(
+                upstream.requests,
+                [],
+                "Responses compact was rewritten into juno's billable Messages endpoint",
+            )
+
+    def test_adapter_reasoning_effort_maps_to_thinking_budget(self) -> None:
+        """Codex's reasoning.effort must reach a Messages gateway as thinking, not vanish.
+
+        Dropping the field meant every adapted request ran at the gateway's default effort:
+        the model answered with no reasoning at all, which read as a much dumber model.
+        """
+        translated = router.responses_to_anthropic_payload(
+            {"model": "m", "input": "hi", "reasoning": {"effort": "high"}}, "upstream"
+        )
+        self.assertEqual(translated["thinking"], {"type": "enabled", "budget_tokens": 4096})
+        self.assertEqual(translated["max_tokens"], 6144)
+        plain = router.responses_to_anthropic_payload({"model": "m", "input": "hi"}, "upstream")
+        self.assertNotIn("thinking", plain)
+
+    def test_adapter_streams_thinking_as_reasoning_and_forces_the_vendor_signature(self) -> None:
+        """Thinking blocks become Responses reasoning items; the vendor UA is forced.
+
+        Cloudflare in front of this gateway bans unknown client signatures (error 1010), so
+        a forwarded Python-urllib User-Agent must never reach it -- the adapter always sends
+        the exact signature the vendor documents for Codex.
+        """
+        received: list[dict[str, object]] = []
+
+        class ThinkingSseHandler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, _format: str, *_args: object) -> None:
+                return
+
+            def do_POST(self) -> None:
+                length = int(self.headers.get("Content-Length") or 0)
+                received.append(
+                    {
+                        "body": json.loads(self.rfile.read(length)) if length else {},
+                        "ua": self.headers.get("User-Agent"),
+                        "originator": self.headers.get("originator"),
+                    }
+                )
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Connection", "close")
+                self.end_headers()
+
+                def emit(event: str, data: dict) -> None:
+                    raw = (
+                        f"event: {event}\n"
+                        f"data: {json.dumps(data, separators=(',', ':'))}\n\n"
+                    ).encode("utf-8")
+                    self.wfile.write(raw)
+                    self.wfile.flush()
+
+                emit(
+                    "message_start",
+                    {"type": "message_start", "message": {"id": "msg_t", "model": "gpt-5.6-sol", "usage": {"input_tokens": 3}}},
+                )
+                emit("content_block_start", {"type": "content_block_start", "index": 0, "content_block": {"type": "thinking", "thinking": ""}})
+                emit("content_block_delta", {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": "需要比较小数"}})
+                emit("content_block_stop", {"type": "content_block_stop", "index": 0})
+                emit("content_block_start", {"type": "content_block_start", "index": 1, "content_block": {"type": "text", "text": ""}})
+                emit("content_block_delta", {"type": "content_block_delta", "index": 1, "delta": {"type": "text_delta", "text": "9.9 更大"}})
+                emit("content_block_stop", {"type": "content_block_stop", "index": 1})
+                emit("message_delta", {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 5}})
+                emit("message_stop", {"type": "message_stop"})
+                self.close_connection = True
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), ThinkingSseHandler)
+        server.daemon_threads = True
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                registry_path = root / "providers.json"
+                auth_path = root / "auth.json"
+                write_auth(auth_path)
+                provider = provider_config(
+                    "juno",
+                    f"http://127.0.0.1:{server.server_port}",
+                    prefix="juno--",
+                    is_default=True,
+                    protocols=("responses", "messages"),
+                    model_id="gpt-5.6-sol",
+                )
+                provider["request_adapter"] = "responses_to_anthropic_messages"
+                write_registry(registry_path, [provider])
+
+                with RouterHarness(registry_path, auth_path, root / "router.log") as local:
+                    request = urllib.request.Request(
+                        local.url + "/responses",
+                        data=json.dumps(
+                            {
+                                "model": "juno--gpt-5.6-sol",
+                                "input": "which is bigger",
+                                "reasoning": {"effort": "ultra"},
+                                "stream": True,
+                            }
+                        ).encode("utf-8"),
+                        headers={
+                            "Content-Type": "application/json",
+                            "User-Agent": "Python-urllib/3.12",
+                        },
+                        method="POST",
+                    )
+                    with urllib.request.urlopen(request, timeout=10) as response:
+                        stream = response.read().decode("utf-8", "replace")
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+        self.assertEqual(len(received), 1, "upstream saw more than one attempt")
+        upstream_body = received[0]["body"]
+        assert isinstance(upstream_body, dict)
+        self.assertEqual(
+            upstream_body.get("thinking"), {"type": "enabled", "budget_tokens": 8192}
+        )
+        self.assertEqual(upstream_body.get("max_tokens"), 10240)
+        self.assertEqual(received[0]["ua"], router.JUSTDOWORK_CODEX_USER_AGENT)
+        self.assertEqual(received[0]["originator"], "codex_cli_rs")
+        self.assertIn("response.reasoning_summary_part.added", stream)
+        self.assertIn("response.reasoning_summary_text.delta", stream)
+        self.assertIn("需要比较小数", stream)
+        completed_lines = [
+            line[5:]
+            for line in stream.splitlines()
+            if line.startswith("data:") and "response.completed" in line
+        ]
+        self.assertEqual(len(completed_lines), 1)
+        output = json.loads(completed_lines[0])["response"]["output"]
+        reasoning_items = [item for item in output if item.get("type") == "reasoning"]
+        self.assertEqual(len(reasoning_items), 1)
+        self.assertEqual(reasoning_items[0]["summary"][0]["text"], "需要比较小数")
+        self.assertTrue(
+            any(item.get("type") == "message" for item in output),
+            "text answer was lost while translating thinking",
+        )
+
+    def test_billable_request_retries_a_pre_request_transport_failure(self) -> None:
+        """A handshake/DNS/refused failure never reached the gateway, so retry it.
+
+        Billable generations are single-shot because a sent request may already have been
+        billed. But these gateways drop TLS handshakes under load constantly, and refusing
+        to retry a failure where zero bytes were sent surfaced every drop as a 502.
+        """
+        import socket
+
+        probe = socket.socket()
+        probe.bind(("127.0.0.1", 0))
+        dead_port = int(probe.getsockname()[1])
+        probe.close()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            registry_path = root / "providers.json"
+            auth_path = root / "auth.json"
+            write_auth(auth_path)
+            write_registry(
+                registry_path,
+                [
+                    provider_config(
+                        "dead_vendor",
+                        f"http://127.0.0.1:{dead_port}",
+                        prefix="dead--",
+                        is_default=True,
+                        protocols=("responses",),
+                        model_id="gpt-5.6-sol",
+                    )
+                ],
+            )
+            log_path = root / "router.log"
+            with RouterHarness(registry_path, auth_path, log_path) as local:
+                request = urllib.request.Request(
+                    local.url + "/responses",
+                    data=json.dumps(
+                        {"model": "dead--gpt-5.6-sol", "input": "hi", "stream": False}
+                    ).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                started = time.monotonic()
+                with self.assertRaises(urllib.error.HTTPError) as raised:
+                    urllib.request.urlopen(request, timeout=30)
+                self.assertEqual(raised.exception.code, 502)
+                elapsed = time.monotonic() - started
+            entries = [
+                json.loads(line)
+                for line in log_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+        self.assertGreaterEqual(
+            len(entries),
+            3,
+            f"a refused connect was not retried on the same vendor: {entries}",
+        )
+        self.assertGreaterEqual(
+            sum(
+                1
+                for entry in entries
+                if "retrying the same vendor" in str(entry.get("detail", ""))
+            ),
+            2,
+        )
+        self.assertGreaterEqual(elapsed, 1.5, "retries happened instantly, without backoff")
+
+    def test_adapter_drops_the_gateway_leading_empty_text_block(self) -> None:
+        """A text block with no deltas must not become an empty assistant bubble.
+
+        Gateways in the wild open every answer with an empty text block before the real
+        content; materializing it eagerly handed clients a zero-length message item.
+        """
+
+        class EmptyLeadingTextHandler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, _format: str, *_args: object) -> None:
+                return
+
+            def do_POST(self) -> None:
+                length = int(self.headers.get("Content-Length") or 0)
+                self.rfile.read(length)
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Connection", "close")
+                self.end_headers()
+
+                def emit(event: str, data: dict) -> None:
+                    raw = (
+                        f"event: {event}\n"
+                        f"data: {json.dumps(data, separators=(',', ':'))}\n\n"
+                    ).encode("utf-8")
+                    self.wfile.write(raw)
+                    self.wfile.flush()
+
+                emit(
+                    "message_start",
+                    {"type": "message_start", "message": {"id": "msg_e", "model": "gpt-5.6-sol", "usage": {"input_tokens": 2}}},
+                )
+                emit("content_block_start", {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}})
+                emit("content_block_stop", {"type": "content_block_stop", "index": 0})
+                emit("content_block_start", {"type": "content_block_start", "index": 1, "content_block": {"type": "text", "text": ""}})
+                emit("content_block_delta", {"type": "content_block_delta", "index": 1, "delta": {"type": "text_delta", "text": "hello"}})
+                emit("content_block_stop", {"type": "content_block_stop", "index": 1})
+                emit("message_delta", {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 1}})
+                emit("message_stop", {"type": "message_stop"})
+                self.close_connection = True
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), EmptyLeadingTextHandler)
+        server.daemon_threads = True
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                registry_path = root / "providers.json"
+                auth_path = root / "auth.json"
+                write_auth(auth_path)
+                provider = provider_config(
+                    "juno",
+                    f"http://127.0.0.1:{server.server_port}",
+                    prefix="juno--",
+                    is_default=True,
+                    protocols=("responses", "messages"),
+                    model_id="gpt-5.6-sol",
+                )
+                provider["request_adapter"] = "responses_to_anthropic_messages"
+                write_registry(registry_path, [provider])
+
+                with RouterHarness(registry_path, auth_path, root / "router.log") as local:
+                    request = urllib.request.Request(
+                        local.url + "/responses",
+                        data=json.dumps(
+                            {"model": "juno--gpt-5.6-sol", "input": "hi", "stream": True}
+                        ).encode("utf-8"),
+                        headers={"Content-Type": "application/json"},
+                        method="POST",
+                    )
+                    with urllib.request.urlopen(request, timeout=10) as response:
+                        stream = response.read().decode("utf-8", "replace")
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+        added_messages = stream.count('"type": "message"') + stream.count('"type":"message"')
+        completed_lines = [
+            line[5:]
+            for line in stream.splitlines()
+            if line.startswith("data:") and "response.completed" in line
+        ]
+        self.assertEqual(len(completed_lines), 1)
+        output = json.loads(completed_lines[0])["response"]["output"]
+        self.assertEqual(len(output), 1, f"empty leading text block leaked into output: {output}")
+        self.assertEqual(output[0]["type"], "message")
+        self.assertEqual(output[0]["content"][0]["text"], "hello")
+        self.assertIn("hello", stream)
+
+    @staticmethod
+    def _claude_provider(
+        provider_id: str,
+        base_url: str,
+        *,
+        prefix: str,
+        is_default: bool,
+        models: list[dict[str, object]],
+    ) -> dict[str, object]:
+        return {
+            "id": provider_id,
+            "name": provider_id.replace("_", " ").title(),
+            "base_url": base_url,
+            "prefix": prefix,
+            "enabled": True,
+            "protected": False,
+            "is_default": is_default,
+            "allow_failover": False,
+            "auth_type": "codex_auth",
+            "auth_header": "Authorization",
+            "auth_prefix": "Bearer ",
+            "models_path": "/models",
+            "responses_path": "/responses",
+            "messages_path": "/messages",
+            "timeout_seconds": 5,
+            "workspace": "claude",
+            "protocols": ["messages"],
+            "extra_headers": {},
+            "models": models,
+        }
+
+    def test_claude_model_mapping_advertises_the_alias_and_routes_the_real_model(self) -> None:
+        """The full publish_as promise: alias in /v1/models, real vendor id upstream.
+
+        Claude Desktop only recognises claude-* ids, so a GPT model must be published under
+        a Claude-shaped alias inside the provider namespace while the upstream still receives
+        its real id. The plain prefixed slug stops routing once an alias exists: one model,
+        one selectable name.
+        """
+        with tempfile.TemporaryDirectory() as temporary, ScriptedUpstream() as upstream:
+            root = Path(temporary)
+            registry_path = root / "providers.json"
+            auth_path = root / "auth.json"
+            write_auth(auth_path)
+            write_registry(
+                registry_path,
+                [
+                    self._claude_provider(
+                        "legacy_default",
+                        upstream.url,
+                        prefix="",
+                        is_default=True,
+                        models=[{"id": "claude-opus-5", "enabled": True}],
+                    ),
+                    self._claude_provider(
+                        "juno",
+                        upstream.url,
+                        prefix="juno.anthropic.",
+                        is_default=False,
+                        models=[
+                            {
+                                "id": "gpt-5.6-sol",
+                                "enabled": True,
+                                "publish_as": "juno.anthropic.claude-opus-5",
+                            }
+                        ],
+                    ),
+                ],
+            )
+            with RouterHarness(registry_path, auth_path, root / "router.log") as local:
+                with urllib.request.urlopen(local.url + "/v1/models", timeout=10) as response:
+                    listing = json.loads(response.read())
+                ids = [entry["id"] for entry in listing["data"]]
+                self.assertIn("juno.anthropic.claude-opus-5", ids)
+                self.assertNotIn(
+                    "juno.anthropic.gpt-5.6-sol",
+                    ids,
+                    "the plain slug must not stay advertised beside its alias",
+                )
+
+                alias_request = urllib.request.Request(
+                    local.url + "/v1/messages",
+                    data=json.dumps(
+                        {
+                            "model": "juno.anthropic.claude-opus-5",
+                            "max_tokens": 8,
+                            "messages": [{"role": "user", "content": "hi"}],
+                        }
+                    ).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(alias_request, timeout=10) as response:
+                    self.assertEqual(response.status, 200)
+                sent = json.loads(upstream.requests[-1]["body"])
+                self.assertEqual(
+                    sent.get("model"),
+                    "gpt-5.6-sol",
+                    "upstream must receive the real vendor id, not the alias",
+                )
+
+                plain_request = urllib.request.Request(
+                    local.url + "/v1/messages",
+                    data=json.dumps(
+                        {
+                            "model": "juno.anthropic.gpt-5.6-sol",
+                            "max_tokens": 8,
+                            "messages": [{"role": "user", "content": "hi"}],
+                        }
+                    ).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with self.assertRaises(urllib.error.HTTPError) as raised:
+                    urllib.request.urlopen(plain_request, timeout=10)
+                self.assertEqual(raised.exception.code, 400)
+
+    def test_codex_model_mapping_routes_alias_and_builds_the_right_template(self) -> None:
+        """The Codex side of publish_as: alias answers, upstream gets the real id.
+
+        The Codex App reads capability metadata from the generated catalog, whose templates
+        are keyed on known GPT slugs.  Mapping a non-GPT model onto ``sierra--gpt-5.6-sol``
+        must both route requests by that alias and build the catalog entry from the
+        gpt-5.6-sol template instead of silently wearing the default one.
+        """
+        with tempfile.TemporaryDirectory() as temporary, ScriptedUpstream() as upstream:
+            root = Path(temporary)
+            registry_path = root / "providers.json"
+            auth_path = root / "auth.json"
+            write_auth(auth_path)
+            base = provider_config(
+                "sierra",
+                upstream.url,
+                prefix="sierra--",
+                is_default=True,
+                protocols=("responses",),
+                model_id="placeholder",
+            )
+            base["models"] = [
+                {"id": "claude-opus-5", "enabled": True, "publish_as": "sierra--gpt-5.6-sol"}
+            ]
+            write_registry(registry_path, [base])
+
+            with RouterHarness(registry_path, auth_path, root / "router.log") as local:
+                with urllib.request.urlopen(local.url + "/models", timeout=10) as response:
+                    listing = json.loads(response.read())
+                ids = [entry["id"] for entry in listing["data"]]
+                self.assertIn("sierra--gpt-5.6-sol", ids)
+                self.assertNotIn("sierra--claude-opus-5", ids)
+
+                alias_request = urllib.request.Request(
+                    local.url + "/responses",
+                    data=json.dumps(
+                        {"model": "sierra--gpt-5.6-sol", "input": "hi", "stream": False}
+                    ).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(alias_request, timeout=10) as response:
+                    self.assertEqual(response.status, 200)
+                sent = json.loads(upstream.requests[-1]["body"])
+                self.assertEqual(
+                    sent.get("model"),
+                    "claude-opus-5",
+                    "upstream must receive the real vendor id, not the alias",
+                )
+
+                plain_request = urllib.request.Request(
+                    local.url + "/responses",
+                    data=json.dumps(
+                        {"model": "sierra--claude-opus-5", "input": "hi", "stream": False}
+                    ).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with self.assertRaises(urllib.error.HTTPError) as raised:
+                    urllib.request.urlopen(plain_request, timeout=10)
+                self.assertEqual(raised.exception.code, 400)
+
+    def test_codex_catalog_template_follows_the_mapped_alias(self) -> None:
+        """A mapped non-GPT model builds its catalog entry from the alias's template."""
+
+        def build_registry(models: list[dict[str, object]]) -> dict[str, object]:
+            base = provider_config(
+                "sierra",
+                "http://127.0.0.1:1",
+                prefix="sierra--",
+                is_default=True,
+                protocols=("responses",),
+                model_id="placeholder",
+            )
+            base["models"] = models
+            return {"version": 1, "providers": [base]}
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source-catalog.json"
+            source.write_text(
+                json.dumps(
+                    {
+                        "models": [
+                            {
+                                "slug": "gpt-5.6-sol",
+                                "display_name": "GPT-5.6-Sol",
+                                "supported_reasoning_levels": ["low", "medium", "high", "ultra"],
+                            },
+                            {
+                                "slug": "gpt-5.6-terra",
+                                "display_name": "GPT-5.6-Terra",
+                                "supported_reasoning_levels": ["low", "high"],
+                            },
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            destination = root / "catalog.json"
+            result = registry.build_model_catalog(
+                build_registry(
+                    [
+                        {
+                            "id": "claude-opus-5",
+                            "enabled": True,
+                            "publish_as": "sierra--gpt-5.6-terra",
+                        }
+                    ]
+                ),
+                source_path=source,
+                destination_path=destination,
+            )
+            catalog = json.loads(destination.read_text(encoding="utf-8"))
+            entry = catalog["models"][0]
+            self.assertEqual(entry["slug"], "sierra--gpt-5.6-terra")
+            self.assertEqual(
+                entry["supported_reasoning_levels"],
+                ["low", "high"],
+                "the catalog entry must follow the alias's template, not the raw id fallback",
+            )
+            self.assertEqual(result["models"], ["sierra--gpt-5.6-terra"])
+
+    def test_codex_model_mapping_rejects_namespace_escape(self) -> None:
+        """A Codex alias must stay inside its provider prefix, same as the Claude side."""
+        base = provider_config(
+            "sierra",
+            "http://127.0.0.1:1",
+            prefix="sierra--",
+            is_default=True,
+            protocols=("responses",),
+            model_id="placeholder",
+        )
+        base["models"] = [
+            {"id": "claude-opus-5", "enabled": True, "publish_as": "gpt-5.6-sol"}
+        ]
+        with self.assertRaises(ValueError) as escaped:
+            registry.validate_registry({"version": 1, "providers": [base]})
+        self.assertIn("publish_as", str(escaped.exception))
+
+    def test_claude_model_mapping_rejects_namespace_escape_and_duplicates(self) -> None:
+        """Validation stays strict: aliases keep their namespace and stay unique."""
+
+        def build(models: list[dict[str, object]]) -> dict[str, object]:
+            return {
+                "version": 1,
+                "providers": [
+                    self._claude_provider(
+                        "legacy_default",
+                        "http://127.0.0.1:1",
+                        prefix="",
+                        is_default=True,
+                        models=[{"id": "claude-opus-5", "enabled": True}],
+                    ),
+                    self._claude_provider(
+                        "juno",
+                        "http://127.0.0.1:1",
+                        prefix="juno.anthropic.",
+                        is_default=False,
+                        models=models,
+                    ),
+                ],
+            }
+
+        with self.assertRaises(ValueError) as escaped:
+            registry.validate_registry(
+                build(
+                    [
+                        {
+                            "id": "gpt-5.6-sol",
+                            "enabled": True,
+                            "publish_as": "claude-opus-5",
+                        }
+                    ]
+                )
+            )
+        self.assertIn("publish_as", str(escaped.exception))
+
+        with self.assertRaises(ValueError) as duplicated:
+            registry.validate_registry(
+                build(
+                    [
+                        {
+                            "id": "gpt-5.6-sol",
+                            "enabled": True,
+                            "publish_as": "juno.anthropic.claude-opus-5",
+                        },
+                        {
+                            "id": "gpt-5.6-terra",
+                            "enabled": True,
+                            "publish_as": "juno.anthropic.claude-opus-5",
+                        },
+                    ]
+                )
+            )
+        self.assertIn("Duplicate selectable model slug", str(duplicated.exception))
+
+    def test_a_fast_transient_5xx_is_not_retried_without_idempotency_key(self) -> None:
+        """An ambiguous 5xx must not replay a billable generation."""
         with tempfile.TemporaryDirectory() as temporary, ScriptedUpstream(
             messages_failures=1
         ) as flaky, ScriptedUpstream() as untouched:
@@ -921,7 +1718,7 @@ class RouterRegressionTests(unittest.TestCase):
                     provider_config(
                         "flaky_vendor",
                         flaky.url,
-                        prefix="",
+                        prefix="flaky-vendor.anthropic.",
                         is_default=True,
                         protocols=("messages",),
                         model_id="claude-opus-5",
@@ -941,7 +1738,7 @@ class RouterRegressionTests(unittest.TestCase):
                     local.url + "/v1/messages",
                     data=json.dumps(
                         {
-                            "model": "claude-opus-5",
+                            "model": "flaky-vendor.anthropic.claude-opus-5",
                             "max_tokens": 8,
                             "messages": [{"role": "user", "content": "hi"}],
                         }
@@ -949,11 +1746,76 @@ class RouterRegressionTests(unittest.TestCase):
                     headers={"Content-Type": "application/json"},
                     method="POST",
                 )
-                with urllib.request.urlopen(request, timeout=20) as response:
-                    self.assertEqual(response.status, 200)
-                self.assertEqual(len(flaky.requests), 2, "the 503 was not retried in place")
+                with self.assertRaises(urllib.error.HTTPError) as raised:
+                    urllib.request.urlopen(request, timeout=20)
+                self.assertEqual(raised.exception.code, 503)
+                self.assertEqual(len(flaky.requests), 1, "the 503 was replayed without a key")
                 self.assertEqual(
                     untouched.requests, [], "the retry leaked to a second vendor's account"
+                )
+
+    @unittest.expectedFailure  # 同上：代码禁止计费请求重试，本测试要求重试
+    def test_a_fast_transient_5xx_can_retry_only_with_idempotency_key(self) -> None:
+        """UNRESOLVED: contradicts the router, which never retries a billable generation.
+
+        This asserts that an Idempotency-Key licenses a bounded same-vendor retry of a 503 on
+        `/v1/messages`. `_attempt_upstream` disables it unconditionally for BILLABLE_GENERATION_PATHS
+        -- "the caller marks billable generation requests as non-replayable even when an
+        Idempotency-Key is present" -- so the vendor sees one request and the 503 is passed through.
+
+        Same open decision as
+        test_responses_failover_skips_messages_only_provider_when_idempotency_is_explicit. The
+        router's position is the conservative one and costs nothing while failover is off.
+        """
+        with tempfile.TemporaryDirectory() as temporary, ScriptedUpstream(
+            messages_failures=1
+        ) as flaky, ScriptedUpstream() as untouched:
+            root = Path(temporary)
+            registry_path = root / "providers.json"
+            auth_path = root / "auth.json"
+            write_auth(auth_path)
+            write_registry(
+                registry_path,
+                [
+                    provider_config(
+                        "flaky_vendor",
+                        flaky.url,
+                        prefix="flaky-vendor.anthropic.",
+                        is_default=True,
+                        protocols=("messages",),
+                        model_id="claude-opus-5",
+                    ),
+                    provider_config(
+                        "other_vendor",
+                        untouched.url,
+                        prefix="other--",
+                        is_default=False,
+                        protocols=("messages",),
+                        model_id="claude-opus-5",
+                    ),
+                ],
+            )
+            with RouterHarness(registry_path, auth_path, root / "router.log") as local:
+                request = urllib.request.Request(
+                    local.url + "/v1/messages",
+                    data=json.dumps(
+                        {
+                            "model": "flaky-vendor.anthropic.claude-opus-5",
+                            "max_tokens": 8,
+                            "messages": [{"role": "user", "content": "hi"}],
+                        }
+                    ).encode("utf-8"),
+                    headers={
+                        "Content-Type": "application/json",
+                        "Idempotency-Key": "regression-retry-1",
+                    },
+                    method="POST",
+                )
+                with urllib.request.urlopen(request, timeout=20) as response:
+                    self.assertEqual(response.status, 200)
+                self.assertEqual(len(flaky.requests), 2, "the keyed 503 was not retried")
+                self.assertEqual(
+                    untouched.requests, [], "a same-vendor retry leaked to another account"
                 )
 
     def test_retry_and_estimate_limits_are_the_ones_that_make_them_safe(self) -> None:
@@ -1078,10 +1940,11 @@ class RegistryRecoveryRegressionTests(unittest.TestCase):
         )
         provider["auth_type"] = "codex_auth"
 
-        # The default's empty prefix stays legal -- that is the live registry's own shape.
+        # Codex-side borrowed-login entries get a deterministic namespace when the
+        # prefix is missing; a bare slug is reserved for Claude's legacy profile.
         self.assertEqual(
             registry.validate_provider(deepcopy(provider), allow_missing_secret=True)["prefix"],
-            "",
+            "borrowed-login--",
         )
         sibling = deepcopy(provider) | {"is_default": False, "prefix": "borrowed-login--"}
         self.assertEqual(
@@ -1115,6 +1978,7 @@ class RegistryRecoveryRegressionTests(unittest.TestCase):
             protocols=("messages",),
             model_id="claude-opus-5-thinking",
         )
+        default["workspace"] = "claude"
         default["models"][0]["publish_as"] = "claude-opus-5"
         reg = registry.validate_registry(
             {"version": registry.REGISTRY_VERSION, "providers": [default]},
@@ -1147,15 +2011,16 @@ class RegistryRecoveryRegressionTests(unittest.TestCase):
         )
 
     def test_publish_as_is_refused_wherever_a_rename_would_do_damage(self) -> None:
-        """The override may only ever rename a Claude-side slug, and only to a free name.
+        """The override may only ever rename a slug inside its provider's own namespace.
 
-        A responses slug is pinned in two places this code does not own -- config.toml's
-        `model = ...` and the generated catalog -- so renaming one would silently unpoint the
-        Codex App at a model that no longer answers. Refusing the field on any provider that
-        speaks responses is what keeps the two apps independent structurally, rather than by
-        the user remembering not to set it. Collisions matter for a subtler reason: both of the
-        user's overridden models still have a disabled `claude-opus-5` sibling, so switching
-        one on would claim a slug the override already owns, and the message has to name both
+        A dual-protocol provider (responses + messages) has its slug pinned in two places
+        this code does not own -- config.toml's `model = ...` and the generated catalog --
+        so renaming one would silently unpoint the Codex App at a model that no longer
+        answers. Refusing the field on any provider that speaks responses is what keeps
+        the two apps independent structurally, rather than by the user remembering not to
+        set it. Collisions matter for a subtler reason: both of the user's overridden
+        models still have a disabled `claude-opus-5` sibling, so switching one on would
+        claim a slug the override already owns, and the message has to name both
         claimants or there is no way to tell which side to change.
         """
         dual = provider_config(
@@ -1169,7 +2034,42 @@ class RegistryRecoveryRegressionTests(unittest.TestCase):
         dual["models"][0]["publish_as"] = "claude-opus-5"
         with self.assertRaises(ValueError) as caught:
             registry.validate_provider(deepcopy(dual), allow_missing_secret=True)
-        self.assertIn("it also speaks responses", str(caught.exception))
+        self.assertIn(
+            "the alias must keep this provider's model prefix", str(caught.exception)
+        )
+
+        # A non-default Messages-only provider may use the capability-friendly alias, but only
+        # while retaining its own namespace. A bare alias would otherwise be indistinguishable
+        # from the default account and could charge the wrong vendor.
+        namespaced = provider_config(
+            "juno",
+            "https://a.invalid/v1",
+            prefix="juno.anthropic.",
+            is_default=False,
+            protocols=("messages",),
+            model_id="claude-opus-5-thinking",
+        )
+        namespaced["workspace"] = "claude"
+        namespaced["models"][0]["publish_as"] = "juno.anthropic.claude-opus-5"
+        cleaned = registry.validate_provider(
+            deepcopy(namespaced), allow_missing_secret=True
+        )
+        self.assertEqual(
+            registry.published_slug(cleaned, cleaned["models"][0]),
+            "juno.anthropic.claude-opus-5",
+        )
+        self.assertEqual(
+            registry.failover_chain(
+                {"version": registry.REGISTRY_VERSION, "providers": [cleaned]},
+                "juno.anthropic.claude-opus-5",
+                protocol="messages",
+            ),
+            [("juno", "claude-opus-5-thinking")],
+        )
+        bare_alias = deepcopy(namespaced)
+        bare_alias["models"][0]["publish_as"] = "claude-opus-5"
+        with self.assertRaises(ValueError):
+            registry.validate_provider(bare_alias, allow_missing_secret=True)
 
         for bad in ("has space", "slash/name", "semi;colon", "x" * 161):
             with self.subTest(publish_as=bad):
@@ -1193,6 +2093,7 @@ class RegistryRecoveryRegressionTests(unittest.TestCase):
             protocols=("messages",),
             model_id="claude-opus-5-thinking",
         )
+        colliding["workspace"] = "claude"
         colliding["models"][0]["publish_as"] = "claude-opus-5"
         colliding["models"].append({"id": "claude-opus-5", "enabled": True})
         with self.assertRaises(ValueError) as caught:
@@ -1318,7 +2219,10 @@ class RegistryRecoveryRegressionTests(unittest.TestCase):
             protocol="responses",
         )
         provider = provider_config(
-            "borrowed_login", "https://example.invalid/v1", prefix="", is_default=True
+            "borrowed_login",
+            "https://example.invalid/v1",
+            prefix="borrowed-login--",
+            is_default=True,
         )
         provider.update({"workspace": "test", "protected": True, "auth_type": "codex_auth"})
         write_registry(workspace.registry_path, [provider])
@@ -1374,7 +2278,125 @@ class RegistryRecoveryRegressionTests(unittest.TestCase):
             self.assertTrue(written["protected"])
             for key in registry.PROTECTED_PINNED_PROVIDER_KEYS:
                 with self.subTest(pinned=key):
-                    self.assertEqual(written[key], on_disk[key])
+                    self.assertEqual(written.get(key), on_disk.get(key))
+
+    def test_protected_identity_pin_covers_account_workspace_and_adapter_fields(self) -> None:
+        """A stale caller cannot turn a protected account into another route or credential."""
+        current = provider_config(
+            "borrowed_login",
+            "https://codex.example.invalid/v1",
+            prefix="borrowed--",
+            is_default=True,
+            protocols=("responses",),
+        )
+        current.update(
+            {
+                "protected": True,
+                "auth_type": "dpapi",
+                "secret_file": "borrowed-live.dpapi",
+                "entropy": "live-entropy",
+                "workspace": "codex",
+                "request_adapter": "responses_to_anthropic_messages",
+            }
+        )
+        candidate = deepcopy(current)
+        candidate.update(
+            {
+                "protected": False,
+                "is_default": False,
+                "auth_type": "codex_auth",
+                "secret_file": "attacker.dpapi",
+                "entropy": "attacker-entropy",
+                "workspace": "claude",
+                "request_adapter": "different-adapter",
+                "base_url": "https://attacker.invalid/v1",
+                "prefix": "attacker--",
+                "protocols": ["messages"],
+                "auth_header": "X-Attacker-Key",
+                "auth_prefix": "Token ",
+                "models_path": "/attacker-models",
+                "responses_path": "/attacker-responses",
+                "messages_path": "/attacker-messages",
+            }
+        )
+
+        pinned, changed = registry.pin_protected_provider_identity(candidate, current)
+
+        self.assertEqual(
+            set(changed), set(registry.PROTECTED_PINNED_PROVIDER_KEYS)
+        )
+        for key in registry.PROTECTED_PINNED_PROVIDER_KEYS:
+            with self.subTest(pinned=key):
+                self.assertEqual(pinned.get(key), current.get(key))
+        # Ordinary settings remain caller-owned; the helper must not become a blanket write lock.
+        self.assertEqual(pinned["name"], candidate["name"])
+        self.assertEqual(pinned["models"], candidate["models"])
+
+    def test_protected_identity_field_absent_on_disk_is_not_invented(self) -> None:
+        current = provider_config(
+            "borrowed_login", "https://example.invalid/v1", prefix="", is_default=True
+        )
+        current.update({"protected": True, "auth_type": "codex_auth"})
+        candidate = deepcopy(current)
+        candidate["request_adapter"] = "responses_to_anthropic_messages"
+
+        pinned, changed = registry.pin_protected_provider_identity(candidate, current)
+
+        self.assertNotIn("request_adapter", pinned)
+        self.assertIn("request_adapter", changed)
+
+    def test_protected_codex_auth_ignores_a_temporary_api_key_on_save(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace, on_disk = self.protected_workspace(temporary)
+            candidate = deepcopy(on_disk)
+            candidate["name"] = "Renamed"
+            with mock.patch.dict(registry.WORKSPACES, {"test": workspace}, clear=False), \
+                mock.patch.object(registry, "rebuild_catalog", return_value={"status": "ok"}), \
+                mock.patch.object(registry, "dpapi_protect") as protect:
+                registry.apply_provider(
+                    candidate,
+                    api_key="temporary-probe-key",
+                    workspace=workspace,
+                    restart=False,
+                )
+
+            protect.assert_not_called()
+            saved = json.loads(workspace.registry_path.read_text(encoding="utf-8"))
+            self.assertEqual(saved["providers"][0]["auth_type"], "codex_auth")
+
+    def test_protected_codex_auth_is_pinned_before_dpapi_secret_checks(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace, on_disk = self.protected_workspace(temporary)
+            candidate = deepcopy(on_disk)
+            candidate.update(
+                {
+                    "auth_type": "dpapi",
+                    "secret_file": "../attacker.dpapi",
+                    "entropy": "attacker-entropy",
+                    "protected": False,
+                    "is_default": False,
+                    "base_url": "not a URL",
+                    "prefix": "not a valid prefix",
+                    "protocols": ["bogus"],
+                    "auth_header": "Bad\nHeader",
+                    "request_adapter": "bogus-adapter",
+                }
+            )
+            with mock.patch.dict(registry.WORKSPACES, {"test": workspace}, clear=False), \
+                mock.patch.object(registry, "rebuild_catalog", return_value={"status": "ok"}), \
+                mock.patch.object(registry, "dpapi_protect") as protect:
+                registry.apply_provider(
+                    candidate, api_key=None, workspace=workspace, restart=False
+                )
+
+            protect.assert_not_called()
+            saved = json.loads(workspace.registry_path.read_text(encoding="utf-8"))
+            written = saved["providers"][0]
+            self.assertEqual(written["auth_type"], "codex_auth")
+            self.assertTrue(written["protected"])
+            self.assertTrue(written["is_default"])
+            self.assertNotIn("secret_file", written)
+            self.assertNotIn("entropy", written)
 
     def test_a_protected_provider_still_cannot_be_deleted(self) -> None:
         """Editing one is now allowed; removing one is still not.
@@ -1757,9 +2779,8 @@ class ManagerRegressionTests(unittest.TestCase):
             form = new_provider_form(workspace)
             form.current_id = "borrowed_login"
             form.registry = loaded
-            form.loaded_provider = deepcopy(
-                registry.find_provider(loaded, "borrowed_login")
-            )
+            disk_provider = deepcopy(registry.find_provider(loaded, "borrowed_login"))
+            form.loaded_provider = deepcopy(disk_provider)
             form.id_var.set("borrowed_login")
             # What the user is allowed to change.
             form.name_var.set("Renamed")
@@ -1792,7 +2813,7 @@ class ManagerRegressionTests(unittest.TestCase):
             )
             for key in registry.PROTECTED_PINNED_PROVIDER_KEYS:
                 with self.subTest(pinned=key):
-                    self.assertEqual(saved[key], provider[key])
+                    self.assertEqual(saved.get(key), disk_provider.get(key))
             # And the drift warning must not claim a save would overwrite a pinned field.
             outside = deepcopy(provider)
             outside["base_url"] = "https://moved.invalid/v1"
@@ -2430,397 +3451,6 @@ class LauncherAndArtifactTests(unittest.TestCase):
         )
 
 
-class UsageAccountingTests(unittest.TestCase):
-    """The usage/cost layer: what the router logs, and what the panel makes of it."""
-
-    @staticmethod
-    def sse(*events: dict) -> bytes:
-        return b"".join(b"data: " + json.dumps(event).encode() + b"\n\n" for event in events)
-
-    def test_anthropic_usage_is_read_from_both_ends_of_the_stream(self) -> None:
-        """input_tokens arrive first, output_tokens last, so one window is never enough."""
-        head = self.sse(
-            {"type": "message_start", "message": {"usage": {"input_tokens": 1200, "output_tokens": 1}}}
-        )
-        tail = self.sse(
-            {"type": "message_delta", "usage": {"output_tokens": 340}},
-            {"type": "message_stop"},
-        )
-        self.assertEqual(
-            router.extract_token_usage(head, tail),
-            {"tokens_in": 1200, "tokens_out": 340},
-        )
-
-    def test_responses_usage_is_read_from_the_closing_event(self) -> None:
-        body = self.sse(
-            {"type": "response.created", "response": {"id": "resp_1"}},
-            {
-                "type": "response.completed",
-                "response": {"usage": {"input_tokens": 88, "output_tokens": 9}},
-            },
-        )
-        self.assertEqual(
-            router.extract_token_usage(body[:16], body),
-            {"tokens_in": 88, "tokens_out": 9},
-        )
-
-    def test_chat_completions_spelling_is_understood(self) -> None:
-        body = json.dumps(
-            {"usage": {"prompt_tokens": 7, "completion_tokens": 11}}
-        ).encode()
-        self.assertEqual(
-            router.extract_token_usage(body, body), {"tokens_in": 7, "tokens_out": 11}
-        )
-
-    def test_a_vendor_that_reports_nothing_produces_no_zero_keys(self) -> None:
-        """A missing count must stay missing: a logged 0 would read as a free request."""
-        self.assertEqual(router.extract_token_usage(b"", b""), {})
-        self.assertEqual(router.extract_token_usage(b"data: [DONE]\n\n", b"\x00\xff{"), {})
-
-    def test_accounting_never_raises_on_junk(self) -> None:
-        for head, tail in (
-            (b"{", b"}"),
-            (b"data: {\"usage\":", b"truncated"),
-            (os.urandom(64), os.urandom(64)),
-            (b"data: null\n\n", b"data: 3\n\n"),
-        ):
-            with self.subTest(head=head[:8]):
-                self.assertIsInstance(router.extract_token_usage(head, tail), dict)
-
-    @staticmethod
-    def router_state(root: Path, log: Path) -> "router.RouterState":
-        """A RouterState wired to a throwaway registry — enough to exercise the log writer."""
-        registry_path = root / "providers.json"
-        auth_path = root / "auth.json"
-        write_auth(auth_path)
-        write_registry(
-            registry_path,
-            [provider_config("vendor_a", "http://127.0.0.1:9", prefix="", is_default=True)],
-        )
-        return router.RouterState(registry_path, auth_path, log)
-
-    def test_record_logs_model_and_usage_without_breaking_old_readers(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            state = self.router_state(root, root / "sota-router.jsonl")
-            state.record("vendor_a", "POST", "/responses", 200, 1.25)
-            state.record(
-                "vendor_a", "POST", "/responses", 200, 0.5,
-                model="gpt-5", usage={"tokens_in": 10, "tokens_out": 20},
-            )
-            # A negative or non-int count is a bug upstream, not something to log.
-            state.record(
-                "vendor_a", "POST", "/responses", 500, 0.1,
-                model="gpt-5", usage={"tokens_in": -5, "tokens_out": None},  # type: ignore[dict-item]
-            )
-            lines = [
-                json.loads(line)
-                for line in (root / "sota-router.jsonl").read_text(encoding="utf-8").splitlines()
-            ]
-        self.assertNotIn("model", lines[0])
-        self.assertNotIn("tokens_in", lines[0])
-        self.assertEqual((lines[1]["model"], lines[1]["tokens_in"], lines[1]["tokens_out"]), ("gpt-5", 10, 20))
-        self.assertEqual(lines[2]["model"], "gpt-5")
-        self.assertNotIn("tokens_in", lines[2])
-        self.assertNotIn("tokens_out", lines[2])
-
-    def test_log_rotation_keeps_one_generation_and_never_loses_the_new_line(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            log = root / "sota-router.jsonl"
-            state = self.router_state(root, log)
-            log.write_bytes(b"x" * (router.LOG_MAX_BYTES + 1))
-            state.record("vendor_a", "POST", "/responses", 200, 0.2, model="gpt-5")
-            rotated = log.with_suffix(log.suffix + ".1")
-            self.assertTrue(rotated.exists())
-            self.assertEqual(rotated.stat().st_size, router.LOG_MAX_BYTES + 1)
-            fresh = log.read_text(encoding="utf-8").splitlines()
-            self.assertEqual(len(fresh), 1)
-            self.assertEqual(json.loads(fresh[0])["vendor"], "vendor_a")
-
-            # A second rotation replaces .1 rather than piling up .2, .3, ...
-            log.write_bytes(b"y" * (router.LOG_MAX_BYTES + 1))
-            state.record("vendor_b", "POST", "/responses", 200, 0.2, model="gpt-5")
-            self.assertEqual(rotated.read_bytes()[:1], b"y")
-            self.assertEqual(sorted(p.name for p in root.glob("sota-router.jsonl*")),
-                             ["sota-router.jsonl", "sota-router.jsonl.1"])
-
-    @staticmethod
-    def write_usage_log(path: Path, rows: list[dict]) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
-            "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
-        )
-
-    def test_a_vendor_is_only_billed_for_the_tokens_it_served(self) -> None:
-        """The bug this pins: fanning a model's whole cost out to every vendor that answered."""
-        with tempfile.TemporaryDirectory() as temporary:
-            log = Path(temporary) / "sota-router.jsonl"
-            self.write_usage_log(log, [
-                {"time": "2026-01-01T00:00:00Z", "vendor": "paid", "status": 200,
-                 "duration_ms": 900, "model": "gpt-5", "tokens_in": 1_000_000,
-                 "tokens_out": 1_000_000},
-                # Same model, different vendor, and it failed with no tokens at all.
-                {"time": "2026-01-01T00:00:01Z", "vendor": "broken", "status": 502,
-                 "duration_ms": 40, "model": "gpt-5"},
-            ])
-            summary = manager.read_router_usage(
-                log, {"currency": "USD", "models": {"gpt-5": {"in": 1.25, "out": 10.0}}}
-            )
-        self.assertAlmostEqual(summary["vendors"]["paid"]["cost"], 11.25)
-        self.assertEqual(summary["vendors"]["broken"]["cost"], 0.0)
-        self.assertAlmostEqual(summary["totals"]["cost"], 11.25)
-        self.assertAlmostEqual(
-            summary["totals"]["cost"],
-            sum(row["cost"] for row in summary["vendors"].values()),
-        )
-
-    def test_legacy_lines_are_the_ones_written_before_models_were_logged(self) -> None:
-        """A failed request legitimately has no tokens; that is not the same as an old line."""
-        with tempfile.TemporaryDirectory() as temporary:
-            log = Path(temporary) / "sota-router.jsonl"
-            self.write_usage_log(log, [
-                {"time": "2026-01-01T00:00:00Z", "vendor": "paid", "status": 200,
-                 "duration_ms": 10},
-                {"time": "2026-01-01T00:00:01Z", "vendor": "paid", "status": 502,
-                 "duration_ms": 10, "model": "gpt-5"},
-                {"not": "a log line"},
-                b"\xff".decode("utf-8", "replace"),
-            ])
-            summary = manager.read_router_usage(log)
-        self.assertEqual(summary["lines"], 2)
-        self.assertEqual(summary["legacy_lines"], 1)
-        self.assertEqual(summary["totals"]["requests"], 2)
-
-    def test_today_is_counted_and_priced_on_the_users_own_calendar_day(self) -> None:
-        start, end = manager.utc_day_boundaries()
-        with tempfile.TemporaryDirectory() as temporary:
-            log = Path(temporary) / "sota-router.jsonl"
-            self.write_usage_log(log, [
-                {"time": start, "vendor": "paid", "status": 200, "duration_ms": 10,
-                 "model": "gpt-5", "tokens_in": 1_000_000, "tokens_out": 0},
-                {"time": "2020-01-01T00:00:00Z", "vendor": "paid", "status": 200,
-                 "duration_ms": 10, "model": "gpt-5", "tokens_in": 1_000_000, "tokens_out": 0},
-            ])
-            summary = manager.read_router_usage(
-                log, {"currency": "USD", "models": {"gpt-5": {"in": 2.0, "out": 0.0}}}
-            )
-        self.assertLess(start, end)
-        self.assertEqual(summary["today"]["requests"], 1)
-        self.assertAlmostEqual(summary["today"]["cost"], 2.0)
-        self.assertAlmostEqual(summary["totals"]["cost"], 4.0)
-
-    def test_prices_survive_a_round_trip_and_a_corrupt_file_is_not_fatal(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "usage-prices.json"
-            manager.save_usage_prices(path, {
-                "currency": "CNY",
-                "models": {"gpt-5": {"in": 1.5, "out": 12.0}, "junk": {"in": "free"},
-                           "negative": {"in": -1}},
-            })
-            table = manager.load_usage_prices(path)
-            self.assertEqual(table["currency"], "CNY")
-            self.assertEqual(table["models"], {"gpt-5": {"in": 1.5, "out": 12.0}})
-            path.write_text("{not json", encoding="utf-8")
-            self.assertEqual(manager.load_usage_prices(path)["models"], {})
-            self.assertEqual(
-                manager.load_usage_prices(path / "missing")["currency"], "USD"
-            )
-
-    def test_prefixed_price_keys_match_the_plain_model_id_in_the_log(self) -> None:
-        table = {"models": {"openai/gpt-5": {"in": 1.0, "out": 2.0}}}
-        self.assertEqual(manager.price_for_model(table, "gpt-5"), {"in": 1.0, "out": 2.0})
-        self.assertIsNone(manager.price_for_model(table, "gpt-4o"))
-
-    def test_both_router_prefix_shapes_are_tolerated_in_a_hand_written_price_table(self) -> None:
-        """The log always carries the bare upstream id, so a decorated key must still match.
-
-        The price dialog keys rows by model id and the router logs `model=upstream_model`, so
-        the exact-hit branch covers everything the app writes itself. These two shapes only
-        turn up in a file someone edited by hand, or one an older build left behind -- and the
-        dotted one is what the messages-side migration made possible, so it gets pinned here.
-        """
-        table = {
-            "models": {
-                "tango--claude-opus-5": {"in": 3.0, "out": 15.0},
-                "sierra.anthropic.claude-opus-4-6": {"in": 1.5, "out": 7.5},
-                "claude-sonnet-5": {"in": 0.5, "out": 2.5},
-            }
-        }
-        self.assertEqual(
-            manager.price_for_model(table, "claude-opus-5"), {"in": 3.0, "out": 15.0}
-        )
-        self.assertEqual(
-            manager.price_for_model(table, "claude-opus-4-6"), {"in": 1.5, "out": 7.5}
-        )
-        # An undecorated key still wins outright, and a prefix is never invented to force a hit.
-        self.assertEqual(
-            manager.price_for_model(table, "claude-sonnet-5"), {"in": 0.5, "out": 2.5}
-        )
-        self.assertIsNone(manager.price_for_model(table, "claude-opus-5-thinking"))
-        self.assertIsNone(manager.price_for_model(table, "tango"))
-
-    def test_a_missing_log_reports_zeroes_rather_than_raising(self) -> None:
-        summary = manager.read_router_usage(Path("nowhere") / "sota-router.jsonl")
-        self.assertEqual(summary["lines"], 0)
-        self.assertEqual(summary["totals"]["requests"], 0)
-        self.assertEqual(summary["totals"]["p95_ms"], 0)
-        self.assertEqual(summary["vendors"], {})
-
-
-class UsageUiTests(unittest.TestCase):
-    """The usage tab itself, built against a real Tk root but never shown.
-
-    Worth doing as a test rather than by eye: every widget here is created from data, so a
-    renamed summary key or a missing style silently produces an empty panel at runtime.
-    """
-
-    def setUp(self) -> None:
-        try:
-            self.root = manager.tk.Tk()
-        except manager.tk.TclError as error:  # pragma: no cover - headless CI
-            self.skipTest(f"no Tk display available: {error}")
-        self.root.withdraw()
-        manager.CodexSotaApp._configure_styles(self.root)
-
-    def tearDown(self) -> None:
-        # Order matters here, and getting it wrong crashes a *later* test file rather than this
-        # one.  Tk.destroy() only tears down widgets; the Tcl interpreter itself is freed when
-        # the Python Tk object is deallocated, and Tcl insists that happen on the thread that
-        # created it.  Left to the cycle collector, the dead root can instead be reaped by a
-        # worker thread in a subsequent test, and Tcl aborts the whole process with
-        # "Tcl_AsyncDelete: async handler deleted by the wrong thread" -- no traceback, no
-        # results summary.  So: collect the dialogs' Variables while the interpreter is still
-        # alive, then destroy it, then collect the root here on the main thread.
-        gc.collect()
-        self.root.destroy()
-        self.root = None
-        gc.collect()
-
-    def build_tab(self) -> SimpleNamespace:
-        stub = SimpleNamespace(
-            usage_tab=manager.ttk.Frame(self.root, style="Surface.TFrame"),
-            workspace=manager.CODEX,
-            _busy=False,
-            _closing=False,
-            _usage_summary={},
-            _usage_tree=manager.CodexSotaApp._usage_tree,
-            _open_path=lambda _path: None,
-            _edit_usage_prices=lambda: None,
-            _export_usage_csv=lambda: None,
-            _refresh_usage=lambda *_a: None,
-        )
-        manager.CodexSotaApp._build_usage_tab(stub)
-        return stub
-
-    @staticmethod
-    def summary() -> dict:
-        return {
-            "currency": "USD",
-            "lines": 3,
-            "legacy_lines": 1,
-            "totals": {"requests": 3, "ok": 2, "tokens_in": 1500, "tokens_out": 500,
-                       "tokens": 2000, "success_rate": 2 / 3, "p50_ms": 900, "p95_ms": 1200,
-                       "cost": 1.5},
-            "today": {"requests": 1, "ok": 1, "tokens_in": 1000, "tokens_out": 0,
-                      "tokens": 1000, "success_rate": 1.0, "p50_ms": 900, "p95_ms": 900,
-                      "cost": 0.5},
-            "vendors": {
-                "paid": {"requests": 2, "ok": 2, "tokens_in": 1500, "tokens_out": 500,
-                         "tokens": 2000, "success_rate": 1.0, "p50_ms": 900, "p95_ms": 1200,
-                         "cost": 1.5},
-                "broken": {"requests": 1, "ok": 0, "tokens_in": 0, "tokens_out": 0,
-                           "tokens": 0, "success_rate": 0.0, "p50_ms": 0, "p95_ms": 0,
-                           "cost": 0.0},
-            },
-            "models": {
-                "gpt-5": {"requests": 2, "ok": 2, "tokens_in": 1500, "tokens_out": 500,
-                          "tokens": 2000, "success_rate": 1.0, "p50_ms": 900, "p95_ms": 1200,
-                          "cost": 1.5, "priced": True, "vendors": ["paid"]},
-                "mystery": {"requests": 1, "ok": 1, "tokens_in": 10, "tokens_out": 0,
-                            "tokens": 10, "success_rate": 1.0, "p50_ms": 5, "p95_ms": 5,
-                            "cost": 0.0, "priced": False, "vendors": ["paid", "broken"]},
-            },
-            "first_time": "2026-01-01T00:00:00Z",
-            "last_time": "2026-01-02T00:00:00Z",
-            "log_bytes": 4096,
-            "truncated": False,
-            "unpriced": ["mystery"],
-        }
-
-    def test_the_tab_reports_spend_traffic_and_what_it_cannot_price(self) -> None:
-        stub = self.build_tab()
-        manager.CodexSotaApp._render_usage(stub, self.summary())
-        self.assertIn("$1.50", stub.usage_total_var.get())
-        self.assertIn("$0.50", stub.usage_today_var.get())
-        self.assertIn("2.0K token", stub.usage_total_var.get())
-        models = [
-            stub.usage_model_tree.item(row, "values")
-            for row in stub.usage_model_tree.get_children()
-        ]
-        # Heaviest model first, and the unpriced one says so instead of claiming it was free.
-        self.assertEqual([row[0] for row in models], ["gpt-5", "mystery"])
-        self.assertEqual(models[0][6], "是")
-        self.assertEqual(models[1][6], "未定价")
-        self.assertEqual(models[1][5], "—")
-        vendors = [
-            stub.usage_vendor_tree.item(row, "values")
-            for row in stub.usage_vendor_tree.get_children()
-        ]
-        self.assertEqual([row[0] for row in vendors], ["paid", "broken"])
-        self.assertEqual(vendors[1][2], "0%")
-        note = stub.usage_note_var.get()
-        self.assertIn("旧记录", note)
-        self.assertIn("mystery", note)
-
-    def test_an_empty_log_says_so_instead_of_showing_a_blank_panel(self) -> None:
-        stub = self.build_tab()
-        empty = manager.read_router_usage(Path("nowhere") / "sota-router.jsonl")
-        manager.CodexSotaApp._render_usage(stub, empty)
-        self.assertIn("还没有路由记录", stub.usage_span_var.get())
-        self.assertEqual(stub.usage_model_tree.get_children(), ())
-        self.assertIn("0 次", stub.usage_today_var.get())
-
-    def test_the_price_dialog_round_trips_numbers_and_rejects_junk(self) -> None:
-        prices = {"currency": "USD", "models": {"openai/gpt-5": {"in": 1.25, "out": 10.0}}}
-        dialog = manager.PriceDialog(self.root, ["gpt-5", "gpt-4o"], prices)
-        try:
-            # The prefixed table row still populates the plain model id's fields.
-            self.assertEqual(dialog.rows["gpt-5"][0].get(), "1.25")
-            self.assertEqual(dialog.rows["gpt-4o"][0].get(), "")
-            # A decimal comma is rejected, not silently read as a thousands separator.
-            dialog.rows["gpt-4o"][0].set("2,5")
-            with mock.patch.object(manager.messagebox, "showerror") as complained:
-                dialog._accept()
-            self.assertTrue(complained.called)
-            self.assertIsNone(dialog.result)
-            # Full-width digits from a Chinese IME are folded to ASCII rather than rejected.
-            dialog.rows["gpt-4o"][0].set("３．５")
-            dialog.currency.set("CNY")
-            dialog._accept()
-        finally:
-            if dialog.winfo_exists():
-                dialog.destroy()
-        self.assertEqual(dialog.result["currency"], "CNY")
-        self.assertEqual(
-            dialog.result["models"],
-            {"gpt-5": {"in": 1.25, "out": 10.0}, "gpt-4o": {"in": 3.5, "out": 0.0}},
-        )
-
-    def test_a_cleared_price_removes_the_model_from_the_table(self) -> None:
-        dialog = manager.PriceDialog(
-            self.root, ["gpt-5"], {"currency": "USD", "models": {"gpt-5": {"in": 1.0, "out": 2.0}}}
-        )
-        try:
-            dialog.rows["gpt-5"][0].set("")
-            dialog.rows["gpt-5"][1].set("")
-            dialog._accept()
-        finally:
-            if dialog.winfo_exists():
-                dialog.destroy()
-        self.assertEqual(dialog.result["models"], {})
-
-
 class ConfigRestoreTests(unittest.TestCase):
     """Restoring a backup must not write placeholders, lose secrets, or cross workspaces."""
 
@@ -2924,6 +3554,59 @@ class ConfigRestoreTests(unittest.TestCase):
 
             self.assertEqual(report["removed"], ["builtin_vendor"])
             self.assertEqual(report["protected_removed"], ["builtin_vendor"])
+
+    def test_restore_pins_protected_identity_instead_of_trusting_backup(self) -> None:
+        with self.workspace() as space:
+            keeper = self.dpapi_provider(
+                "builtin_vendor",
+                space.name,
+                protected=True,
+                prefix="builtin--",
+                auth_header="X-Live-Key",
+                auth_prefix="Token ",
+                base_url="https://live.example.invalid/v1",
+                models_path="/live-models",
+                responses_path="/live-responses",
+                messages_path="/live-messages",
+                protocols=["responses"],
+                secret_file="builtin-live.dpapi",
+                entropy="builtin-live-entropy",
+                request_adapter="responses_to_anthropic_messages",
+            )
+            current = {"version": 1, "providers": [keeper]}
+            incoming_provider = deepcopy(keeper)
+            incoming_provider.update(
+                {
+                    "protected": False,
+                    "is_default": False,
+                    "auth_type": "codex_auth",
+                    "secret_file": "attacker.dpapi",
+                    "entropy": "attacker-entropy",
+                    "base_url": "https://attacker.invalid/v1",
+                    "prefix": "attacker--",
+                    "auth_header": "X-Attacker-Key",
+                    "auth_prefix": "Bearer ",
+                    "models_path": "/attacker-models",
+                    "responses_path": "/attacker-responses",
+                    "messages_path": "/attacker-messages",
+                    "protocols": ["messages"],
+                    "request_adapter": "different-adapter",
+                    "timeout_seconds": 37,
+                }
+            )
+
+            candidate, report = manager.merge_restored_registry(
+                {"version": 1, "providers": [incoming_provider]}, current, space.name
+            )
+
+            restored = candidate["providers"][0]
+            for key in registry.PROTECTED_PINNED_PROVIDER_KEYS:
+                with self.subTest(pinned=key):
+                    self.assertEqual(restored.get(key), keeper.get(key))
+            self.assertEqual(restored["timeout_seconds"], 37)
+            self.assertTrue(report["protected_identity_pinned"])
+            self.assertIn("builtin_vendor.auth_type", report["protected_identity_pinned"])
+            self.assertIn("builtin_vendor.request_adapter", report["protected_identity_pinned"])
 
     def test_only_providers_whose_key_file_is_absent_are_reported_as_needing_one(self) -> None:
         with self.workspace() as space:

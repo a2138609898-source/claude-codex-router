@@ -14,7 +14,7 @@ import urllib.request
 from unittest import mock
 
 
-CORE_ROOT = Path.home() / "Documents" / "Codex" / "CodexHistorySync"
+CORE_ROOT = Path(__file__).resolve().parent.parent / "CodexHistorySync"
 if str(CORE_ROOT) not in sys.path:
     sys.path.insert(0, str(CORE_ROOT))
 
@@ -406,6 +406,143 @@ class TransactionTests(unittest.TestCase):
 
 
 class CatalogCapabilityTests(unittest.TestCase):
+    def test_raw_responses_registry_never_builds_a_bare_catalog_slug(self) -> None:
+        """Catalog helpers may receive an old registry before its normal load/validation pass."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source.json"
+            destination = root / "catalog.json"
+            source.write_text(
+                json.dumps({"models": [{"slug": "gpt-5.6-sol"}]}),
+                encoding="utf-8",
+            )
+            raw_registry = {
+                "version": 1,
+                "providers": [
+                    {
+                        "id": "tango_relay",
+                        "name": "Tango Relay",
+                        "workspace": "codex",
+                        "protocols": ["responses"],
+                        "enabled": True,
+                        "is_default": True,
+                        "prefix": "",
+                        "models": [{"id": "gpt-5.6-sol", "enabled": True}],
+                    }
+                ],
+            }
+
+            self.assertEqual(
+                registry.selectable_slugs(raw_registry),
+                ["tango-relay--gpt-5.6-sol"],
+            )
+            registry.build_model_catalog(
+                registry=raw_registry,
+                source_path=source,
+                destination_path=destination,
+            )
+            catalog = json.loads(destination.read_text(encoding="utf-8"))
+            self.assertEqual(
+                [model["slug"] for model in catalog["models"]],
+                ["tango-relay--gpt-5.6-sol"],
+            )
+
+    def test_namespaced_claude_publish_as_is_preserved_and_hashed(self) -> None:
+        """Raw catalog previews must use the same canonical slug and digest as the router."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source.json"
+            destination = root / "catalog.json"
+            source.write_text(
+                json.dumps({"models": [{"slug": "claude-opus-5-thinking"}]}),
+                encoding="utf-8",
+            )
+            raw_registry = {
+                "version": 1,
+                "providers": [
+                    {
+                        "id": "juno",
+                        "name": "Juno",
+                        "base_url": "https://example.invalid",
+                        "workspace": "claude",
+                        "protocols": ["messages"],
+                        "enabled": True,
+                        "is_default": False,
+                        "prefix": "",
+                        "models": [
+                            {
+                                "id": "claude-opus-5-thinking",
+                                "enabled": True,
+                                "publish_as": "juno.anthropic.claude-opus-5",
+                            }
+                        ],
+                    }
+                ],
+            }
+            canonical_registry = json.loads(json.dumps(raw_registry))
+            canonical_registry["providers"][0]["prefix"] = "juno.anthropic."
+            expected_hash = registry.registry_digest(canonical_registry)
+            result = registry.build_model_catalog(
+                registry=raw_registry,
+                source_path=source,
+                destination_path=destination,
+            )
+            catalog = json.loads(destination.read_text(encoding="utf-8"))
+            self.assertEqual(result["registry_hash"], expected_hash)
+            self.assertEqual(catalog["registry_hash"], expected_hash)
+            self.assertEqual(
+                [model["slug"] for model in catalog["models"]],
+                ["juno.anthropic.claude-opus-5"],
+            )
+
+    def test_raw_nondefault_claude_bare_alias_is_not_advertised(self) -> None:
+        """A hand-edited bare alias cannot erase a non-default provider namespace."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source.json"
+            destination = root / "catalog.json"
+            source.write_text(
+                json.dumps({"models": [{"slug": "claude-opus-5-thinking"}]}),
+                encoding="utf-8",
+            )
+            raw_registry = {
+                "version": 1,
+                "providers": [
+                    {
+                        "id": "juno",
+                        "name": "Juno",
+                        "base_url": "https://example.invalid",
+                        "workspace": "claude",
+                        "protocols": ["messages"],
+                        "enabled": True,
+                        "is_default": False,
+                        "prefix": "juno.anthropic.",
+                        "models": [
+                            {
+                                "id": "claude-opus-5-thinking",
+                                "enabled": True,
+                                "publish_as": "claude-opus-5",
+                            }
+                        ],
+                    }
+                ],
+            }
+            result = registry.build_model_catalog(
+                registry=raw_registry,
+                source_path=source,
+                destination_path=destination,
+            )
+            catalog = json.loads(destination.read_text(encoding="utf-8"))
+            canonical_registry = json.loads(json.dumps(raw_registry))
+            canonical_registry["providers"][0]["models"][0]["publish_as"] = ""
+            expected_hash = registry.registry_digest(canonical_registry)
+            self.assertEqual(result["registry_hash"], expected_hash)
+            self.assertEqual(catalog["registry_hash"], expected_hash)
+            self.assertEqual(
+                [model["slug"] for model in catalog["models"]],
+                ["juno.anthropic.claude-opus-5-thinking"],
+            )
+
     def test_luna_does_not_inherit_sol_ultra_reasoning(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

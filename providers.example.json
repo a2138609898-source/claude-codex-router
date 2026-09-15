@@ -62,9 +62,9 @@
         {
           "id": "claude-opus-5-thinking",
           "enabled": true,
-          "publish_as": "alt-relay.anthropic.claude-opus-5",
+          "publish_as": "",
           "display_name": "Opus 5 (thinking)",
-          "description": "publish_as 的典型用途：上游真实模型名叫 claude-opus-5-thinking，而这个名字规范化之后仍是它自己、不在 Claude Desktop 的能力表里，思考档滑杆就出不来。改名成 alt-relay.anthropic.claude-opus-5 之后规范化能落到 claude-opus-5，滑杆回来了，发给上游的仍然是 id 里那个原名。",
+          "description": "非 Claude 的 Messages-only 默认配置不得使用 publish_as；这里留空后，对外 slug 固定为 alt-relay.anthropic.claude-opus-5-thinking，上游也收到 id 里的原名。只有 Claude Desktop 旧版默认配置可以用 publish_as 做能力表兼容。",
           "last_test_status": "untested",
           "fast_tier_status": "unknown",
           "fast_tier_effect": "untested",

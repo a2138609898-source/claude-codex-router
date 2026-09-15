@@ -33,8 +33,10 @@ try {
     }
 
     if (Test-Path -LiteralPath $stagedApp) {
-        $previous = Join-Path $root ('dist-staging.previous-' + (Get-Date -Format 'yyyyMMdd-HHmmss'))
-        Move-Item -LiteralPath $stagedRoot -Destination $previous -ErrorAction Stop
+        # The staged tree is fully regenerable from source and Apply-StagedBuild keeps its
+        # own rollback copy of live, so replace it in place instead of parking another full
+        # build snapshot in dist-staging.previous-* forever.
+        Remove-Item -LiteralPath $stagedRoot -Recurse -Force -ErrorAction Stop
     }
     New-Item -ItemType Directory -Path $stagedRoot -Force | Out-Null
     Move-Item -LiteralPath $candidateApp -Destination $stagedApp -ErrorAction Stop

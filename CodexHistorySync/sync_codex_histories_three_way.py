@@ -31,11 +31,18 @@ DEFAULT_SOTA_ROOT = Path.home() / ".codex-sota"
 DEFAULT_BACKUP_BASE = INSTALL_DIR / "backups" / "three-way"
 COCKPIT_PROVIDER = "codex_local_access"
 PLUS_PROVIDER = "openai"
-SOTA_PROVIDER = "true_sota"
+SOTA_PROVIDER = "tango_relay"
 MAX_THREE_WAY_BACKUPS = 10
 # How many runs keep their outer-snapshot undo image.  Raise it to be able to undo an older
 # sync; each extra run costs a full second copy of every session tree it touched.
 KEEP_OUTER_SNAPSHOTS = 1
+# Session rollout files past this size are recorded in the snapshot manifest but not copied
+# into the undo image.  Two runaway conversations on this install are 255 MB and 327 MB, so
+# one full snapshot used to weigh 7.5 GB and the copy dominated every sync run. Skipping them
+# is safe: every session mutation the sync performs is an atomic temp-file swap, so there is
+# never a torn copy to roll back, and pass-* backups plus the sibling roots still hold the
+# pre-sync content of anything the sync actually changed.
+OUTER_SNAPSHOT_MAX_FILE_BYTES = 64 * 1024 * 1024
 OUTER_SNAPSHOT_FILES = (
     "state_5.sqlite",
     ".codex-global-state.json",
@@ -141,18 +148,37 @@ def rotate_three_way_backups(
         shutil.rmtree(old, ignore_errors=True)
 
 
+def thread_ids_for_root(root: Path) -> set[str]:
+    """Every thread id a root's database currently holds, read-only.
+
+    Used to decide whether another convergence round is needed. Deliberately lighter than
+    `core.verify_roots`: that one raises on the first inconsistency, which is exactly what the
+    round loop is trying to avoid triggering prematurely.
+    """
+    database = root / "state_5.sqlite"
+    if not database.is_file():
+        return set()
+    connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True, timeout=30)
+    try:
+        return {str(row[0]) for row in connection.execute("SELECT id FROM threads")}
+    finally:
+        connection.close()
+
+
 def prune_outer_snapshots(
     backup_base: Path, keep: int = KEEP_OUTER_SNAPSHOTS
 ) -> list[str]:
-    """Drop the undo images of runs that already committed.
+    """Drop the full-size recovery images of runs that are no longer the newest.
 
-    `outer-snapshot` is read by `restore_outer_snapshot` alone, and only from the failure
-    branch of `run_three_way_sync` -- inside the very call that wrote it.  Once a run
-    returns successfully its image is a second full copy of every session tree it touched
-    and nothing will ever read it again, so retaining ten of them costs tens of gigabytes
-    to keep undo logs for transactions that all committed.  The newest images survive so
-    that undoing the most recent sync stays possible; `pass-*` keeps every run auditable
-    for a few megabytes each.
+    A run leaves up to two full copies of every session tree it touched: `outer-snapshot`, the undo
+    image, and -- when it failed -- `failed-mutated-state`, the half-mutated state the rollback
+    moved aside for inspection. Both are read only from the failure branch of `run_three_way_sync`,
+    inside the very call that wrote them, so once a newer run exists nothing will ever read either
+    again. Retaining them is what turned a repeatedly-failing preflight into tens of gigabytes: one
+    session tree here is ~11 GB, and three retries wrote six copies of it.
+
+    The newest `keep` runs survive intact so undoing or diagnosing the most recent sync stays
+    possible; `pass-*` keeps every run auditable for a few megabytes each.
     """
     if not backup_base.is_dir():
         return []
@@ -163,13 +189,37 @@ def prune_outer_snapshots(
     )
     removed: list[str] = []
     for run in runs[max(keep, 0) :]:
-        snapshot = run / "outer-snapshot"
-        if not snapshot.is_dir():
-            continue
-        shutil.rmtree(snapshot, ignore_errors=True)
-        if not snapshot.exists():
-            removed.append(str(snapshot))
+        for name in ("outer-snapshot", "failed-mutated-state"):
+            image = run / name
+            if not image.is_dir():
+                continue
+            shutil.rmtree(image, ignore_errors=True)
+            if not image.exists():
+                removed.append(str(image))
     return removed
+
+
+def oversize_ignore_filter(skip_log: list[dict[str, Any]]):
+    """copytree ignore hook that leaves files past the snapshot cap out of the copy.
+
+    Every skip is recorded so the manifest and the rollback can account for exactly which
+    files a snapshot copy does not contain.
+    """
+
+    def ignore(directory: str, names: list[str]) -> list[str]:
+        drop: list[str] = []
+        for entry in names:
+            candidate = Path(directory) / entry
+            try:
+                size = candidate.stat().st_size
+            except OSError:
+                continue
+            if candidate.is_file() and size > OUTER_SNAPSHOT_MAX_FILE_BYTES:
+                drop.append(entry)
+                skip_log.append({"path": str(candidate), "bytes": size})
+        return drop
+
+    return ignore
 
 
 def create_outer_snapshot(roots: list[Path], run_backup_root: Path) -> dict[str, Any]:
@@ -205,18 +255,26 @@ def create_outer_snapshot(roots: list[Path], run_backup_root: Path) -> dict[str,
                 sqlite_snapshot(source, target)
             else:
                 target.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(source, target)
+                shutil.copy2(core.extended_path(source), core.extended_path(target))
         for name in OUTER_SNAPSHOT_DIRS:
             source = root / name
             exists = source.is_dir()
             root_record["directories"][name] = exists
             if exists:
+                # Extended-length on both ends: this walks the whole session tree, whose deepest
+                # rollout names already run past 100 characters, into a backup root that is itself
+                # deep. See core.extended_path -- the plain form fails with a bare WinError 3 that
+                # names neither path.
+                skipped: list[dict[str, Any]] = []
                 shutil.copytree(
-                    source,
-                    destination / name,
+                    core.extended_path(source),
+                    core.extended_path(destination / name),
                     copy_function=shutil.copy2,
                     symlinks=True,
+                    ignore=oversize_ignore_filter(skipped),
                 )
+                if skipped:
+                    root_record["oversize_skipped"] = skipped
         manifest["roots"][label] = root_record
     core.atomic_write_json(snapshot_root / "manifest.json", manifest)
     return {
@@ -240,18 +298,49 @@ def restore_outer_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
         failed_destination.mkdir(parents=True, exist_ok=True)
         root.mkdir(parents=True, exist_ok=True)
 
+        # Oversize files are not in the snapshot, and the rollback below deletes and restores
+        # whole directories. Move each one into the failed-state area first and move it back
+        # after the restore, so rolling back can never cost the user a 300 MB conversation.
+        preserved_oversize: list[tuple[Path, Path]] = []
+        for record in root_record.get("oversize_skipped") or []:
+            try:
+                relative = Path(str(record["path"])).relative_to(
+                    Path(root_record["root"])
+                )
+            except (KeyError, TypeError, ValueError):
+                continue
+            current_file = root / relative
+            if not current_file.is_file():
+                continue
+            staged = failed_destination / "oversize-preserved" / relative
+            staged.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                shutil.move(str(current_file), str(staged))
+                preserved_oversize.append((staged, current_file))
+            except OSError:
+                continue
+
+        def restore_preserved() -> None:
+            for staged, destination in preserved_oversize:
+                with contextlib.suppress(Exception):
+                    if staged.is_file():
+                        destination.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.move(str(staged), str(destination))
+
         for name in OUTER_SNAPSHOT_DIRS:
             current = root / name
             recovery_copy = failed_destination / name
             expected = bool(root_record["directories"].get(name))
             try:
                 if current.exists():
+                    recovery_skipped: list[dict[str, Any]] = []
                     shutil.copytree(
                         current,
                         recovery_copy,
                         copy_function=shutil.copy2,
                         symlinks=True,
                         dirs_exist_ok=True,
+                        ignore=oversize_ignore_filter(recovery_skipped),
                     )
                     shutil.rmtree(current)
                 if expected:
@@ -273,6 +362,7 @@ def restore_outer_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
                             copy_function=shutil.copy2,
                             symlinks=True,
                         )
+        restore_preserved()
 
         for name in OUTER_SNAPSHOT_FILES:
             current = root / name
@@ -351,35 +441,67 @@ def execute_three_way_mutations(
         "duplicate_main_threads_removed": 0,
         "duplicate_auxiliary_threads_removed": 0,
         "duplicate_session_files_removed": 0,
+        "normalized_model_fields": 0,
+        "unresolved_model_fields": 0,
     }
     warnings: list[str] = []
     last_result: dict[str, Any] | None = None
-
-    for index, (label, left_root, right_root) in enumerate(passes, start=1):
-        pass_backup_base = run_backup_root / f"pass-{index:02d}-{label}"
-        result = core.run_sync(
-            left_root,
-            right_root,
-            pass_backup_base,
-            providers[left_root],
-            providers[right_root],
-        )
-        last_result = result
-        for key in totals:
-            totals[key] += int(result.get(key) or 0)
-        warnings.extend(str(item) for item in result.get("warnings", []))
-        pass_results.append(
-            {
-                "label": label,
-                "left_root": str(left_root),
-                "right_root": str(right_root),
-                "left_provider": providers[left_root],
-                "right_provider": providers[right_root],
-                "backup_dir": result.get("backup_dir"),
-                "new_files": result.get("new_files"),
-                "updated_files": result.get("updated_files"),
-                "conflicts_preserved": result.get("conflicts_preserved"),
-            }
+    # Run the three pairwise passes until the three roots agree, not just once.
+    #
+    # A single round is not enough, and the reason is structural rather than a flaky edge case: the
+    # passes both propagate sessions AND remove duplicates. Pass 2 (cockpit-sota) copies sota's new
+    # threads into cockpit; pass 3 (plus-sota) then dedupes sota, and any thread it drops there is
+    # still sitting in cockpit -- so the pairwise verification inside each pass passes while the
+    # final three-way check finds the sets unequal and fails the whole sync after four minutes of
+    # work. Re-running the passes lets a removal made late in one round propagate in the next.
+    #
+    # Bounded, because "repeat until equal" on a genuine non-convergence would loop forever: three
+    # rounds is enough for a removal in the last pass to reach both other roots, and if the sets
+    # still disagree the verification below reports it as the real problem it is.
+    MAX_CONVERGENCE_ROUNDS = 3
+    rounds_run = 0
+    for round_number in range(1, MAX_CONVERGENCE_ROUNDS + 1):
+        rounds_run = round_number
+        for index, (label, left_root, right_root) in enumerate(passes, start=1):
+            # Keep round 1's directory names exactly as they were; only a repeat needs the suffix.
+            pass_name = f"pass-{index:02d}-{label}"
+            if round_number > 1:
+                pass_name = f"r{round_number}-{pass_name}"
+            pass_backup_base = run_backup_root / pass_name
+            result = core.run_sync(
+                left_root,
+                right_root,
+                pass_backup_base,
+                providers[left_root],
+                providers[right_root],
+            )
+            last_result = result
+            for key in totals:
+                totals[key] += int(result.get(key) or 0)
+            warnings.extend(str(item) for item in result.get("warnings", []))
+            pass_results.append(
+                {
+                    "round": round_number,
+                    "label": label,
+                    "left_root": str(left_root),
+                    "right_root": str(right_root),
+                    "left_provider": providers[left_root],
+                    "right_provider": providers[right_root],
+                    "backup_dir": result.get("backup_dir"),
+                    "new_files": result.get("new_files"),
+                    "updated_files": result.get("updated_files"),
+                    "conflicts_preserved": result.get("conflicts_preserved"),
+                    "normalized_model_fields": result.get("normalized_model_fields", 0),
+                    "unresolved_model_fields": result.get("unresolved_model_fields", 0),
+                }
+            )
+        id_sets = [thread_ids_for_root(root) for root in roots]
+        if all(current == id_sets[0] for current in id_sets[1:]):
+            break
+        logging.info(
+            "三向同步第 %d 轮后会话 ID 集仍不一致（%s），再跑一轮",
+            round_number,
+            "/".join(str(len(ids)) for ids in id_sets),
         )
 
     assert last_result is not None
@@ -389,6 +511,7 @@ def execute_three_way_mutations(
         providers,
     )
     verification["three_way_same_thread_ids"] = verification["same_thread_ids"]
+    verification["convergence_rounds"] = rounds_run
     finished = core.utc_now()
     result = {
         "status": "ok",
@@ -415,6 +538,12 @@ def execute_three_way_mutations(
         "integrity": {
             str(root): verification[str(root)]["integrity"] for root in roots
         },
+        "normalized_model_fields": sum(
+            int(item.get("normalized_model_fields") or 0) for item in pass_results
+        ),
+        "unresolved_model_fields": sum(
+            int(item.get("unresolved_model_fields") or 0) for item in pass_results
+        ),
         "verification": verification,
         "warnings": warnings,
     }
@@ -458,7 +587,20 @@ def run_three_way_sync(
     run_name = core.utc_now().strftime("%Y%m%d-%H%M%S-%f")
     run_backup_root = backup_base / run_name
     run_backup_root.mkdir(parents=True, exist_ok=False)
-    outer_snapshot = create_outer_snapshot(roots, run_backup_root)
+    try:
+        outer_snapshot = create_outer_snapshot(roots, run_backup_root)
+    except BaseException:
+        # The snapshot itself failed, so nothing has been mutated and there is nothing to roll back;
+        # this run's backup dir holds only a half-written image with no recovery value. Drop it so a
+        # run that died on a full disk gives back the space it just took. This cannot live in the
+        # rollback try below: that block's `except` restores from `outer_snapshot`, which would be
+        # unbound here -- masking the real "disk is full" with an UnboundLocalError -- and restoring
+        # from a partial image would overwrite intact history with an incomplete copy.
+        # BaseException so an interrupt during a multi-gigabyte copy reclaims too; re-raised at once
+        # so the real error still reaches the caller and the exit code is unchanged. Only this run's
+        # own directory is removed, so the previous run's still-usable undo image is untouched.
+        shutil.rmtree(run_backup_root, ignore_errors=True)
+        raise
     try:
         return execute_three_way_mutations(
             started,
@@ -476,6 +618,21 @@ def run_three_way_sync(
                 f"recovery data: {rollback['failed_state_root']}"
             ) from error
         raise
+    finally:
+        # Prune on EVERY exit, not just the committing one.  The success path prunes from inside
+        # execute_three_way_mutations, so a run that failed never pruned at all -- and a failing run
+        # is the expensive one: it leaves its outer-snapshot *and* the failed-mutated-state copy the
+        # rollback moved aside, two full images of every session tree. Three consecutive failures of
+        # a preflight that rejects the user's own history filled a 238 GB drive to zero, and each
+        # retry made it worse because nothing on the failure path ever reclaimed anything.
+        # prune_outer_snapshots keeps the newest KEEP_OUTER_SNAPSHOTS runs by name, and this run's
+        # name sorts newest, so the image this rollback may still need is never the one dropped.
+        try:
+            prune_outer_snapshots(backup_base)
+        except OSError:
+            # Reclaiming disk is best-effort cleanup; it must never replace the real error with an
+            # error about tidying up, nor fail a sync that actually committed.
+            pass
 
 
 def audit_roots(
@@ -585,7 +742,7 @@ def reusable_result_matches_request(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Synchronize Cockpit, Plus, and True SOTA Codex histories."
+        description="Synchronize Cockpit, Plus, and Tango Relay Codex histories."
     )
     parser.add_argument("--cockpit-root", type=Path, default=DEFAULT_COCKPIT_ROOT)
     parser.add_argument("--plus-root", type=Path, default=DEFAULT_PLUS_ROOT)
@@ -634,7 +791,11 @@ def main() -> int:
             if core.LAST_RESULT_PATH.exists()
             else 0
         )
-        lock_timeout = 180.0 if args.wait_for_existing else 0.0
+        # A real three-way sync takes minutes (280 s observed on this install), so a 180 s
+        # wait used to expire while the winning sync was still running and turned a launch
+        # into "History sync is already running" failure.  15 minutes covers any sync this
+        # machine actually performs; the wait ends the moment the holder releases.
+        lock_timeout = 900.0 if args.wait_for_existing else 0.0
         with core.SingleInstanceLock(
             core.LOCK_PATH, wait_timeout=lock_timeout
         ) as lock:

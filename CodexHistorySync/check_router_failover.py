@@ -1,4 +1,4 @@
-"""Failover checks: does a failing vendor hand the same model to the next one?
+"""Billing-safety checks: a generation must never be replayed at another vendor.
 
 Two fake upstreams and a shadow router, all on OS-assigned loopback ports against a temp
 registry, so the live router on 17895 and the real vendors are never involved -- and so a
@@ -33,14 +33,15 @@ from sota_registry import (  # noqa: E402
 
 # The router port is handed to a child process, so it has to be reserved and released; the
 # scenario then checks the healthz it gets back really is that child. Nothing ever listens on
-# the idle port -- the default家 must stay unreachable, so that MODEL has exactly one fallback.
+# the idle port -- the default provider must stay unreachable. Even with allow_failover and an
+# Idempotency-Key, a billable generation is allowed one upstream attempt only.
 ROUTER_PORT = reserve_port()
 IDLE_PORT = reserve_port()
 MODEL = "gpt-5.6-sol"
 OTHER_MODEL = "gpt-5.6-terra"
 
 
-def pick_roles() -> tuple[str, str, str]:
+def pick_roles() -> tuple[str, str, str, str]:
     """Choose default / primary / backup from whatever the live registry actually has.
 
     Hard-coding vendor ids made this fixture silently useless the moment a vendor was
@@ -49,11 +50,12 @@ def pick_roles() -> tuple[str, str, str]:
     """
     registry = json.loads(Path(REGISTRY_PATH).read_text(encoding="utf-8"))
     providers = [p for p in registry["providers"] if p.get("enabled")]
-    default = next((p["id"] for p in providers if not p.get("prefix")), None)
+    default = next((p["id"] for p in providers if p.get("is_default")), None)
     serving = [
-        p["id"]
+        p
         for p in providers
         if p["id"] != default
+        and p.get("prefix")
         and any(m.get("enabled") and m["id"] == MODEL for m in p.get("models") or [])
     ]
     if default is None or len(serving) < 2:
@@ -61,10 +63,10 @@ def pick_roles() -> tuple[str, str, str]:
             f"跳过：需要一个空前缀的默认家外加至少两家提供 {MODEL} 的供应商，"
             f"当前 default={default} 可用={serving}"
         )
-    return default, serving[0], serving[1]
+    return default, serving[0]["id"], serving[1]["id"], str(serving[0]["prefix"])
 
 
-DEFAULT_PROVIDER, PRIMARY, BACKUP = pick_roles()
+DEFAULT_PROVIDER, PRIMARY, BACKUP, PRIMARY_PREFIX = pick_roles()
 HEADERS = {
     "Content-Type": "application/json",
     "Authorization": "Bearer local",
@@ -148,10 +150,13 @@ def wait_ready() -> dict | None:
     return None
 
 
-def ask(slug: str) -> tuple[int, str]:
+def ask(slug: str, idempotency_key: str = "") -> tuple[int, str]:
     body = json.dumps({"model": slug, "input": "hi", "stream": False}).encode()
+    headers = dict(HEADERS)
+    if idempotency_key:
+        headers["Idempotency-Key"] = idempotency_key
     req = urllib.request.Request(
-        f"http://127.0.0.1:{ROUTER_PORT}/responses", data=body, headers=HEADERS, method="POST"
+        f"http://127.0.0.1:{ROUTER_PORT}/responses", data=body, headers=headers, method="POST"
     )
     try:
         with urllib.request.urlopen(req, timeout=30) as r:
@@ -170,7 +175,14 @@ def stop(proc: subprocess.Popen) -> None:
         proc.kill()
 
 
-def scenario(label: str, failover: bool, upstream_status: int, expect_status: int, expect_hits: list[str]) -> bool:
+def scenario(
+    label: str,
+    failover: bool,
+    upstream_status: int,
+    expect_status: int,
+    expect_hits: list[str],
+    idempotency_key: str = "check-failover-1",
+) -> bool:
     work = Path(tempfile.mkdtemp())
     reg = work / "providers.json"
     write_registry(reg, failover)
@@ -196,7 +208,7 @@ def scenario(label: str, failover: bool, upstream_status: int, expect_status: in
                 flush=True,
             )
             return False
-        status, raw = ask(f"{PRIMARY}--{MODEL}")
+        status, raw = ask(f"{PRIMARY_PREFIX}{MODEL}", idempotency_key)
         try:
             parsed = json.loads(raw)
             served = parsed.get("served_by") or parsed.get("error", {}).get("type", "?")
@@ -223,15 +235,10 @@ if __name__ == "__main__":
 
     results = []
     for args in (
-        ("主上游 503 + 开启换家 → 换到备用", True, 503, 200, ["primary", "backup"]),
-        # 关掉换家不等于「一次都不重试」。同一家原地再试两次是安全的：这时还没有一个字节
-        # 发给客户端，换家的承诺（绝不把请求悄悄记到别家账上）也没有被破坏。以前这里只打
-        # 一次就把 503 抛给客户端，中转随便抖一下，Claude Desktop 的探测就会把整个网关判成
-        # 坏的——而那条探测永远钉在默认供应商上。
-        ("主上游 503 + 关闭换家 → 原地重试同一家，仍然暴露 503", False, 503, 503,
-         ["primary", "primary", "primary"]),
-        ("主上游 403（分组停用那类）+ 开启换家 → 换到备用", True, 403, 200, ["primary", "backup"]),
-        ("主上游 429 限流 + 开启换家 → 换到备用", True, 429, 200, ["primary", "backup"]),
+        ("主上游 503 + 开启换家 + 有幂等键 → 仍只打主家一次", True, 503, 503, ["primary"]),
+        ("主上游 503 + 无幂等键 → 只打主家一次", True, 503, 503, ["primary"], ""),
+        ("主上游 403 + 开启换家 → 不跨供应商重放", True, 403, 403, ["primary"]),
+        ("主上游 429 + 开启换家 → 不跨供应商重放", True, 429, 429, ["primary"]),
         ("主上游 400（请求本身错）+ 开启换家 → 不该换", True, 400, 400, ["primary"]),
         ("主上游正常 + 开启换家 → 一次就成，不碰备用", True, 200, 200, ["primary"]),
     ):

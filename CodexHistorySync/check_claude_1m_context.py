@@ -58,6 +58,11 @@ def provider(pid: str, protocols: list[str], models: list[str], **extra: object)
         "id": pid,
         "name": pid.title(),
         "base_url": "https://gateway.example.com",
+        # These fixtures are all Claude-side. The workspace is load-bearing, not decoration:
+        # allows_legacy_bare_model only lets the default provider keep an empty prefix when the
+        # entry is a Claude messages-only default, so without this the validator derives a
+        # namespace and every expected bare slug here turns into `<vendor>.anthropic.<model>`.
+        "workspace": "claude",
         "protocols": protocols,
         "models": [{"id": m, "enabled": True} for m in models],
         **extra,

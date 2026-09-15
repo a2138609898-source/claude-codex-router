@@ -27,6 +27,28 @@ def _provider(data: dict[str, Any], provider_id: str) -> dict[str, Any]:
     return provider if isinstance(provider, dict) else {}
 
 
+def _catalog_slugs(catalog: Path) -> set[str] | None:
+    """Read the selectable model slugs without contacting a provider."""
+    try:
+        with catalog.open("rb") as stream:
+            data = json.load(stream)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+    models = data.get("models") if isinstance(data, dict) else None
+    if not isinstance(models, list):
+        return None
+    return {
+        str(model.get("slug"))
+        for model in models
+        if isinstance(model, dict) and isinstance(model.get("slug"), str)
+    }
+
+
+def _without_context_1m_suffix(value: str) -> str:
+    suffix = "[1m]"
+    return value[:-len(suffix)] if value.lower().endswith(suffix) else value
+
+
 def _same_path(value: object, expected: Path) -> bool:
     if not isinstance(value, str) or not value.strip():
         return False
@@ -80,11 +102,27 @@ def validate_profile(profile: str, root: Path, catalog: Path | None) -> tuple[bo
         return True, "ok"
 
     if profile == "Sota":
-        if data.get("model_provider") != "true_sota":
+        if data.get("model_provider") != "tango_relay":
             return False, "model_provider_mismatch"
         if catalog is None or not _same_path(data.get("model_catalog_json"), catalog):
             return False, "model_catalog_mismatch"
-        provider = _provider(data, "true_sota")
+        slugs = _catalog_slugs(catalog) if catalog is not None else None
+        if slugs is None:
+            return False, "model_catalog_unreadable"
+        for field, required in (("model", True), ("review_model", False)):
+            value = data.get(field)
+            if value is None:
+                if required:
+                    return False, "model_missing"
+                continue
+            if not isinstance(value, str) or not value.strip():
+                return False, f"{field}_invalid"
+            slug = _without_context_1m_suffix(value.strip())
+            if "--" not in slug:
+                return False, f"{field}_unqualified"
+            if slug not in slugs:
+                return False, f"{field}_not_in_catalog"
+        provider = _provider(data, "tango_relay")
         if provider.get("base_url") != "http://127.0.0.1:17895":
             return False, "base_url_mismatch"
         if provider.get("wire_api") != "responses":

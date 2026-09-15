@@ -40,9 +40,17 @@ if (Test-Path -LiteralPath $messagesPath) {
 
 $pythonCandidates = @(
     [Environment]::GetEnvironmentVariable('CODEX_PYTHON'),
-    (Join-Path $env:USERPROFILE '.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe'),
-    (Join-Path $env:LOCALAPPDATA 'Programs\Python\Python313\python.exe'),
-    (Join-Path $env:LOCALAPPDATA 'Programs\Python\Python312\python.exe')
+    (Join-Path $env:USERPROFILE '.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe')
+)
+# Any locally installed CPython, newest first, instead of a hard-coded 3.13/3.12 pair. On this
+# machine neither of those exists and only 3.11 does, so the list fell through to `python.exe` on
+# PATH -- which on Windows is usually the Microsoft Store stub: it starts, runs nothing, and exits
+# 0. A history sync that "succeeded" without ever executing is the worst possible outcome here.
+# Run-ThreeRoundValidation.ps1 already carries this same fix for the same reason.
+$pythonCandidates += @(
+    Get-ChildItem -Path (Join-Path $env:LOCALAPPDATA 'Programs\Python') -Directory -Filter 'Python3*' -ErrorAction SilentlyContinue |
+        Sort-Object Name -Descending |
+        ForEach-Object { Join-Path $_.FullName 'python.exe' }
 )
 
 $python = $pythonCandidates |
@@ -354,9 +362,9 @@ $($messages.success_intro)
 
 $($messages.cockpit): $cockpitMain $($messages.main_threads) + $cockpitAuxiliary $($messages.auxiliary_sessions) ($($messages.total_records) $cockpitCount)
 $($messages.plus): $plusMain $($messages.main_threads) + $plusAuxiliary $($messages.auxiliary_sessions) ($($messages.total_records) $plusCount)
-True SOTA: $sotaMain $($messages.main_threads) + $sotaAuxiliary $($messages.auxiliary_sessions) ($($messages.total_records) $sotaCount)
-$($messages.searchable_index): $($messages.cockpit) $cockpitSidebarVisible/$cockpitMain; $($messages.plus) $plusSidebarVisible/$plusMain; True SOTA $sotaSidebarVisible/$sotaMain
-$($messages.projects): $($messages.cockpit) $cockpitProjects ($cockpitProjectChats $($messages.project_chats)); $($messages.plus) $plusProjects ($plusProjectChats $($messages.project_chats)); True SOTA $sotaProjects ($sotaProjectChats $($messages.project_chats))
+Tango Relay: $sotaMain $($messages.main_threads) + $sotaAuxiliary $($messages.auxiliary_sessions) ($($messages.total_records) $sotaCount)
+$($messages.searchable_index): $($messages.cockpit) $cockpitSidebarVisible/$cockpitMain; $($messages.plus) $plusSidebarVisible/$plusMain; Tango Relay $sotaSidebarVisible/$sotaMain
+$($messages.projects): $($messages.cockpit) $cockpitProjects ($cockpitProjectChats $($messages.project_chats)); $($messages.plus) $plusProjects ($plusProjectChats $($messages.project_chats)); Tango Relay $sotaProjects ($sotaProjectChats $($messages.project_chats))
 $($messages.new_copies): $($result.new_files)
 $($messages.incremental_updates): $($result.updated_files)
 $($messages.conflict_copies): $($result.conflicts_preserved)
@@ -374,9 +382,9 @@ Codex history sync completed.
 
 Cockpit: $cockpitMain main chats + $cockpitAuxiliary auxiliary sessions ($cockpitCount local records)
 Plus: $plusMain main chats + $plusAuxiliary auxiliary sessions ($plusCount local records)
-True SOTA: $sotaMain main chats + $sotaAuxiliary auxiliary sessions ($sotaCount local records)
-Searchable main chats: Cockpit $cockpitSidebarVisible/$cockpitMain; Plus $plusSidebarVisible/$plusMain; True SOTA $sotaSidebarVisible/$sotaMain
-Projects: Cockpit $cockpitProjects ($cockpitProjectChats project chats); Plus $plusProjects ($plusProjectChats project chats); True SOTA $sotaProjects ($sotaProjectChats project chats)
+Tango Relay: $sotaMain main chats + $sotaAuxiliary auxiliary sessions ($sotaCount local records)
+Searchable main chats: Cockpit $cockpitSidebarVisible/$cockpitMain; Plus $plusSidebarVisible/$plusMain; Tango Relay $sotaSidebarVisible/$sotaMain
+Projects: Cockpit $cockpitProjects ($cockpitProjectChats project chats); Plus $plusProjects ($plusProjectChats project chats); Tango Relay $sotaProjects ($sotaProjectChats project chats)
 New copies: $($result.new_files)
 Incremental updates: $($result.updated_files)
 Conflict copies: $($result.conflicts_preserved)

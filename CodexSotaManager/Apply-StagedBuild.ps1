@@ -4,6 +4,11 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+# Emit UTF-8 regardless of the host's console codepage: callers capture this output as
+# UTF-8, and localized Windows error text (zh-CN Move-Item failures and the like) otherwise
+# goes out as GBK bytes and crashes the capturing reader.
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$OutputEncoding = [System.Text.Encoding]::UTF8
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $live = Join-Path $root 'dist\codex-sota'
 $staged = Join-Path $root 'dist-staging\codex-sota'
@@ -94,6 +99,19 @@ function Invoke-Swap {
     # The new live tree is committed at this point. Logging and removal of an empty staging
     # parent are best-effort post-commit work and must never trigger transaction rollback.
     Remove-EmptyDirectory $stagedRoot
+    # Keep only the two newest rollback copies: every apply otherwise parks another full
+    # build snapshot in dist\ codex-sota.old-* forever.
+    try {
+        $staleRollbacks = @(Get-ChildItem -LiteralPath $distRoot -Directory -Filter 'codex-sota.old-*' |
+            Sort-Object Name -Descending |
+            Select-Object -Skip 2)
+        foreach ($stale in $staleRollbacks) {
+            Remove-Item -LiteralPath $stale.FullName -Recurse -Force -ErrorAction Stop
+        }
+    }
+    catch {
+        Note ('could not prune old build snapshots: ' + $_.Exception.Message)
+    }
     if ($liveRetired) {
         Note ('applied staged build; previous build retired to ' + $retired)
     }

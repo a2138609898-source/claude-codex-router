@@ -19,6 +19,7 @@ from fixture_ports import reserve_port, serve_on_free_port  # noqa: E402
 from sota_registry import load_registry, registry_digest  # noqa: E402
 
 PROVIDER, MODEL = "abort_test", "gpt-5.6-sol"
+MODEL_SLUG = "abort-test--" + MODEL
 
 
 class SlowStream(BaseHTTPRequestHandler):
@@ -54,7 +55,7 @@ def write_registry(path: Path, upstream_port: int) -> None:
                 "id": PROVIDER,
                 "name": "Abort test",
                 "base_url": f"http://127.0.0.1:{upstream_port}",
-                "prefix": "",
+                "prefix": "abort-test--",
                 "enabled": True,
                 "protected": False,
                 "is_default": True,
@@ -140,7 +141,7 @@ if health is None or health.get("registry_hash") != registry_digest(load_registr
     temporary.cleanup()
     raise SystemExit(1)
 
-body = json.dumps({"model": MODEL, "input": "hi", "stream": True}).encode()
+body = json.dumps({"model": MODEL_SLUG, "input": "hi", "stream": True}).encode()
 request = (
     f"POST /responses HTTP/1.1\r\nHost: 127.0.0.1:{router_port}\r\n"
     f"Content-Type: application/json\r\nAccept: text/event-stream\r\n"

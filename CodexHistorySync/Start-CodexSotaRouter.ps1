@@ -10,6 +10,11 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+# Emit UTF-8 regardless of the host's console codepage: restart_router and the manager
+# capture this script's output as UTF-8, and localized Windows error text (zh-CN process or
+# file errors) otherwise goes out as GBK bytes and crashes the capturing reader.
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$OutputEncoding = [System.Text.Encoding]::UTF8
 # One script serves both config roots so the start/stop/health logic cannot drift between
 # them; Start-ClaudeSotaRouter.ps1 is a shim that passes -Workspace claude.
 $workspaceSettings = @{

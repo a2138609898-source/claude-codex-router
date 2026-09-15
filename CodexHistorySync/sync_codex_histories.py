@@ -64,6 +64,85 @@ DICT_STATE_KEYS = (
     "thread-writable-roots",
 )
 SESSION_STORAGE_DIRS = ("sessions", "archived_sessions")
+MODEL_REGISTRY_NAME = "providers.json"
+MODEL_NAMESPACE_SEPARATOR = "--"
+# Responses providers normally publish the ``vendor--model`` form.  Keep the
+# Messages-compatible dotted form here as well: a hand-authored Codex registry
+# may use it, and treating such a slug as bare would make the synchronizer
+# rewrite (or reject) an already-qualified model.
+MODEL_NAMESPACE_SEPARATORS = (MODEL_NAMESPACE_SEPARATOR, ".anthropic.")
+MODEL_GUARD_MAX_EXAMPLES = 12
+
+
+def extended_path(path: Path | str) -> str:
+    """A path string Windows will accept past its 260-character MAX_PATH limit.
+
+    The backup tree is deep by construction: backup base, run timestamp, `pass-NN-<label>`, a second
+    timestamp from `create_backup`, then `conflicts/<label>/` and finally the session's own relative
+    path. With the archive living under a long base directory that total lands between roughly 254
+    and 262 characters depending on which pass is running and how long the rollout filename is --
+    and a Codex rollout name carrying two session ids is over 100 characters on its own. So the copy
+    succeeded for most sessions and failed for a few with a bare `[WinError 3] The system cannot
+    find the path specified`, which names neither file and reads like a missing source.
+
+    `\\\\?\\` opts that call out of MAX_PATH without a registry change or admin rights
+    (LongPathsEnabled is 0 on this machine). It requires a fully-resolved absolute path with
+    backslash separators and no `.`/`..` components, which is why abspath runs first.
+    """
+    text = str(path)
+    if os.name != "nt":
+        return os.path.abspath(text)
+    # Test the prefix BEFORE abspath: abspath treats an already-extended path as relative-ish and
+    # mangles it into \\?\C:\?\C:\... , which then fails in a way that looks like a bad source.
+    if text.startswith("\\\\?\\"):
+        return text
+    text = os.path.abspath(text)
+    if text.startswith("\\\\?\\"):
+        return text
+    if text.startswith("\\\\"):
+        # UNC: \\server\share -> \\?\UNC\server\share
+        return "\\\\?\\UNC\\" + text[2:]
+    return "\\\\?\\" + text
+# Which unresolved-model reasons must stop a sync, and which are only worth reporting.
+#
+# Almost none of them. The writer never guesses: `qualify_model_for_target` returns an unresolvable
+# value UNCHANGED, so an archived rollout line is copied verbatim and no attribution is invented.
+# A reason code therefore describes a property of the user's history, not a hazard in the write.
+#
+# Both history-derived reasons were fatal, and both were unsatisfiable by construction:
+#
+#   model_has_no_unique_enabled_provider -- the model is no longer offered by any enabled provider
+#     (an old `gpt-5.5` in a months-old session). History cannot be made attributable after the
+#     fact; the user would have to re-enable every model they have ever used.
+#
+#   model_has_multiple_enabled_providers -- several enabled providers offer the same bare id. That
+#     is not a defect, it is the entire point of a multi-vendor router with failover: one archive
+#     had `gpt-5.6-sol` offered by nine providers and 7602 history fields naming it. Aborting here
+#     made the tool's central use case self-blocking.
+#
+# The misrouting this was meant to prevent is already prevented where it can actually happen: the
+# router rejects a bare, un-namespaced slug at the request boundary rather than falling back to the
+# default provider, so a bare name copied into another root fails loudly instead of billing the
+# wrong account. Guarding it a second time in the archive buys nothing and cost this user a filled
+# disk -- the three-way outer snapshot is taken before the preflight, so every abort still paid for
+# a full-size copy of the session tree.
+#
+# What stays fatal is internal inconsistency, not history: a value we DID qualify that then fails to
+# validate means the resolver produced a bad slug, which is a bug worth stopping for.
+FATAL_MODEL_GUARD_REASONS = frozenset({"qualified_model_invalid"})
+# Reasons a post-sync value was legitimately left exactly as recorded: no attribution could be
+# chosen, so the writer copied it verbatim rather than guessing. A finding carrying one of these is
+# evidence the copy was faithful. Anything else -- above all a plain "unqualified_model", meaning
+# the value COULD have been namespaced and was not -- is a real post-condition failure worth
+# stopping for, which is the check that keeps `verify_roots` meaningful.
+BENIGN_UNQUALIFIED_REASONS = frozenset(
+    {
+        "model_has_no_unique_enabled_provider",
+        "model_has_multiple_enabled_providers",
+        "missing_model",
+        "model_whitespace",
+    }
+)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -102,8 +181,462 @@ class DuplicateCloneSpec:
     is_auxiliary: bool
 
 
+@dataclasses.dataclass(frozen=True)
+class RegistryProviderModels:
+    provider_id: str
+    prefix: str
+    enabled: bool
+    model_counts: dict[str, int]
+
+
+@dataclasses.dataclass
+class ModelGuardContext:
+    root: Path
+    registry_path: Path
+    providers: dict[str, RegistryProviderModels]
+    global_model_candidates: dict[str, list[tuple[str, str]]] = dataclasses.field(
+        default_factory=dict
+    )
+    registry_error: str | None = None
+    normalized_fields: int = 0
+    unresolved_fields: int = 0
+    unresolved_reasons: dict[str, int] = dataclasses.field(default_factory=dict)
+    unresolved_examples: list[dict[str, str]] = dataclasses.field(default_factory=list)
+
+    def record_normalized(self) -> None:
+        self.normalized_fields += 1
+
+    def record_unresolved(
+        self, reason: str, model: Any, source_provider: str, location: str
+    ) -> None:
+        self.unresolved_fields += 1
+        self.unresolved_reasons[reason] = self.unresolved_reasons.get(reason, 0) + 1
+        if len(self.unresolved_examples) < MODEL_GUARD_MAX_EXAMPLES:
+            self.unresolved_examples.append(
+                {
+                    "reason": reason,
+                    "model": repr(model),
+                    "source_provider": source_provider,
+                    "location": location,
+                }
+            )
+
+    def summary(self) -> dict[str, Any]:
+        return {
+            "registry_path": str(self.registry_path),
+            "registry_error": self.registry_error,
+            "normalized_model_fields": self.normalized_fields,
+            "unresolved_model_fields": self.unresolved_fields,
+            "unresolved_reasons": dict(sorted(self.unresolved_reasons.items())),
+            "unresolved_examples": list(self.unresolved_examples),
+        }
+
+
 class SyncError(RuntimeError):
     pass
+
+
+def load_model_guard_context(root: Path) -> ModelGuardContext:
+    """Read a target Codex registry without changing it.
+
+    History synchronization must never infer a vendor from a bare model name.  The
+    registry is therefore treated as read-only routing data: a model can only be
+    qualified when exactly one enabled Codex/Responses provider exposes that model.
+    The provider id stored in a rollout is only an app/router identity (for example
+    ``tango_relay``), not proof of which upstream account served the turn.
+    """
+    root = root.resolve()
+    registry_path = root / MODEL_REGISTRY_NAME
+    context = ModelGuardContext(root=root, registry_path=registry_path, providers={})
+    if not registry_path.is_file():
+        context.registry_error = "target_registry_missing"
+        return context
+    try:
+        with registry_path.open("r", encoding="utf-8") as handle:
+            registry = json.load(handle)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        context.registry_error = f"target_registry_unreadable:{type(exc).__name__}"
+        return context
+    try:
+        registry_version = int(registry.get("version") or 0)
+    except (TypeError, ValueError):
+        registry_version = 0
+    if registry_version != 1:
+        context.registry_error = "target_registry_unsupported_version"
+        return context
+    raw_providers = registry.get("providers") if isinstance(registry, dict) else None
+    if not isinstance(raw_providers, list):
+        context.registry_error = "target_registry_invalid_providers"
+        return context
+
+    for raw_provider in raw_providers:
+        if not isinstance(raw_provider, dict):
+            context.registry_error = "target_registry_invalid_provider"
+            continue
+        provider_id = str(raw_provider.get("id") or "").strip()
+        if not provider_id:
+            context.registry_error = "target_registry_provider_id_missing"
+            continue
+        workspace = str(raw_provider.get("workspace") or "codex").strip().lower()
+        protocols = raw_provider.get("protocols") or ["responses"]
+        if isinstance(protocols, str):
+            protocols = [protocols]
+        protocols = {str(item).strip().lower() for item in protocols}
+        # The guard is intentionally limited to Codex/Responses providers.  Claude's
+        # legacy Messages-only default is allowed to remain bare by design.
+        if workspace != "codex" or "responses" not in protocols:
+            continue
+        if provider_id in context.providers:
+            context.registry_error = "target_registry_duplicate_provider"
+            continue
+        model_counts: dict[str, int] = {}
+        raw_models = raw_provider.get("models") or []
+        if not isinstance(raw_models, list):
+            context.registry_error = "target_registry_invalid_models"
+            raw_models = []
+        for raw_model in raw_models:
+            if not isinstance(raw_model, dict) or raw_model.get("enabled") is not True:
+                continue
+            model_id = str(raw_model.get("id") or "").strip()
+            if model_id:
+                model_counts[model_id] = model_counts.get(model_id, 0) + 1
+        context.providers[provider_id] = RegistryProviderModels(
+            provider_id=provider_id,
+            prefix=str(raw_provider.get("prefix") or "").strip(),
+            enabled=raw_provider.get("enabled") is True,
+            model_counts=model_counts,
+        )
+    for provider_id, provider in context.providers.items():
+        if not provider.enabled:
+            continue
+        prefix = provider.prefix
+        # Old registries (including the original tango_relay entry) legitimately have an
+        # empty prefix on disk.  The shared registry validator derives the same namespace
+        # in memory; mirror that rule here so a uniquely identifiable legacy model can be
+        # repaired without ever guessing the default provider.
+        if not prefix:
+            prefix = provider_id.lower().replace("_", "-") + MODEL_NAMESPACE_SEPARATOR
+        if not any(
+            prefix.endswith(separator) and len(prefix) > len(separator)
+            for separator in MODEL_NAMESPACE_SEPARATORS
+        ):
+            continue
+        for model_id, count in provider.model_counts.items():
+            if count == 1:
+                context.global_model_candidates.setdefault(model_id, []).append(
+                    (provider_id, prefix)
+                )
+    return context
+
+
+def _registry_may_be_codex_responses(root: Path) -> bool:
+    """Return whether a root should receive the automatic model guard.
+
+    The two official Codex profiles intentionally have no ``providers.json`` and
+    store bare first-party model IDs.  They must remain compatible.  SOTA roots
+    do have a registry; malformed registries are treated as applicable so the
+    guard fails closed instead of silently disabling itself.
+    """
+    registry_path = Path(root).resolve() / MODEL_REGISTRY_NAME
+    if not registry_path.is_file():
+        return False
+    try:
+        with registry_path.open("r", encoding="utf-8") as handle:
+            registry = json.load(handle)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return True
+    raw_providers = registry.get("providers") if isinstance(registry, dict) else None
+    if not isinstance(raw_providers, list):
+        return True
+    for raw_provider in raw_providers:
+        if not isinstance(raw_provider, dict):
+            return True
+        workspace = str(raw_provider.get("workspace") or "codex").strip().lower()
+        protocols = raw_provider.get("protocols") or ["responses"]
+        if isinstance(protocols, str):
+            protocols = [protocols]
+        protocol_names = {str(item).strip().lower() for item in protocols}
+        if workspace == "codex" and "responses" in protocol_names:
+            return True
+    return False
+
+
+def build_model_guard_contexts(
+    roots: Iterable[Path], guarded_roots: Iterable[Path] | None = None
+) -> dict[Path, ModelGuardContext]:
+    """Build guards for all eligible roots unless an explicit subset is supplied.
+
+    ``None`` means automatic discovery: every root with a registry advertising a
+    Codex/Responses provider is guarded.  An explicit iterable remains available
+    for callers that intentionally scope a check (and for focused tests), while
+    an official root without a registry is never guarded implicitly.
+    """
+    resolved_roots = tuple(Path(root).resolve() for root in roots)
+    if guarded_roots is None:
+        guarded = {
+            root for root in resolved_roots if _registry_may_be_codex_responses(root)
+        }
+    else:
+        guarded = {Path(root).resolve() for root in guarded_roots}
+    return {
+        root: load_model_guard_context(root)
+        for root in resolved_roots
+        if root in guarded
+    }
+
+
+def _namespace_model_part(value: Any) -> str | None:
+    """Return the model portion of a qualified slug, if it has a known separator."""
+    if not isinstance(value, str):
+        return None
+    matches = [
+        (value.find(separator), separator)
+        for separator in MODEL_NAMESPACE_SEPARATORS
+        if value.find(separator) > 0
+    ]
+    if not matches:
+        return None
+    index, separator = min(matches, key=lambda item: item[0])
+    model = value[index + len(separator) :]
+    return model or None
+
+
+def model_has_namespace(value: Any) -> bool:
+    return _namespace_model_part(value) is not None
+
+
+def _model_lookup_parts(value: str) -> tuple[str, str]:
+    """Return the registry ID and an optional context-window suffix."""
+    suffix = ""
+    base = value
+    if value.lower().endswith("[1m]"):
+        suffix = "[1m]"
+        base = value[: -len(suffix)]
+    return base, suffix
+
+
+def _registered_namespace_model_part(
+    value: Any, context: ModelGuardContext
+) -> str | None:
+    """Return the bare id only when ``value`` matches a registered published slug."""
+    if not isinstance(value, str):
+        return None
+    base, suffix = _model_lookup_parts(value)
+    for model_id, candidates in context.global_model_candidates.items():
+        if any(prefix + model_id == base for _provider_id, prefix in candidates):
+            return model_id + suffix
+    return None
+
+
+def _model_has_namespace_in_context(value: Any, context: ModelGuardContext) -> bool:
+    """Tell whether a model is already qualified for this target registry.
+
+    Delimiters are not proof of provenance: a legitimate upstream model id may itself
+    contain ``--`` or ``.anthropic.``.  Prefer an exact registered ``prefix + id``
+    match, and only retain the syntax-based compatibility fallback for an old,
+    currently-disabled/unknown qualified slug that the registry cannot resolve.
+    """
+    if not isinstance(value, str) or not value.strip() or value != value.strip():
+        return False
+    model_id, _suffix = _model_lookup_parts(value)
+    if _registered_namespace_model_part(value, context) is not None:
+        return True
+    # If the whole value is an enabled bare model id, it is provenance-less even
+    # when it happens to contain a namespace-looking delimiter.
+    if model_id in context.global_model_candidates:
+        return False
+    return model_has_namespace(value)
+
+
+def _resolve_model_for_target(
+    value: Any, context: ModelGuardContext
+) -> tuple[Any, str | None]:
+    """Resolve a model without recording telemetry.
+
+    Keeping the pure decision separate lets the synchronizer preflight every file before it
+    mutates either destination.  An unresolved value is returned unchanged and paired with a
+    stable reason; callers decide whether to record it, raise, or present it as a warning.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return value, "missing_model"
+    if value != value.strip():
+        return value, "model_whitespace"
+    if context.registry_error:
+        return value, context.registry_error
+    model_id, suffix = _model_lookup_parts(value)
+    if _model_has_namespace_in_context(value, context):
+        return value, None
+    candidates = context.global_model_candidates.get(model_id, [])
+    if len(candidates) == 0:
+        return value, "model_has_no_unique_enabled_provider"
+    if len(candidates) != 1:
+        return value, "model_has_multiple_enabled_providers"
+    _, prefix = candidates[0]
+    qualified = prefix + model_id + suffix
+    if not _model_has_namespace_in_context(qualified, context):
+        return value, "qualified_model_invalid"
+    return qualified, None
+
+
+def qualify_model_for_target(
+    value: Any,
+    source_provider: str,
+    context: ModelGuardContext,
+    location: str,
+) -> Any:
+    """Qualify one model value, or retain it and record why it was unsafe."""
+    source_provider = str(source_provider or "").strip()
+    resolved, reason = _resolve_model_for_target(value, context)
+    if reason:
+        context.record_unresolved(reason, value, source_provider, location)
+        return value
+    if resolved != value:
+        context.record_normalized()
+    return resolved
+
+
+def _add_model_slot(
+    slots: list[tuple[dict[str, Any], str, str]],
+    container: Any,
+    key: str,
+    location: str,
+) -> None:
+    if isinstance(container, dict) and key in container:
+        slots.append((container, key, location))
+
+
+def rollout_model_slots(item: Any) -> list[tuple[dict[str, Any], str, str]]:
+    """Yield only fields that represent an active Codex model selection.
+
+    Tool schemas also contain keys named ``model``; they describe future tool
+    arguments and are deliberately excluded here.
+    """
+    if not isinstance(item, dict):
+        return []
+    record_type = item.get("type")
+    payload = item.get("payload")
+    if not isinstance(payload, dict):
+        return []
+    slots: list[tuple[dict[str, Any], str, str]] = []
+    containers: list[tuple[Any, str]] = []
+    if record_type == "turn_context":
+        containers.append((payload, "payload"))
+        thread_settings = payload.get("thread_settings")
+        if isinstance(thread_settings, dict):
+            containers.append((thread_settings, "payload.thread_settings"))
+    elif record_type == "event_msg" and payload.get("type") == "thread_settings_applied":
+        containers.append((payload.get("thread_settings"), "payload.thread_settings"))
+    elif record_type == "world_state":
+        state = payload.get("state")
+        containers.append((state, "payload.state"))
+        if isinstance(state, dict):
+            containers.append((state.get("personality"), "payload.state.personality"))
+            containers.append((state.get("collaboration_mode"), "payload.state.collaboration_mode"))
+
+    for container, prefix in containers:
+        _add_model_slot(slots, container, "model", f"{prefix}.model")
+        if isinstance(container, dict):
+            collaboration = container.get("collaboration_mode")
+            if isinstance(collaboration, dict):
+                settings = collaboration.get("settings")
+                _add_model_slot(
+                    slots,
+                    settings,
+                    "model",
+                    f"{prefix}.collaboration_mode.settings.model",
+                )
+    # ``world_state.state.collaboration_mode`` was added above as a container, so
+    # its nested settings are covered by the same explicit path logic.
+    return slots
+
+
+def _provider_from_mapping(mapping: Any, fallback: str) -> str:
+    if isinstance(mapping, dict):
+        for key in ("model_provider_id", "model_provider"):
+            candidate = str(mapping.get(key) or "").strip()
+            if candidate:
+                return candidate
+    return fallback
+
+
+def normalize_rollout_item_models(
+    item: Any,
+    default_source_provider: str,
+    context: ModelGuardContext,
+    location_prefix: str,
+) -> tuple[Any, str, bool]:
+    """Normalize active model fields and return (item, current_provider, changed)."""
+    if not isinstance(item, dict):
+        return item, default_source_provider, False
+    record_type = item.get("type")
+    payload = item.get("payload")
+    if not isinstance(payload, dict):
+        return item, default_source_provider, False
+    current_provider = default_source_provider
+    provider_source: Any = payload
+    if record_type == "session_meta":
+        provider_source = None
+    elif record_type == "event_msg" and payload.get("type") == "thread_settings_applied":
+        provider_source = payload.get("thread_settings")
+    elif record_type == "world_state":
+        provider_source = payload.get("state")
+    current_provider = _provider_from_mapping(provider_source, current_provider)
+    changed = False
+    for container, key, field_path in rollout_model_slots(item):
+        old_value = container.get(key)
+        new_value = qualify_model_for_target(
+            old_value,
+            current_provider,
+            context,
+            f"{location_prefix}:{field_path}",
+        )
+        if new_value != old_value:
+            container[key] = new_value
+            changed = True
+    return item, current_provider, changed
+
+
+def canonicalize_rollout_models(
+    item: Any, model_guard: ModelGuardContext | None = None
+) -> Any:
+    """Remove provider namespaces for semantic comparison across profiles.
+
+    When a registry is available, an exact registered slug wins over delimiter-based
+    parsing so a legitimate model id containing ``--`` is not truncated.
+    """
+    for container, key, _ in rollout_model_slots(item):
+        value = container.get(key)
+        if model_guard is None:
+            model_part = _namespace_model_part(value)
+        else:
+            model_part = _registered_namespace_model_part(value, model_guard)
+            if model_part is None and _model_has_namespace_in_context(value, model_guard):
+                model_part = _namespace_model_part(value)
+        if model_part is not None:
+            container[key] = model_part
+    return item
+
+
+def model_guard_warnings(
+    contexts: dict[Path, ModelGuardContext]
+) -> list[str]:
+    warnings: list[str] = []
+    for root, context in contexts.items():
+        if context.registry_error:
+            warnings.append(
+                f"模型保护无法读取目标 registry {context.registry_path}: "
+                f"{context.registry_error}"
+            )
+        if context.unresolved_fields:
+            reasons = ", ".join(
+                f"{key}={value}"
+                for key, value in sorted(context.unresolved_reasons.items())
+            )
+            warnings.append(
+                f"目标 {root} 有 {context.unresolved_fields} 个模型字段未能安全限定；"
+                f"同步校验将拒绝该目标（{reasons}）。"
+            )
+    return warnings
 
 
 def utc_now() -> dt.datetime:
@@ -345,12 +878,19 @@ def scan_sessions(root: Path, preferred_paths: dict[str, str] | None = None) -> 
                 os.path.abspath(path)
             ):
                 catalog[session_id] = current
-            elif not preferred and (current.mtime_ns, current.size) > (
-                previous.mtime_ns,
-                previous.size,
-            ):
-                catalog[session_id] = current
-            logging.warning("会话 %s 在 %s 中存在重复文件", session_id, root)
+            elif not preferred:
+                # Branch and fork rollouts legitimately share one session id; when the state
+                # database names a preferred file the collision is resolved deterministically
+                # and is not worth a warning on every scan pass. Only the mtime guess is
+                # ambiguous enough to surface.
+                if (current.mtime_ns, current.size) > (previous.mtime_ns, previous.size):
+                    catalog[session_id] = current
+                logging.warning(
+                    "会话 %s 在 %s 中存在多个文件，无首选路径，已按最新选择 %s",
+                    session_id,
+                    root,
+                    catalog[session_id].path.name,
+                )
     return catalog
 
 
@@ -374,7 +914,9 @@ def normalize_session_self_references(value: Any, session_id: str) -> Any:
     return value
 
 
-def normalized_session_digest(session: SessionFile) -> str:
+def normalized_session_digest(
+    session: SessionFile, model_guard: ModelGuardContext | None = None
+) -> str:
     """Hash a rollout after removing only profile/provider and self-ID differences."""
     digest = hashlib.sha256()
     with session.path.open("r", encoding="utf-8") as handle:
@@ -384,6 +926,7 @@ def normalized_session_digest(session: SessionFile) -> str:
                 payload = item.get("payload")
                 if isinstance(payload, dict):
                     payload.pop("model_provider", None)
+            item = canonicalize_rollout_models(item, model_guard)
             item = normalize_session_self_references(item, session.session_id)
             digest.update(
                 json.dumps(
@@ -397,9 +940,75 @@ def normalized_session_digest(session: SessionFile) -> str:
     return digest.hexdigest()
 
 
-def sessions_semantically_equal(left: SessionFile, right: SessionFile) -> bool:
+def normalized_session_lines(
+    session: SessionFile, model_guard: ModelGuardContext | None = None
+) -> Iterable[bytes]:
+    """Yield canonical JSONL lines for equality/prefix checks across profiles."""
+    with session.path.open("r", encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            item = json.loads(line)
+            if line_number == 1 and isinstance(item, dict):
+                payload = item.get("payload")
+                if isinstance(payload, dict):
+                    payload.pop("model_provider", None)
+            item = canonicalize_rollout_models(item, model_guard)
+            item = normalize_session_self_references(item, session.session_id)
+            yield (
+                json.dumps(
+                    item,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+                + b"\n"
+            )
+
+
+def compare_normalized_sessions(
+    left: SessionFile,
+    right: SessionFile,
+    left_model_guard: ModelGuardContext | None = None,
+    right_model_guard: ModelGuardContext | None = None,
+) -> str:
+    """Compare rollouts after profile/model namespace normalization."""
+    left_iter = iter(normalized_session_lines(left, left_model_guard))
+    right_iter = iter(normalized_session_lines(right, right_model_guard))
+    while True:
+        try:
+            left_line = next(left_iter)
+            left_done = False
+        except StopIteration:
+            left_line = None
+            left_done = True
+        try:
+            right_line = next(right_iter)
+            right_done = False
+        except StopIteration:
+            right_line = None
+            right_done = True
+        if left_done and right_done:
+            return "equal"
+        if left_done:
+            return "left_prefix"
+        if right_done:
+            return "right_prefix"
+        if left_line != right_line:
+            return "divergent"
+
+
+def sessions_semantically_equal(
+    left: SessionFile,
+    right: SessionFile,
+    left_model_guard: ModelGuardContext | None = None,
+    right_model_guard: ModelGuardContext | None = None,
+) -> bool:
     try:
-        return normalized_session_digest(left) == normalized_session_digest(right)
+        return (
+            compare_normalized_sessions(
+                left, right, left_model_guard, right_model_guard
+            )
+            == "equal"
+        )
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         logging.warning("无法计算会话语义指纹：%s", exc)
         return False
@@ -412,7 +1021,9 @@ def thread_display_name(row: dict[str, Any] | None) -> str:
 
 
 def find_legacy_exact_clones(
-    left: RootSnapshot, right: RootSnapshot
+    left: RootSnapshot,
+    right: RootSnapshot,
+    model_guards: dict[Path, ModelGuardContext] | None = None,
 ) -> tuple[list[DuplicateCloneSpec], list[str]]:
     """Find only old conflict clones that are provably exact duplicates.
 
@@ -422,6 +1033,7 @@ def find_legacy_exact_clones(
     prefix-related chats are intentionally not considered duplicates.
     """
     snapshots = (left, right)
+    model_guards = model_guards or {}
     catalogs: dict[Path, dict[str, SessionFile]] = {}
     digest_cache: dict[tuple[Path, str], str] = {}
     all_ids = set(left.threads) | set(right.threads)
@@ -440,7 +1052,9 @@ def find_legacy_exact_clones(
                 continue
             key = (snapshot.root, session_id)
             if key not in digest_cache:
-                digest_cache[key] = normalized_session_digest(session)
+                digest_cache[key] = normalized_session_digest(
+                    session, model_guards.get(snapshot.root)
+                )
             values.add(digest_cache[key])
         return values
 
@@ -536,7 +1150,12 @@ def stable_snapshot(source: Path, temp_dir: Path, attempts: int = 6) -> Path:
     raise SyncError(f"无法取得完整会话快照：{source}；{last_error}")
 
 
-def compare_files(left: SessionFile, right: SessionFile) -> str:
+def compare_files(
+    left: SessionFile,
+    right: SessionFile,
+    left_model_guard: ModelGuardContext | None = None,
+    right_model_guard: ModelGuardContext | None = None,
+) -> str:
     """Return equal, left_prefix, right_prefix, or divergent."""
     # The same conversation intentionally has a different model_provider in
     # each profile (Plus=openai, Cockpit=codex_local_access). Compare the JSONL
@@ -550,9 +1169,13 @@ def compare_files(left: SessionFile, right: SessionFile) -> str:
                 if isinstance(payload, dict):
                     payload.pop("model_provider", None)
         except (json.JSONDecodeError, AttributeError):
-            return "equal" if sessions_semantically_equal(left, right) else "divergent"
+            return compare_normalized_sessions(
+                left, right, left_model_guard, right_model_guard
+            )
         if left_header != right_header:
-            return "equal" if sessions_semantically_equal(left, right) else "divergent"
+            return compare_normalized_sessions(
+                left, right, left_model_guard, right_model_guard
+            )
         left_start = handle_left.tell()
         right_start = handle_right.tell()
         left_tail_size = left.size - left_start
@@ -563,7 +1186,9 @@ def compare_files(left: SessionFile, right: SessionFile) -> str:
             chunk_left = handle_left.read(chunk_size)
             chunk_right = handle_right.read(chunk_size)
             if chunk_left != chunk_right:
-                return "equal" if sessions_semantically_equal(left, right) else "divergent"
+                return compare_normalized_sessions(
+                    left, right, left_model_guard, right_model_guard
+                )
             remaining -= len(chunk_left)
     if left_tail_size == right_tail_size:
         return "equal"
@@ -603,6 +1228,80 @@ def set_session_model_provider(path: Path, provider: str) -> None:
         os.replace(temp_path, path)
     finally:
         if temp_path.exists():
+            with contextlib.suppress(OSError):
+                temp_path.unlink()
+
+
+def rewrite_session_for_destination(
+    path: Path,
+    destination_provider: str,
+    source_provider: str,
+    model_guard: ModelGuardContext | None = None,
+) -> None:
+    """Stamp a rollout for its destination and optionally qualify active models.
+
+    The source file is never edited in place before the destination rewrite is complete.  A
+    three-way caller snapshots the target root, so an unresolved guard failure can be rolled
+    back atomically along with the database changes.
+    """
+    if model_guard is None:
+        set_session_model_provider(path, destination_provider)
+        return
+
+    temp_path: Path | None = None
+    changed = False
+    source_provider = str(source_provider or "").strip()
+    try:
+        fd, raw_temp = tempfile.mkstemp(
+            prefix=f".{path.name}.models-", dir=path.parent
+        )
+        temp_path = Path(raw_temp)
+        with path.open("r", encoding="utf-8", newline="") as source, os.fdopen(
+            fd, "w", encoding="utf-8", newline=""
+        ) as target:
+            current_provider = source_provider
+            for line_number, line in enumerate(source, start=1):
+                item = json.loads(line)
+                item_changed = False
+                if line_number == 1:
+                    payload = item.get("payload") if isinstance(item, dict) else None
+                    if not isinstance(payload, dict):
+                        raise SyncError(f"会话元数据无效：{path}")
+                    source_header_provider = str(
+                        payload.get("model_provider") or ""
+                    ).strip()
+                    if not source_provider and source_header_provider:
+                        current_provider = source_header_provider
+                    if payload.get("model_provider") != destination_provider:
+                        payload["model_provider"] = destination_provider
+                        item_changed = True
+                item, current_provider, models_changed = normalize_rollout_item_models(
+                    item,
+                    current_provider,
+                    model_guard,
+                    f"{path}:{line_number}",
+                )
+                item_changed = item_changed or models_changed
+                if item_changed:
+                    newline = "\n" if line.endswith("\n") else ""
+                    target.write(
+                        json.dumps(item, ensure_ascii=False, separators=(",", ":"))
+                        + newline
+                    )
+                    changed = True
+                else:
+                    target.write(line)
+            target.flush()
+            os.fsync(target.fileno())
+        if not changed:
+            return
+        validate_jsonl(temp_path)
+        os.replace(temp_path, path)
+        temp_path = None
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        raise SyncError(f"无法规范化会话模型：{path}；{exc}") from exc
+    finally:
+        if temp_path is not None:
             with contextlib.suppress(OSError):
                 temp_path.unlink()
 
@@ -775,8 +1474,20 @@ def backup_conflict_file(
     backup_dir: Path, root: Path, label: str, session_file: SessionFile
 ) -> None:
     destination = backup_dir / "conflicts" / label / session_file.relative_path
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(session_file.path, destination)
+    # Extended-length form on both ends: this is the deepest write the sync makes, and the plain
+    # form silently tips past MAX_PATH for the longest rollout names (see extended_path).
+    os.makedirs(extended_path(destination.parent), exist_ok=True)
+    try:
+        shutil.copy2(extended_path(session_file.path), extended_path(destination))
+    except OSError as error:
+        # The bare WinError names neither path, which sent the last diagnosis after a missing
+        # source that was never missing. Say which end failed and how long the paths were.
+        raise SyncError(
+            "备份冲突文件失败："
+            f"{error}；源={session_file.path}（存在={session_file.path.exists()}，"
+            f"{len(str(session_file.path))} 字符）；"
+            f"目标={destination}（{len(str(destination))} 字符）"
+        ) from error
 
 
 def sync_session_files(
@@ -785,6 +1496,7 @@ def sync_session_files(
     backup_dir: Path,
     temp_dir: Path,
     root_providers: dict[Path, str],
+    model_guards: dict[Path, ModelGuardContext] | None = None,
 ) -> tuple[
     dict[Path, dict[str, Path]],
     list[CloneSpec],
@@ -800,6 +1512,15 @@ def sync_session_files(
     clones: list[CloneSpec] = []
     counters = {"new_files": 0, "updated_files": 0, "conflicts": 0, "unchanged": 0}
     warnings: list[str] = []
+    model_guards = model_guards or {}
+    source_provider_by_id: dict[str, str] = {}
+
+    def source_provider(snapshot: RootSnapshot, session_id: str) -> str:
+        row = snapshot.threads.get(session_id) or {}
+        return str(
+            row.get("model_provider")
+            or provider_for_root(snapshot.root, root_providers)
+        ).strip()
 
     for session_id in sorted((set(left_files) | set(right_files)) & relevant_ids):
         left_file = left_files.get(session_id)
@@ -807,6 +1528,10 @@ def sync_session_files(
         if left_file is None or right_file is None:
             source_file = left_file or right_file
             assert source_file is not None
+            source_snapshot = left if left_file is not None else right
+            source_provider_by_id[session_id] = source_provider(
+                source_snapshot, session_id
+            )
             snapshot = stable_snapshot(source_file.path, temp_dir)
             for root, existing in ((left.root, left_file), (right.root, right_file)):
                 destination = (
@@ -823,13 +1548,27 @@ def sync_session_files(
 
         target_paths[left.root][session_id] = left_file.path
         target_paths[right.root][session_id] = right_file.path
-        relation = compare_files(left_file, right_file)
+        relation = compare_files(
+            left_file,
+            right_file,
+            model_guards.get(left.root),
+            model_guards.get(right.root),
+        )
         if relation == "equal":
+            selected_source = choose_thread_source(session_id, left, right)
+            if selected_source is not None:
+                source_provider_by_id[session_id] = source_provider(
+                    selected_source[0], session_id
+                )
             counters["unchanged"] += 1
             continue
         if relation in {"left_prefix", "right_prefix"}:
             source_file = right_file if relation == "left_prefix" else left_file
             destination_file = left_file if relation == "left_prefix" else right_file
+            source_snapshot = right if relation == "left_prefix" else left
+            source_provider_by_id[session_id] = source_provider(
+                source_snapshot, session_id
+            )
             snapshot = stable_snapshot(source_file.path, temp_dir)
             copy_snapshot_to(snapshot, destination_file.path)
             snapshot.unlink(missing_ok=True)
@@ -850,6 +1589,9 @@ def sync_session_files(
         else:
             canonical_snapshot_root, canonical_file = left, left_file
             alternate_snapshot_root, alternate_file = right, right_file
+        source_provider_by_id[session_id] = source_provider(
+            canonical_snapshot_root, session_id
+        )
 
         backup_conflict_file(backup_dir, left.root, "cockpit", left_file)
         backup_conflict_file(backup_dir, right.root, "plus", right_file)
@@ -886,6 +1628,9 @@ def sync_session_files(
                 paths_by_root=paths_by_root,
             )
         )
+        source_provider_by_id[new_id] = source_provider(
+            alternate_snapshot_root, session_id
+        )
         counters["conflicts"] += 1
         warnings.append(f"会话 {session_id} 两边均被续写，已保留同步冲突副本 {new_id}。")
 
@@ -893,10 +1638,109 @@ def sync_session_files(
     # login. This is what the App's provider-filtered sidebar actually reads.
     for root, paths in target_paths.items():
         provider = provider_for_root(root, root_providers)
-        for path in paths.values():
-            set_session_model_provider(path, provider)
+        for session_id, path in paths.items():
+            rewrite_session_for_destination(
+                path,
+                provider,
+                source_provider_by_id.get(session_id, provider),
+                model_guards.get(root),
+            )
 
     return target_paths, clones, counters, warnings
+
+
+def preflight_model_guards(
+    snapshots: Iterable[RootSnapshot],
+    root_providers: dict[Path, str],
+    model_guards: dict[Path, ModelGuardContext],
+) -> None:
+    """Check every active model slot before the first sync mutation.
+
+    ``sync_session_files`` rewrites rollout files and ``sync_databases`` updates SQLite.  Waiting
+    for the post-write verifier to discover an ambiguous bare model leaves a standalone two-way
+    caller partially synchronized.  This pass is read-only: it resolves the same fields the
+    writer will touch and aborts before any destination file or database is opened for writing.
+    """
+    if not model_guards:
+        return
+    snapshots = tuple(snapshots)
+    for target_root, context in model_guards.items():
+        if context.registry_error:
+            raise SyncError(
+                f"无法安全同步到 {target_root}：模型 registry 不可用 "
+                f"({context.registry_error})。"
+            )
+        for snapshot in snapshots:
+            preferred = {
+                session_id: str(row.get("rollout_path") or "")
+                for session_id, row in snapshot.threads.items()
+            }
+            sessions = scan_sessions(snapshot.root, preferred)
+            for session_id, session in sessions.items():
+                row = snapshot.threads.get(session_id) or {}
+                source_provider = str(
+                    row.get("model_provider")
+                    or provider_for_root(snapshot.root, root_providers)
+                ).strip()
+                try:
+                    with session.path.open("r", encoding="utf-8") as handle:
+                        for line_number, line in enumerate(handle, start=1):
+                            try:
+                                item = json.loads(line)
+                            except (ValueError, json.JSONDecodeError) as exc:
+                                raise SyncError(
+                                    f"模型保护预检无法解析 rollout：{session.path}:{line_number}"
+                                ) from exc
+                            for container, key, field_path in rollout_model_slots(item):
+                                _resolved, reason = _resolve_model_for_target(
+                                    container.get(key), context
+                                )
+                                if reason:
+                                    context.record_unresolved(
+                                        reason,
+                                        container.get(key),
+                                        source_provider,
+                                        f"{target_root}:{session.path}:{line_number}:{field_path}",
+                                    )
+                except OSError as exc:
+                    raise SyncError(
+                        f"模型保护预检无法读取 rollout：{session.path}"
+                    ) from exc
+
+                if "model" in row:
+                    _resolved, reason = _resolve_model_for_target(
+                        row.get("model"), context
+                    )
+                    if reason:
+                        context.record_unresolved(
+                            reason,
+                            row.get("model"),
+                            source_provider,
+                            f"{target_root}:threads:{session_id}:model",
+                        )
+        if context.unresolved_fields:
+            # Only genuinely ambiguous fields stop the sync.  The rest are counted, reported through
+            # `summary()["unresolved_reasons"]`, and left untouched by the writer.
+            fatal_counts = {
+                reason: count
+                for reason, count in context.unresolved_reasons.items()
+                if reason in FATAL_MODEL_GUARD_REASONS
+            }
+            if fatal_counts:
+                fatal_examples = [
+                    item
+                    for item in context.unresolved_examples
+                    if item["reason"] in FATAL_MODEL_GUARD_REASONS
+                ]
+                examples = "; ".join(
+                    f"{item['reason']}:{item['model']}" for item in fatal_examples[:3]
+                )
+                total = sum(fatal_counts.values())
+                raise SyncError(
+                    f"同步前模型来源校验失败：{target_root} 有 "
+                    f"{total} 个模型字段限定后仍然非法（解析器 bug，不是历史数据问题）。"
+                    + (f" 示例：{examples}" if examples else "")
+                )
 
 
 def make_clone_row(source_row: dict[str, Any], clone: CloneSpec) -> dict[str, Any]:
@@ -1164,7 +2008,9 @@ def sync_databases(
     target_paths: dict[Path, dict[str, Path]],
     clones: list[CloneSpec],
     root_providers: dict[Path, str],
+    model_guards: dict[Path, ModelGuardContext] | None = None,
 ) -> dict[str, Any]:
+    model_guards = model_guards or {}
     selected: dict[str, tuple[RootSnapshot, dict[str, Any]]] = {}
     for session_id in set(left.threads) | set(right.threads):
         chosen = choose_thread_source(session_id, left, right)
@@ -1186,6 +2032,7 @@ def sync_databases(
             all_edges.append(edge)
 
     integrity: dict[str, str] = {}
+    clone_ids = {clone.new_id for clone in clones}
     for destination_snapshot in (left, right):
         connection = sqlite3.connect(destination_snapshot.root / "state_5.sqlite", timeout=30)
         connection.execute("PRAGMA busy_timeout=30000")
@@ -1196,6 +2043,18 @@ def sync_databases(
                 if rollout_path is None:
                     continue
                 destination_row = dict(row)
+                model_guard = model_guards.get(destination_snapshot.root)
+                if model_guard is not None and "model" in destination_row:
+                    source_provider = str(
+                        row.get("model_provider")
+                        or provider_for_root(source_snapshot.root, root_providers)
+                    ).strip()
+                    destination_row["model"] = qualify_model_for_target(
+                        destination_row.get("model"),
+                        source_provider,
+                        model_guard,
+                        f"{destination_snapshot.root}:threads:{session_id}:model",
+                    )
                 destination_row["model_provider"] = provider_for_root(
                     destination_snapshot.root, root_providers
                 )
@@ -1203,7 +2062,7 @@ def sync_databases(
                 tools = source_snapshot.dynamic_tools.get(
                     session_id if session_id in source_snapshot.dynamic_tools else row.get("id"), []
                 )
-                if session_id in {clone.new_id for clone in clones}:
+                if session_id in clone_ids:
                     clone = next(item for item in clones if item.new_id == session_id)
                     tools = source_snapshot.dynamic_tools.get(clone.old_id, [])
                 insert_dynamic_tools(connection, tools, session_id)
@@ -1651,10 +2510,72 @@ def managed_section_coverage(
     return result
 
 
+def find_unqualified_rollout_models(
+    path: Path, model_guard: ModelGuardContext | None = None
+) -> list[dict[str, Any]]:
+    """Find active rollout model fields that still lack a provider namespace."""
+    findings: list[dict[str, Any]] = []
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            for line_number, line in enumerate(handle, start=1):
+                try:
+                    item = json.loads(line)
+                except (ValueError, json.JSONDecodeError) as exc:
+                    findings.append(
+                        {
+                            "line": line_number,
+                            "field": "<json>",
+                            "model": repr(exc),
+                            "reason": "invalid_json",
+                        }
+                    )
+                    continue
+                for container, key, field_path in rollout_model_slots(item):
+                    value = container.get(key)
+                    is_qualified = (
+                        _model_has_namespace_in_context(value, model_guard)
+                        if model_guard is not None
+                        else model_has_namespace(value)
+                    )
+                    if not is_qualified:
+                        # Record WHY it is still bare. "unqualified_model" means the writer could
+                        # have namespaced it and did not -- a real post-condition failure. Any other
+                        # reason means it was never qualifiable (no enabled provider offers the id,
+                        # or several do), so leaving it verbatim was the correct, deliberate outcome
+                        # and must not fail the sync.
+                        reason = "unqualified_model"
+                        if model_guard is not None:
+                            _resolved, unresolved = _resolve_model_for_target(
+                                value, model_guard
+                            )
+                            if unresolved:
+                                reason = unresolved
+                        findings.append(
+                            {
+                                "line": line_number,
+                                "field": field_path,
+                                "model": repr(value),
+                                "reason": reason,
+                            }
+                        )
+    except OSError as exc:
+        findings.append(
+            {
+                "line": 0,
+                "field": "<file>",
+                "model": repr(exc),
+                "reason": "rollout_unreadable",
+            }
+        )
+    return findings
+
+
 def verify_roots(
     roots: list[Path],
     expected_sidebar_account_ids: set[str] | None = None,
     root_providers: dict[Path, str] | None = None,
+    model_guard_roots: Iterable[Path] | None = None,
+    model_guards: dict[Path, ModelGuardContext] | None = None,
 ) -> dict[str, Any]:
     roots = [root.resolve() for root in roots]
     if root_providers is None:
@@ -1668,6 +2589,12 @@ def verify_roots(
         root_providers = {
             root.resolve(): provider for root, provider in root_providers.items()
         }
+    if model_guards is None:
+        model_guards = build_model_guard_contexts(roots, model_guard_roots)
+    else:
+        model_guards = {
+            root.resolve(): context for root, context in model_guards.items()
+        }
     result: dict[str, Any] = {}
     id_sets: list[set[str]] = []
     expected_sidebar_account_ids = expected_sidebar_account_ids or set()
@@ -1679,6 +2606,15 @@ def verify_roots(
             rows = connection.execute(
                 "SELECT id, rollout_path, source, archived, model_provider FROM threads"
             ).fetchall()
+            thread_columns = table_columns(connection, "threads")
+            model_by_id = (
+                {
+                    str(row[0]): row[1]
+                    for row in connection.execute("SELECT id, model FROM threads")
+                }
+                if "model" in thread_columns
+                else {}
+            )
             integrity = str(connection.execute("PRAGMA integrity_check").fetchone()[0])
         finally:
             connection.close()
@@ -1694,6 +2630,20 @@ def verify_roots(
         missing_rollouts = [str(row[1]) for row in rows if not Path(str(row[1])).is_file()]
         expected_provider = provider_for_root(root, root_providers)
         wrong_provider_ids = {str(row[0]) for row in rows if str(row[4]) != expected_provider}
+        model_guard = model_guards.get(root)
+        unqualified_model_thread_ids: set[str] = set()
+        unqualified_model_values = 0
+        # The narrower set the failure predicate uses: values the writer could have namespaced and
+        # did not. The wider set above stays as-is because it is what gets reported.
+        requalifiable_thread_ids: set[str] = set()
+        if model_guard is not None:
+            for session_id, model in model_by_id.items():
+                if not _model_has_namespace_in_context(model, model_guard):
+                    unqualified_model_thread_ids.add(session_id)
+                    unqualified_model_values += 1
+                    _resolved, reason = _resolve_model_for_target(model, model_guard)
+                    if reason is None or reason not in BENIGN_UNQUALIFIED_REASONS:
+                        requalifiable_thread_ids.add(session_id)
         preferred_paths = {str(row[0]): str(row[1] or "") for row in rows}
         all_sessions = scan_sessions(root, preferred_paths)
         orphan_session_ids = set(all_sessions) - db_ids
@@ -1704,6 +2654,9 @@ def verify_roots(
         }
         session_ids = set(sessions)
         wrong_rollout_provider_ids: set[str] = set()
+        unqualified_model_session_ids: set[str] = set()
+        requalifiable_session_ids: set[str] = set()
+        unqualified_rollout_values = 0
         for session_id, session in sessions.items():
             try:
                 with session.path.open("r", encoding="utf-8") as handle:
@@ -1713,6 +2666,18 @@ def verify_roots(
                     wrong_rollout_provider_ids.add(session_id)
             except (OSError, json.JSONDecodeError):
                 wrong_rollout_provider_ids.add(session_id)
+            if model_guard is not None:
+                rollout_findings = find_unqualified_rollout_models(
+                    session.path, model_guard
+                )
+                if rollout_findings:
+                    unqualified_model_session_ids.add(session_id)
+                    unqualified_rollout_values += len(rollout_findings)
+                    if any(
+                        finding["reason"] not in BENIGN_UNQUALIFIED_REASONS
+                        for finding in rollout_findings
+                    ):
+                        requalifiable_session_ids.add(session_id)
         global_state = read_json_retry(root / ".codex-global-state.json")
         projectless_ids = {
             str(item) for item in global_state.get("projectless-thread-ids", [])
@@ -1784,6 +2749,17 @@ def verify_roots(
             ),
             "wrong_model_provider_threads": len(wrong_provider_ids),
             "wrong_rollout_provider_sessions": len(wrong_rollout_provider_ids),
+            "unqualified_model_threads": len(unqualified_model_thread_ids),
+            "unqualified_model_sessions": len(unqualified_model_session_ids),
+            "unqualified_model_values": unqualified_model_values
+            + unqualified_rollout_values,
+            # Bare values that COULD be namespaced. Reported, not fatal: the sync normalizes what it
+            # writes, and an archived file it had no reason to touch keeps whatever it was recorded
+            # with. Demanding zero here means demanding the sync retroactively rewrite every rollout
+            # ever created -- one real archive carries 3250 of these -- so it could never pass.
+            "requalifiable_model_threads": len(requalifiable_thread_ids),
+            "requalifiable_model_sessions": len(requalifiable_session_ids),
+            "model_guard": model_guard.summary() if model_guard is not None else None,
             "integrity": integrity,
             "sidebar_visible_main_threads": len(
                 unarchived_main_thread_ids & sidebar_ids
@@ -1803,6 +2779,15 @@ def verify_roots(
             or missing_rollouts
             or wrong_provider_ids
             or wrong_rollout_provider_ids
+            # Neither `unqualified_model_*` nor `requalifiable_*` is fatal. The first counts history
+            # that could not be attributed at all -- a model no enabled provider offers any more, or
+            # one that many offer, which is what a multi-vendor router is for. The second counts
+            # values that could be namespaced but sit in files this sync had no reason to rewrite.
+            # Failing on either made the run unsatisfiable: the preflight refused to start and this
+            # refused to finish, so no sync could ever succeed, while each attempt still paid for a
+            # full-size backup snapshot. What actually prevents a bare slug reaching the wrong
+            # account is the router, which rejects one at the request boundary. Both counts stay in
+            # `result` so the drift remains visible.
             or db_ids != session_ids
             or missing_sidebar_main_ids
             or unresolved_project_thread_ids
@@ -1827,6 +2812,7 @@ def run_sync(
     backup_base: Path,
     left_provider: str = COCKPIT_MODEL_PROVIDER,
     right_provider: str = PLUS_MODEL_PROVIDER,
+    model_guard_roots: Iterable[Path] | None = None,
 ) -> dict[str, Any]:
     started = utc_now()
     roots = [left_root.resolve(), right_root.resolve()]
@@ -1840,6 +2826,7 @@ def run_sync(
     }
     for root in roots:
         validate_root(root)
+    model_guards = build_model_guard_contexts(roots, model_guard_roots)
 
     backup_base.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="codex-history-sync-", dir=INSTALL_DIR / "work") as raw_temp:
@@ -1847,7 +2834,16 @@ def run_sync(
         backup_dir = create_backup(roots, backup_base, temp_dir)
         left = load_root_snapshot(roots[0])
         right = load_root_snapshot(roots[1])
-        duplicate_plan, duplicate_warnings = find_legacy_exact_clones(left, right)
+
+        # A guarded target must be proven safe before *any* root mutation.  In
+        # particular, legacy duplicate cleanup below deletes rows/files; doing
+        # the first preflight after that cleanup could leave a two-way caller
+        # partially changed when an ambiguous model is discovered.
+        preflight_model_guards((left, right), root_providers, model_guards)
+
+        duplicate_plan, duplicate_warnings = find_legacy_exact_clones(
+            left, right, model_guards
+        )
         duplicate_cleanup = purge_legacy_exact_clones(
             roots, duplicate_plan, backup_dir
         )
@@ -1858,21 +2854,25 @@ def run_sync(
             right = load_root_snapshot(roots[1])
 
         target_paths, clones, counters, sync_warnings = sync_session_files(
-            left, right, backup_dir, temp_dir, root_providers
+            left, right, backup_dir, temp_dir, root_providers, model_guards
         )
         integrity = sync_databases(
-            left, right, target_paths, clones, root_providers
+            left, right, target_paths, clones, root_providers, model_guards
         )
         index_entries, visible_threads, sidebar_account_ids = sync_global_state_and_index(
             left, right, clones
         )
         verification = verify_roots(
-            roots, sidebar_account_ids, root_providers
+            roots,
+            sidebar_account_ids,
+            root_providers,
+            model_guards=model_guards,
         )
+        sync_warnings.extend(model_guard_warnings(model_guards))
         verified_left = load_root_snapshot(roots[0])
         verified_right = load_root_snapshot(roots[1])
         remaining_duplicates, verification_warnings = find_legacy_exact_clones(
-            verified_left, verified_right
+            verified_left, verified_right, model_guards
         )
         verification["legacy_exact_conflict_duplicates"] = len(
             remaining_duplicates
@@ -1912,6 +2912,15 @@ def run_sync(
         "removed_sync_custom_sections": True,
         "sidebar_mode": "project",
         "integrity": integrity,
+        "model_guard": {
+            str(root): context.summary() for root, context in model_guards.items()
+        },
+        "normalized_model_fields": sum(
+            context.normalized_fields for context in model_guards.values()
+        ),
+        "unresolved_model_fields": sum(
+            context.unresolved_fields for context in model_guards.values()
+        ),
         "verification": verification,
         "warnings": duplicate_warnings + sync_warnings + verification_warnings,
     }

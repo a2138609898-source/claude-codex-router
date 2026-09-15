@@ -38,7 +38,7 @@ DPAPI 按「当前用户 + 当前机器」加密，拷到别处解不开。所�
 | `name` | string | 无，必填 | 1–80 字符的显示名 |
 | `base_url` | string | 无，必填 | 经 `normalize_base_url` 规范化 |
 | `protocols` | array | `["responses"]` | 取值只能是 `"responses"` / `"messages"`。传字符串会被包成单元素数组；结果按 `PROTOCOLS` 的固定顺序重排。默认值是为了兼容早于 Claude 支持之前的老条目——那些都是 responses 网关 |
-| `prefix` | string | 见下 | 模型前缀。默认供应商必须为空；其他家留空则由 `derive_model_prefix` 派生 |
+| `prefix` | string | 见下 | 模型前缀。Codex/Responses 供应商（包括默认家）必须有命名空间；只有 Claude 的 Messages-only 默认可留空。其它留空值由 `derive_model_prefix` 派生 |
 | `is_default` | bool | `false` | 全表恰好一家为 `true` |
 | `enabled` | bool | `true` | 关掉的供应商不参与路由，也不要求密钥存在 |
 | `allow_failover` | bool | `false` | 允许这家在失败时被跳过换下一家。默认关，关掉时上游的状态码和原文直接透传 |
@@ -56,8 +56,8 @@ DPAPI 按「当前用户 + 当前机器」加密，拷到别处解不开。所�
 | `extra_headers` | object | `{}` | 额外请求头，键值都必须是字符串，键要过头名校验，值不能含控制字符 |
 | `models` | array | `[]` | 见下节 |
 
-`auth_type = "codex_auth"` 的一个特殊之处：它**不会**派生前缀。这家借的是 Codex App 自己的登录，
-派生一个 id 前缀会把 App 已经看到的模型名改掉。
+`auth_type = "codex_auth"` 借的是 Codex App 自己的登录，但仍然需要保持供应商命名空间；前缀是
+模型来源的一部分，不会因为借用登录而被清空。只有 Claude 的旧版 Messages-only 默认配置保留裸模型兼容性。
 
 ## model 对象
 
@@ -95,32 +95,32 @@ vendor.anthropic.     Bedrock 风格，messages-only 的供应商用它
 `published_slug()` 的规则是：有 `publish_as` 就用它，否则 `prefix + id`。**上游收到的永远是
 `model["id"]`。**
 
-存在的理由只有一个：前缀救不了「把档位烧进模型名」的供应商。Claude 的规范化器会剥掉
-`<label>.anthropic.`、`[...]` 后缀、`-vN`、`@date` 和 `-date`，但**不会**剥 `-thinking`。所以
-`claude-opus-5-thinking` 不管怎么加前缀都进不了能力表，滑杆和 1M 变体都拿不到。把它
-`publish_as` 成 `claude-opus-5`（或 `<prefix>claude-opus-5`）就能落到表里，而上游仍然收到
-`-thinking` 那个原名。
+`publish_as` 只服务于 Claude Desktop 的旧版 Messages-only 默认配置：前缀救不了「把档位烧进
+模型名」的供应商。Claude 的规范化器会剥掉 `<label>.anthropic.`、`[...]` 后缀、`-vN`、`@date`
+和 `-date`，但**不会**剥 `-thinking`。因此旧版 Claude 默认配置可以把
+`claude-opus-5-thinking` 发布成 `claude-opus-5`，让能力表识别到思考档，而上游仍然收到
+`-thinking` 那个原名。Codex/Responses 供应商必须使用带命名空间的 `prefix + id`，不能靠
+`publish_as` 改写选择名。
 
 两条限制：
 
-- **说 `responses` 的供应商禁止用 `publish_as`。** Codex 侧的 slug 由 `config.toml` 的
-  `model = ...` 钉住，不需要这套障眼法，混进来只会让两边对不上。
+- **除 Claude 的 Messages-only 默认供应商外，所有供应商禁止用 `publish_as`。** Codex 侧的
+  slug 由 `config.toml` 的 `model = ...` 钉住；其它别名可能丢失供应商身份，导致请求落到错误账户。
 - `publish_as` 恰好等于 `prefix + id` 时会被自动清空——两种写法结果一样，留着只会让摘要不稳定、
   文件更难读。
 
 ## 四条会在实践中咬人的不变式
 
 1. **恰好一个默认供应商。** `providers` 非空时 `is_default` 为真的必须正好一家，否则整份拒绝。
-2. **默认供应商的 `prefix` 必须为空。** 校验器对默认家不派生前缀，因为新工作区里第一个存进去的
-   供应商必然是默认家，派生前缀会让它永远校验不过。
+2. **Codex 默认供应商也必须有 `prefix`。** 空前缀只对 Claude Messages-only 旧版默认配置
+   兼容；老的 Codex 空前缀会在校验时归一化成 `<provider>--`。
 3. **所有启用模型的可选 slug 全局唯一。** 冲突时报错会把两个claim方都点名（并标出哪个是
    `publish_as`），因为有了 `publish_as` 之后最常见的冲突是「覆盖名撞上刚被打开的兄弟条目」，
    光说「重复」会让人找不到该改哪边。
 4. **启用中的 `dpapi` 供应商必须有密钥文件。** 关掉的供应商即使 key 文件已被删也仍可编辑/删除。
 
-第 2 和第 3 条会联动：把默认供应商换成另一家时，新默认家要清空前缀，而**老默认家那条
-`publish_as`（如果是裸名）也必须一起改**，否则两家同时claim同一个裸 slug，整份文件被拒、改动等于
-没生效。
+第 2 和第 3 条会联动：把默认供应商换成另一家时，新默认家仍保持自己的命名空间；任何旧的裸 slug
+都会在请求入口被本地拒绝，而不是静默选择默认账户。
 
 ## 改完之后怎么生效
 
@@ -137,12 +137,13 @@ curl.exe http://127.0.0.1:<port>/healthz
 路由器会**保留旧表继续服务**并把原因写进 `config_error`——这时候 `registry_hash` 不变，看起来
 「没反应」，其实是被拒了。
 
-一个例外：改 `codex_sota_router.py` 的**代码**不会改 `ROUTER_VERSION` 也不会改 `registry_hash`，
-所以健康检查照样匹配，ensure-running 的启动脚本会认为不用动。详见
+路由安全语义改动会递增 `ROUTER_VERSION`（当前 v15）。只改 `codex_sota_router.py` 的**代码**而不
+递增版本或改变 `registry_hash`，健康检查仍可能匹配，ensure-running 的启动脚本会认为不用动。详见
 [DEVELOPING.md](DEVELOPING.md) 的「改动路由器代码时的陷阱」。
 
 ## 模板
 
 `providers.example.json` 在仓库根目录，可以直接拷成 `%USERPROFILE%\.claude-sota\providers.json`
-再改。它有意做成两家：一家默认、空前缀；一家带 `alt-relay.anthropic.` 前缀并演示 `publish_as`。
+再改。它有意做成两家：Claude 的旧版 Messages-only 默认家保留空前缀，另一家使用
+`alt-relay.anthropic.` 命名空间；其它 workspace 应始终使用非空前缀。
 拷过去之后还要用管理器存一次 API key，`*.dpapi` 文件不能手写。
