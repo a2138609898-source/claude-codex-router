@@ -60,6 +60,8 @@ def provider_config(
         "models_path": "/models",
         "responses_path": "/responses",
         "messages_path": "/messages",
+        "chat_path": "/v1/chat/completions",
+        "request_adapter": "",
         "timeout_seconds": 5,
         "protocols": list(protocols),
         "extra_headers": {},
@@ -1568,6 +1570,842 @@ class RouterRegressionTests(unittest.TestCase):
                     urllib.request.urlopen(plain_request, timeout=10)
                 self.assertEqual(raised.exception.code, 400)
 
+    @staticmethod
+    def _claude_default_provider(base_url: str) -> dict[str, object]:
+        """The legacy bare-name default every claude-workspace registry must carry."""
+        provider = provider_config(
+            "legacy_default",
+            base_url,
+            prefix="",
+            is_default=True,
+            protocols=("messages",),
+            model_id="claude-opus-5",
+        )
+        provider["workspace"] = "claude"
+        return provider
+
+    @staticmethod
+    def _claude_chat_provider(provider_id: str, base_url: str, model_id: str = "nova-vision") -> dict[str, object]:
+        provider = provider_config(
+            provider_id,
+            base_url,
+            prefix=provider_id + ".anthropic.",
+            is_default=False,
+            protocols=("messages",),
+            model_id=model_id,
+        )
+        provider["workspace"] = "claude"
+        provider["request_adapter"] = "messages_to_chat_completions"
+        provider["chat_path"] = "/v1/chat/completions"
+        return provider
+
+    def test_messages_bridge_translates_both_ways(self) -> None:
+        """Anthropic Messages in, Chat Completions out, Anthropic message back."""
+        received: list[dict] = []
+
+        class ChatUpstream(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, _format: str, *_args: object) -> None:
+                return
+
+            def do_POST(self) -> None:
+                length = int(self.headers.get("Content-Length") or 0)
+                received.append(json.loads(self.rfile.read(length)))
+                payload = {
+                    "id": "chatcmpl-m1",
+                    "object": "chat.completion",
+                    "created": 1700000000,
+                    "model": "nova-vision",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {"role": "assistant", "content": "回答：北京"},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                    "usage": {"prompt_tokens": 21, "completion_tokens": 5},
+                }
+                raw = json.dumps(payload, ensure_ascii=False).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), ChatUpstream)
+        server.daemon_threads = True
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                registry_path = root / "providers.json"
+                auth_path = root / "auth.json"
+                write_auth(auth_path)
+                write_registry(
+                    registry_path,
+                    [
+                        self._claude_default_provider(f"http://127.0.0.1:{server.server_port}"),
+                        self._claude_chat_provider("golf", f"http://127.0.0.1:{server.server_port}"),
+                    ],
+                )
+                with RouterHarness(registry_path, auth_path, root / "router.log") as local:
+                    request = urllib.request.Request(
+                        local.url + "/v1/messages",
+                        data=json.dumps(
+                            {
+                                "model": "golf.anthropic.nova-vision",
+                                "max_tokens": 128,
+                                "system": "Be terse.",
+                                "messages": [
+                                    {"role": "user", "content": "首都在哪"},
+                                    {
+                                        "role": "assistant",
+                                        "content": [
+                                            {"type": "text", "text": "我来查"},
+                                            {"type": "tool_use", "id": "toolu_1", "name": "lookup", "input": {"q": "capital"}},
+                                        ],
+                                    },
+                                    {
+                                        "role": "user",
+                                        "content": [
+                                            {"type": "tool_result", "tool_use_id": "toolu_1", "content": "北京"},
+                                        ],
+                                    },
+                                ],
+                                "tools": [
+                                    {
+                                        "name": "lookup",
+                                        "description": "Look things up",
+                                        "input_schema": {"type": "object", "properties": {"q": {"type": "string"}}},
+                                    }
+                                ],
+                                "tool_choice": {"type": "any"},
+                                "stream": False,
+                            },
+                            ensure_ascii=False,
+                        ).encode("utf-8"),
+                        headers={"Content-Type": "application/json", "anthropic-version": "2023-06-01"},
+                        method="POST",
+                    )
+                    with urllib.request.urlopen(request, timeout=10) as response:
+                        body = json.loads(response.read())
+        finally:
+            server.shutdown()
+            server.server_close()
+
+        sent = received[-1]
+        self.assertEqual(sent["model"], "nova-vision")
+        self.assertEqual(sent["messages"][0], {"role": "system", "content": "Be terse."})
+        self.assertEqual(sent["messages"][1], {"role": "user", "content": "首都在哪"})
+        assistant_turn = sent["messages"][2]
+        self.assertEqual(assistant_turn["role"], "assistant")
+        self.assertEqual(assistant_turn["content"], "我来查")
+        self.assertEqual(assistant_turn["tool_calls"][0]["id"], "toolu_1")
+        self.assertEqual(assistant_turn["tool_calls"][0]["function"]["name"], "lookup")
+        self.assertEqual(assistant_turn["tool_calls"][0]["function"]["arguments"], '{"q":"capital"}')
+        self.assertEqual(sent["messages"][3]["role"], "tool")
+        self.assertEqual(sent["messages"][3]["tool_call_id"], "toolu_1")
+        self.assertEqual(sent["messages"][3]["content"], "北京")
+        self.assertEqual(sent["tools"][0]["function"]["name"], "lookup")
+        self.assertEqual(sent["tools"][0]["function"]["parameters"]["properties"], {"q": {"type": "string"}})
+        self.assertEqual(sent["tool_choice"], "required")
+
+        self.assertEqual(body["type"], "message")
+        self.assertEqual(body["role"], "assistant")
+        self.assertEqual(body["content"], [{"type": "text", "text": "回答：北京"}])
+        self.assertEqual(body["stop_reason"], "end_turn")
+        self.assertEqual(body["usage"], {"input_tokens": 21, "output_tokens": 5})
+
+    def test_messages_bridge_count_tokens_is_estimated_locally(self) -> None:
+        """count_tokens must be answered locally, never refused and never forwarded."""
+        provider = self._claude_chat_provider("golf", "http://127.0.0.1:1")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            registry_path = root / "providers.json"
+            auth_path = root / "auth.json"
+            write_auth(auth_path)
+            write_registry(
+                registry_path,
+                [self._claude_default_provider("http://127.0.0.1:1"), provider],
+            )
+            with RouterHarness(registry_path, auth_path, root / "router.log") as local:
+                request = urllib.request.Request(
+                    local.url + "/v1/messages/count_tokens",
+                    data=json.dumps(
+                        {
+                            "model": "golf.anthropic.nova-vision",
+                            "messages": [{"role": "user", "content": "count me"}],
+                        }
+                    ).encode("utf-8"),
+                    headers={"Content-Type": "application/json", "anthropic-version": "2023-06-01"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(request, timeout=10) as response:
+                    self.assertEqual(response.status, 200)
+                    payload = json.loads(response.read())
+        self.assertGreater(payload["input_tokens"], 0)
+
+    def test_messages_bridge_streams_anthropic_events(self) -> None:
+        """Chat SSE deltas become Anthropic SSE, tool calls included."""
+
+        class ChatSse(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, _format: str, *_args: object) -> None:
+                return
+
+            def do_POST(self) -> None:
+                length = int(self.headers.get("Content-Length") or 0)
+                self.rfile.read(length)
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Connection", "close")
+                self.end_headers()
+
+                def send(payload: dict) -> None:
+                    self.wfile.write(f"data: {json.dumps(payload, separators=(',', ':'))}\n\n".encode())
+                    self.wfile.flush()
+
+                send({"id": "chatcmpl-s", "model": "nova-vision", "choices": [{"index": 0, "delta": {"role": "assistant", "content": "北"}}]})
+                send({"choices": [{"index": 0, "delta": {"content": "京"}}]})
+                send({"choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "id": "toolu_a", "function": {"name": "lookup", "arguments": "{\"q\":"}}]}}]})
+                send({"choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "function": {"arguments": "1}"}}]}}]})
+                send({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]})
+                send({"choices": [], "usage": {"prompt_tokens": 7, "completion_tokens": 3}})
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
+                self.close_connection = True
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), ChatSse)
+        server.daemon_threads = True
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                registry_path = root / "providers.json"
+                auth_path = root / "auth.json"
+                write_auth(auth_path)
+                write_registry(
+                    registry_path,
+                    [
+                        self._claude_default_provider(f"http://127.0.0.1:{server.server_port}"),
+                        self._claude_chat_provider("golf", f"http://127.0.0.1:{server.server_port}"),
+                    ],
+                )
+                with RouterHarness(registry_path, auth_path, root / "router.log") as local:
+                    request = urllib.request.Request(
+                        local.url + "/v1/messages",
+                        data=json.dumps(
+                            {
+                                "model": "golf.anthropic.nova-vision",
+                                "max_tokens": 64,
+                                "stream": True,
+                                "messages": [{"role": "user", "content": "hi"}],
+                            }
+                        ).encode("utf-8"),
+                        headers={"Content-Type": "application/json", "anthropic-version": "2023-06-01"},
+                        method="POST",
+                    )
+                    with urllib.request.urlopen(request, timeout=10) as response:
+                        stream = response.read().decode("utf-8", "replace")
+        finally:
+            server.shutdown()
+            server.server_close()
+
+        self.assertIn("event: message_start", stream)
+        self.assertIn('"text_delta","text":"北"', stream)
+        self.assertIn('"text_delta","text":"京"', stream)
+        self.assertIn('"tool_use","id":"toolu_a","name":"lookup"', stream)
+        self.assertIn(r'"input_json_delta","partial_json":"{\"q\":', stream)
+        self.assertIn('"input_json_delta","partial_json":"1}"', stream)
+        self.assertIn('"stop_reason":"tool_use"', stream)
+        self.assertIn("event: message_stop", stream)
+        self.assertNotIn("event: error", stream)
+
+    def test_messages_bridge_truncation_and_early_retry(self) -> None:
+        """Truncated chat streams fail the turn; zero-content deaths retry invisibly."""
+        mode = {"value": "truncate"}
+        calls: list[int] = []
+
+        class Flaky(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, _format: str, *_args: object) -> None:
+                return
+
+            def do_POST(self) -> None:
+                length = int(self.headers.get("Content-Length") or 0)
+                self.rfile.read(length)
+                calls.append(1)
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                if mode["value"] == "retry" and len(calls) == 1:
+                    self.close_connection = True
+                    return
+                self.wfile.write('data: {"choices":[{"index":0,"delta":{"content":"部分"}}]}\n\n'.encode("utf-8"))
+                self.wfile.flush()
+                # The retried attempt (and a healthy baseline) finishes cleanly;
+                # only the truncate scenario withholds the completion event.
+                if mode["value"] != "truncate":
+                    self.wfile.write(b'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n')
+                    self.wfile.flush()
+                self.close_connection = True
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Flaky)
+        server.daemon_threads = True
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                registry_path = root / "providers.json"
+                auth_path = root / "auth.json"
+                write_auth(auth_path)
+                write_registry(
+                    registry_path,
+                    [
+                        self._claude_default_provider(f"http://127.0.0.1:{server.server_port}"),
+                        self._claude_chat_provider("golf", f"http://127.0.0.1:{server.server_port}"),
+                    ],
+                )
+                with RouterHarness(registry_path, auth_path, root / "router.log") as local:
+                    payload = {
+                        "model": "golf.anthropic.nova-vision",
+                        "max_tokens": 32,
+                        "stream": True,
+                        "messages": [{"role": "user", "content": "hi"}],
+                    }
+
+                    def ask():
+                        request = urllib.request.Request(
+                            local.url + "/v1/messages",
+                            data=json.dumps(payload).encode("utf-8"),
+                            headers={"Content-Type": "application/json", "anthropic-version": "2023-06-01"},
+                            method="POST",
+                        )
+                        with urllib.request.urlopen(request, timeout=10) as response:
+                            return response.read().decode("utf-8", "replace")
+
+                    truncated = ask()
+                    log_lines = [
+                        json.loads(line)
+                        for line in (root / "router.log").read_text(encoding="utf-8").splitlines()
+                        if line.strip()
+                    ]
+                    self.assertIn("event: error", truncated)
+                    self.assertIn("截断", truncated)
+                    self.assertNotIn("event: message_stop", truncated)
+                    self.assertIn("部分", truncated)
+                    self.assertEqual(log_lines[-1]["status"], 502)
+
+                    mode["value"] = "retry"
+                    calls.clear()
+                    retried = ask()
+                    self.assertEqual(len(calls), 2, "the zero-content death was not retried")
+                    self.assertIn("部分", retried)
+                    self.assertNotIn("event: error", retried)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_messages_bridge_guards_and_validation(self) -> None:
+        """A Responses request is refused; the bridge requires the messages protocol."""
+        provider = self._claude_chat_provider("golf", "http://127.0.0.1:1")
+        provider["protocols"] = ["responses", "messages"]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            registry_path = root / "providers.json"
+            auth_path = root / "auth.json"
+            write_auth(auth_path)
+            write_registry(
+                registry_path,
+                [self._claude_default_provider("http://127.0.0.1:1"), provider],
+            )
+            with RouterHarness(registry_path, auth_path, root / "router.log") as local:
+                request = urllib.request.Request(
+                    local.url + "/responses",
+                    data=json.dumps(
+                        {"model": "golf.anthropic.nova-vision", "input": "hi", "stream": False}
+                    ).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with self.assertRaises(urllib.error.HTTPError) as raised:
+                    urllib.request.urlopen(request, timeout=10)
+                self.assertEqual(raised.exception.code, 501)
+                payload = json.loads(raised.exception.read())
+                self.assertEqual(payload["error"]["type"], "unsupported_adapter_operation")
+
+        broken = self._claude_chat_provider("golf", "http://127.0.0.1:1")
+        broken["protocols"] = ["responses"]
+        with self.assertRaises(ValueError) as caught:
+            registry.validate_provider(deepcopy(broken), allow_missing_secret=True)
+        self.assertIn("messages", str(caught.exception))
+
+        probe_ok = self._claude_chat_provider("golf", "http://127.0.0.1:1")
+        self.assertEqual(registry.probe_protocol(probe_ok), "chat")
+
+    @staticmethod
+    def _chat_provider(provider_id: str, base_url: str, model_id: str = "nova-test") -> dict[str, object]:
+        provider = provider_config(
+            provider_id,
+            base_url,
+            prefix=provider_id + "--",
+            is_default=True,
+            protocols=("responses",),
+            model_id=model_id,
+        )
+        provider["request_adapter"] = "responses_to_chat_completions"
+        provider["chat_path"] = "/v1/chat/completions"
+        return provider
+
+    def test_chat_bridge_translates_requests_and_answers(self) -> None:
+        """Responses in, Chat Completions out, Responses back -- with tools mapped."""
+        received: list[dict] = []
+
+        class ChatUpstream(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, _format: str, *_args: object) -> None:
+                return
+
+            def do_POST(self) -> None:
+                length = int(self.headers.get("Content-Length") or 0)
+                received.append(json.loads(self.rfile.read(length)))
+                payload = {
+                    "id": "chatcmpl-1",
+                    "object": "chat.completion",
+                    "created": 1700000000,
+                    "model": "nova-test",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {"role": "assistant", "content": "hello from chat"},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                    "usage": {"prompt_tokens": 11, "completion_tokens": 7},
+                }
+                raw = json.dumps(payload).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), ChatUpstream)
+        server.daemon_threads = True
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                registry_path = root / "providers.json"
+                auth_path = root / "auth.json"
+                write_auth(auth_path)
+                write_registry(
+                    registry_path,
+                    [self._chat_provider("chatvendor", f"http://127.0.0.1:{server.server_port}")],
+                )
+                with RouterHarness(registry_path, auth_path, root / "router.log") as local:
+                    request = urllib.request.Request(
+                        local.url + "/responses",
+                        data=json.dumps(
+                            {
+                                "model": "chatvendor--nova-test",
+                                "instructions": "You are terse.",
+                                "input": [
+                                    {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+                                    {
+                                        "type": "function_call",
+                                        "call_id": "call_1",
+                                        "name": "lookup",
+                                        "arguments": "{\"q\":1}",
+                                    },
+                                    {"type": "function_call_output", "call_id": "call_1", "output": "42"},
+                                ],
+                                "tools": [
+                                    {
+                                        "type": "namespace",
+                                        "name": "codex_app",
+                                        "tools": [
+                                            {
+                                                "type": "function",
+                                                "name": "lookup",
+                                                "description": "Look things up",
+                                                "inputSchema": {"type": "object", "properties": {"q": {"type": "integer"}}},
+                                            }
+                                        ],
+                                    }
+                                ],
+                                "tool_choice": "auto",
+                                "reasoning": {"effort": "high"},
+                                "stream": False,
+                            }
+                        ).encode("utf-8"),
+                        headers={"Content-Type": "application/json"},
+                        method="POST",
+                    )
+                    with urllib.request.urlopen(request, timeout=10) as response:
+                        body = json.loads(response.read())
+        finally:
+            server.shutdown()
+            server.server_close()
+
+        sent = received[-1]
+        self.assertEqual(sent["model"], "nova-test")
+        self.assertEqual(sent["messages"][0], {"role": "system", "content": "You are terse."})
+        self.assertEqual(sent["messages"][1]["role"], "user")
+        tool_call_message = sent["messages"][2]
+        self.assertEqual(tool_call_message["role"], "assistant")
+        self.assertEqual(tool_call_message["tool_calls"][0]["id"], "call_1")
+        self.assertEqual(tool_call_message["tool_calls"][0]["function"]["name"], "lookup")
+        self.assertEqual(tool_call_message["tool_calls"][0]["function"]["arguments"], '{"q":1}')
+        self.assertEqual(sent["messages"][3]["role"], "tool")
+        self.assertEqual(sent["messages"][3]["tool_call_id"], "call_1")
+        self.assertEqual(sent["messages"][3]["content"], "42")
+        self.assertEqual(sent["tools"][0]["function"]["name"], "lookup")
+        self.assertEqual(
+            sent["tools"][0]["function"]["parameters"],
+            {"type": "object", "properties": {"q": {"type": "integer"}}},
+        )
+        self.assertEqual(sent["reasoning_effort"], "high")
+        self.assertEqual(body["output_text"], "hello from chat")
+        self.assertEqual(body["usage"]["input_tokens"], 11)
+        self.assertEqual(body["usage"]["output_tokens"], 7)
+
+    def test_chat_bridge_streams_deltas_and_tool_calls(self) -> None:
+        """Chat SSE deltas become Responses events, tool fragments included."""
+
+        class ChatSse(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, _format: str, *_args: object) -> None:
+                return
+
+            def do_POST(self) -> None:
+                length = int(self.headers.get("Content-Length") or 0)
+                self.rfile.read(length)
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Connection", "close")
+                self.end_headers()
+
+                def send(payload: dict) -> None:
+                    self.wfile.write(f"data: {json.dumps(payload, separators=(',', ':'))}\n\n".encode())
+                    self.wfile.flush()
+
+                send({"id": "chatcmpl-s", "model": "nova-test", "choices": [{"index": 0, "delta": {"role": "assistant", "content": "Hel"}}]})
+                send({"choices": [{"index": 0, "delta": {"content": "lo"}}]})
+                send({"choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "id": "call_a", "function": {"name": "lookup", "arguments": "{\"q\":"}}]}}]})
+                send({"choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "function": {"arguments": "7}"}}]}}]})
+                send({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]})
+                send({"choices": [], "usage": {"prompt_tokens": 9, "completion_tokens": 4}})
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
+                self.close_connection = True
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), ChatSse)
+        server.daemon_threads = True
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                registry_path = root / "providers.json"
+                auth_path = root / "auth.json"
+                write_auth(auth_path)
+                write_registry(
+                    registry_path,
+                    [self._chat_provider("chatvendor", f"http://127.0.0.1:{server.server_port}")],
+                )
+                with RouterHarness(registry_path, auth_path, root / "router.log") as local:
+                    request = urllib.request.Request(
+                        local.url + "/responses",
+                        data=json.dumps({"model": "chatvendor--nova-test", "input": "hi", "stream": True}).encode("utf-8"),
+                        headers={"Content-Type": "application/json"},
+                        method="POST",
+                    )
+                    with urllib.request.urlopen(request, timeout=10) as response:
+                        stream = response.read().decode("utf-8", "replace")
+        finally:
+            server.shutdown()
+            server.server_close()
+
+        self.assertIn("response.created", stream)
+        self.assertIn('"delta":"Hel"', stream)
+        self.assertIn('"delta":"lo"', stream)
+        self.assertIn("response.function_call_arguments.delta", stream)
+        self.assertIn(r'"delta":"{\"q\":', stream)
+        self.assertIn('"delta":"7}"', stream)
+        self.assertIn("response.completed", stream)
+        self.assertNotIn("response.failed", stream)
+        completed_line = [line[5:] for line in stream.splitlines() if line.startswith("data:") and "response.completed" in line]
+        self.assertEqual(len(completed_line), 1)
+        output = json.loads(completed_line[0])["response"]["output"]
+        kinds = [item["type"] for item in output]
+        self.assertIn("message", kinds)
+        self.assertIn("function_call", kinds)
+        message = next(item for item in output if item["type"] == "message")
+        self.assertEqual(message["content"][0]["text"], "Hello")
+        call = next(item for item in output if item["type"] == "function_call")
+        self.assertEqual(call["call_id"], "call_a")
+        self.assertEqual(call["name"], "lookup")
+        self.assertEqual(call["arguments"], '{"q":7}')
+
+    def test_chat_bridge_unwraps_custom_tools(self) -> None:
+        """A custom tool's {"input": ...} arguments come back as the bare string."""
+
+        class ChatCustom(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, _format: str, *_args: object) -> None:
+                return
+
+            def do_POST(self) -> None:
+                length = int(self.headers.get("Content-Length") or 0)
+                self.rfile.read(length)
+                payload = {
+                    "id": "chatcmpl-c",
+                    "model": "nova-test",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {
+                                "role": "assistant",
+                                "content": None,
+                                "tool_calls": [
+                                    {
+                                        "id": "call_c",
+                                        "type": "function",
+                                        "function": {"name": "apply_patch", "arguments": "{\"input\":\"*** Begin Patch\\n*** End Patch\"}"},
+                                    }
+                                ],
+                            },
+                            "finish_reason": "tool_calls",
+                        }
+                    ],
+                }
+                raw = json.dumps(payload).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), ChatCustom)
+        server.daemon_threads = True
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                registry_path = root / "providers.json"
+                auth_path = root / "auth.json"
+                write_auth(auth_path)
+                write_registry(
+                    registry_path,
+                    [self._chat_provider("chatvendor", f"http://127.0.0.1:{server.server_port}")],
+                )
+                with RouterHarness(registry_path, auth_path, root / "router.log") as local:
+                    request = urllib.request.Request(
+                        local.url + "/responses",
+                        data=json.dumps(
+                            {
+                                "model": "chatvendor--nova-test",
+                                "input": "patch it",
+                                "stream": False,
+                                "tools": [
+                                    {
+                                        "type": "custom",
+                                        "name": "apply_patch",
+                                        "description": "Apply a patch",
+                                        "format": {"type": "grammar", "syntax": "lark", "definition": "start: PATCH"},
+                                    }
+                                ],
+                            }
+                        ).encode("utf-8"),
+                        headers={"Content-Type": "application/json"},
+                        method="POST",
+                    )
+                    with urllib.request.urlopen(request, timeout=10) as response:
+                        body = json.loads(response.read())
+        finally:
+            server.shutdown()
+            server.server_close()
+
+        call = body["output"][0]
+        self.assertEqual(call["type"], "custom_tool_call")
+        self.assertEqual(call["name"], "apply_patch")
+        self.assertEqual(call["call_id"], "call_c")
+        self.assertEqual(call["input"], "*** Begin Patch\n*** End Patch")
+
+    def test_chat_bridge_detects_truncation_and_fails_the_turn(self) -> None:
+        """A chat stream ending without [DONE]/finish_reason fails, not fakes success."""
+
+        class TruncChat(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, _format: str, *_args: object) -> None:
+                return
+
+            def do_POST(self) -> None:
+                length = int(self.headers.get("Content-Length") or 0)
+                self.rfile.read(length)
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(b'data: {"choices":[{"index":0,"delta":{"content":"partial"}}]}\n\n')
+                self.wfile.flush()
+                self.close_connection = True
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), TruncChat)
+        server.daemon_threads = True
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                registry_path = root / "providers.json"
+                auth_path = root / "auth.json"
+                write_auth(auth_path)
+                write_registry(
+                    registry_path,
+                    [self._chat_provider("chatvendor", f"http://127.0.0.1:{server.server_port}")],
+                )
+                with RouterHarness(registry_path, auth_path, root / "router.log") as local:
+                    request = urllib.request.Request(
+                        local.url + "/responses",
+                        data=json.dumps({"model": "chatvendor--nova-test", "input": "hi", "stream": True}).encode("utf-8"),
+                        headers={"Content-Type": "application/json"},
+                        method="POST",
+                    )
+                    with urllib.request.urlopen(request, timeout=10) as response:
+                        stream = response.read().decode("utf-8", "replace")
+                log_lines = [
+                    json.loads(line)
+                    for line in (root / "router.log").read_text(encoding="utf-8").splitlines()
+                    if line.strip()
+                ]
+        finally:
+            server.shutdown()
+            server.server_close()
+
+        self.assertIn("response.failed", stream)
+        self.assertNotIn("response.completed", stream)
+        self.assertIn("partial", stream)
+        self.assertEqual(log_lines[-1]["status"], 502)
+
+    def test_chat_bridge_retries_an_early_death_invisibly(self) -> None:
+        """Zero-content death on attempt one is retried; the client sees a clean run."""
+        calls: list[int] = []
+
+        class FlakyChat(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, _format: str, *_args: object) -> None:
+                return
+
+            def do_POST(self) -> None:
+                length = int(self.headers.get("Content-Length") or 0)
+                self.rfile.read(length)
+                calls.append(1)
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                if len(calls) == 1:
+                    # dies before producing anything observable
+                    self.close_connection = True
+                    return
+                self.wfile.write(b'data: {"choices":[{"index":0,"delta":{"content":"recovered"}}]}\n\n')
+                self.wfile.write(b'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n')
+                self.wfile.flush()
+                self.close_connection = True
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), FlakyChat)
+        server.daemon_threads = True
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                registry_path = root / "providers.json"
+                auth_path = root / "auth.json"
+                write_auth(auth_path)
+                write_registry(
+                    registry_path,
+                    [self._chat_provider("chatvendor", f"http://127.0.0.1:{server.server_port}")],
+                )
+                with RouterHarness(registry_path, auth_path, root / "router.log") as local:
+                    request = urllib.request.Request(
+                        local.url + "/responses",
+                        data=json.dumps({"model": "chatvendor--nova-test", "input": "hi", "stream": True}).encode("utf-8"),
+                        headers={"Content-Type": "application/json"},
+                        method="POST",
+                    )
+                    with urllib.request.urlopen(request, timeout=10) as response:
+                        stream = response.read().decode("utf-8", "replace")
+        finally:
+            server.shutdown()
+            server.server_close()
+
+        self.assertEqual(len(calls), 2, "the zero-content death was not retried")
+        self.assertIn("recovered", stream)
+        self.assertIn("response.completed", stream)
+        self.assertNotIn("response.failed", stream)
+
+    def test_chat_bridge_refuses_a_messages_client(self) -> None:
+        """A dual-protocol provider with the bridge refuses Messages instead of mangling."""
+        provider = self._chat_provider("chatvendor", "http://127.0.0.1:1")
+        provider["protocols"] = ["responses", "messages"]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            registry_path = root / "providers.json"
+            auth_path = root / "auth.json"
+            write_auth(auth_path)
+            write_registry(registry_path, [provider])
+            with RouterHarness(registry_path, auth_path, root / "router.log") as local:
+                request = urllib.request.Request(
+                    local.url + "/v1/messages",
+                    data=json.dumps(
+                        {
+                            "model": "chatvendor--nova-test",
+                            "max_tokens": 8,
+                            "messages": [{"role": "user", "content": "hi"}],
+                        }
+                    ).encode("utf-8"),
+                    headers={"Content-Type": "application/json", "anthropic-version": "2023-06-01"},
+                    method="POST",
+                )
+                with self.assertRaises(urllib.error.HTTPError) as raised:
+                    urllib.request.urlopen(request, timeout=10)
+                self.assertEqual(raised.exception.code, 501)
+                payload = json.loads(raised.exception.read())
+                self.assertEqual(payload["error"]["type"], "unsupported_adapter_operation")
+
+    def test_chat_bridge_probe_and_validation(self) -> None:
+        """The GUI's test path probes Chat Completions, and validation gates the bridge."""
+        provider = self._chat_provider("chatvendor", "http://127.0.0.1:1")
+        self.assertEqual(registry.probe_protocol(provider), "chat")
+        url, payload, extra, protocol = registry.probe_request(provider, "nova-test")
+        self.assertTrue(url.endswith("/v1/chat/completions"))
+        self.assertEqual(protocol, "chat")
+        self.assertIn("choices", registry.response_shape_problem({"choices": []}, "", "chat") or "choices")
+        self.assertIsNotNone(registry.response_shape_problem({"object": "response"}, "", "chat"))
+
+        # A bridge without the responses protocol serves nothing to translate.
+        broken = self._chat_provider("chatvendor", "http://127.0.0.1:1")
+        broken["protocols"] = ["messages"]
+        with self.assertRaises(ValueError) as caught:
+            registry.validate_provider(deepcopy(broken), allow_missing_secret=True)
+        self.assertIn("responses", str(caught.exception))
+
+        # Unknown adapter values are refused.
+        bogus = self._chat_provider("chatvendor", "http://127.0.0.1:1")
+        bogus["request_adapter"] = "does_not_exist"
+        with self.assertRaises(ValueError) as caught:
+            registry.validate_provider(deepcopy(bogus), allow_missing_secret=True)
+        self.assertIn("request_adapter", str(caught.exception))
+
     def test_codex_catalog_template_follows_the_mapped_alias(self) -> None:
         """A mapped non-GPT model builds its catalog entry from the alias's template."""
 
@@ -2317,6 +3155,7 @@ class RegistryRecoveryRegressionTests(unittest.TestCase):
                 "models_path": "/attacker-models",
                 "responses_path": "/attacker-responses",
                 "messages_path": "/attacker-messages",
+                "chat_path": "/attacker-chat",
             }
         )
 
@@ -2337,6 +3176,9 @@ class RegistryRecoveryRegressionTests(unittest.TestCase):
             "borrowed_login", "https://example.invalid/v1", prefix="", is_default=True
         )
         current.update({"protected": True, "auth_type": "codex_auth"})
+        # The scenario under test is precisely "the field does not exist on disk at all",
+        # so remove the fixture's canonical value rather than relying on it never existing.
+        current.pop("request_adapter", None)
         candidate = deepcopy(current)
         candidate["request_adapter"] = "responses_to_anthropic_messages"
 
@@ -2484,6 +3326,7 @@ def new_provider_form(workspace: registry.Workspace) -> SimpleNamespace:
         failover_var=Variable(),
         proto_responses_var=Variable(),
         proto_messages_var=Variable(),
+        chat_bridge_var=Variable(),
         headers_text=WidgetStub(),
         draft_models=[],
         id_entry=WidgetStub(),

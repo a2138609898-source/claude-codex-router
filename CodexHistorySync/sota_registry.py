@@ -136,6 +136,17 @@ PROTOCOLS = ("responses", "messages")
 # inference endpoint is Anthropic Messages.  Keep the marker in the registry so probes and the
 # local router can opt into the translation without changing the protocol advertised to Codex.
 RESPONSES_TO_ANTHROPIC_MESSAGES_ADAPTER = "responses_to_anthropic_messages"
+# A gateway that only speaks OpenAI Chat Completions: neither Codex App (Responses) nor
+# Claude Desktop (Messages) can talk to it directly, but the router can translate for the
+# Codex side.  Same mechanism as the Messages adapter above, opposite direction.
+RESPONSES_TO_CHAT_COMPLETIONS_ADAPTER = "responses_to_chat_completions"
+# The mirror bridge: a Messages client (Claude Desktop) talking to a Chat-only gateway.
+MESSAGES_TO_CHAT_COMPLETIONS_ADAPTER = "messages_to_chat_completions"
+REQUEST_ADAPTERS = (
+    RESPONSES_TO_ANTHROPIC_MESSAGES_ADAPTER,
+    RESPONSES_TO_CHAT_COMPLETIONS_ADAPTER,
+    MESSAGES_TO_CHAT_COMPLETIONS_ADAPTER,
+)
 # How many vendors one request may be handed to before giving up.
 FAILOVER_MAX_ATTEMPTS = 3
 # What `protected` actually protects.  A protected entry is one whose *identity* this app does not
@@ -163,6 +174,7 @@ PROTECTED_PINNED_PROVIDER_KEYS = (
     "models_path",
     "responses_path",
     "messages_path",
+    "chat_path",
 )
 ID_PATTERN = re.compile(r"^[a-z][a-z0-9_]{1,39}$")
 # Two prefix shapes, both self-delimiting so `prefix + model id` stays one unambiguous slug:
@@ -471,6 +483,26 @@ def uses_responses_to_anthropic_messages(provider: dict[str, Any]) -> bool:
     )
 
 
+def uses_messages_to_chat_completions(provider: dict[str, Any]) -> bool:
+    """Whether this provider is an OpenAI-Chat-only gateway bridged for Claude Desktop."""
+    return (
+        str(provider.get("request_adapter") or "").strip()
+        == MESSAGES_TO_CHAT_COMPLETIONS_ADAPTER
+    )
+
+
+def uses_responses_to_chat_completions(provider: dict[str, Any]) -> bool:
+    """Whether this provider is an OpenAI-Chat-only gateway bridged for the Codex App.
+
+    Not id-gated like the Messages adapter: any gateway can be configured this way, which
+    is the point -- these vendors are exactly the ones neither app can talk to natively.
+    """
+    return (
+        str(provider.get("request_adapter") or "").strip()
+        == RESPONSES_TO_CHAT_COMPLETIONS_ADAPTER
+    )
+
+
 def pin_protected_provider_identity(
     candidate: dict[str, Any], current: dict[str, Any]
 ) -> tuple[dict[str, Any], list[str]]:
@@ -575,6 +607,7 @@ ENDPOINT_KEYS = {
     "models": ("models_path", "/models"),
     "responses": ("responses_path", "/responses"),
     "messages": ("messages_path", "/v1/messages"),
+    "chat": ("chat_path", "/v1/chat/completions"),
 }
 
 
@@ -1076,15 +1109,27 @@ def response_shape_problem(body: Any, text: str, protocol: str = "responses") ->
     if not isinstance(body, dict):
         head = (text or "").strip()[:80].replace("\n", " ")
         if head.lower().startswith(("<!doctype", "<html")):
+            if protocol == "messages":
+                return (
+                    "上游返回的是 HTML 网页（打到了网站首页）而不是 API 结果。"
+                    "两种可能：Anthropic Messages 路径写错了（试试 /v1/messages），"
+                    "或者这家网关根本不提供 Anthropic 端点、只支持 OpenAI Chat Completions"
+                    "——这种网关无法在 Claude Desktop 里直接使用"
+                )
             return (
                 "上游返回的是 HTML 网页而不是 API 结果，"
-                "通常说明 Responses 路径写错了（比如少了 /v1）"
+                "通常说明 Responses 路径写错了（比如少了 /v1）；"
+                "如果各路径都如此，这家网关可能只支持 OpenAI Chat Completions"
             )
         return f"上游返回的不是 JSON 对象：{head!r}"
     if protocol == "messages":
         if body.get("type") == "message" or "content" in body:
             return None
         return f"返回的 JSON 不像 Anthropic message，顶层键：{sorted(body)[:6]}"
+    if protocol == "chat":
+        if isinstance(body.get("choices"), list):
+            return None
+        return f"返回的 JSON 不像 Chat Completions 结果，顶层键：{sorted(body)[:6]}"
     if body.get("object") == "response":
         return None
     if any(field in body for field in ("output", "output_text", "status", "id")):
@@ -1104,6 +1149,10 @@ def probe_protocol(provider: dict[str, Any]) -> str:
     """
     if uses_responses_to_anthropic_messages(provider):
         return "messages"
+    if uses_responses_to_chat_completions(provider):
+        return "chat"
+    if uses_messages_to_chat_completions(provider):
+        return "chat"
     supported = [p for p in (provider.get("protocols") or ["responses"]) if p in PROTOCOLS]
     if not supported:
         supported = ["responses"]
@@ -1121,9 +1170,18 @@ def probe_request(
 ) -> tuple[str, dict[str, Any], dict[str, str], str]:
     """(url, payload, extra headers, protocol) for one minimal completion."""
     protocol = probe_protocol(provider)
-    if protocol == "messages":
-        url = endpoint_url(provider, "messages")
+    if protocol == "chat":
+        url = endpoint_url(provider, "chat")
         payload: dict[str, Any] = {
+            "model": model,
+            "max_tokens": max_tokens,
+            "stream": False,
+            "messages": [{"role": "user", "content": prompt}],
+        }
+        extra = {}
+    elif protocol == "messages":
+        url = endpoint_url(provider, "messages")
+        payload = {
             "model": model,
             "max_tokens": max_tokens,
             "stream": False,
@@ -1178,8 +1236,14 @@ def test_model(
         key = ""
     detail = ""
     if not 200 <= status < 300:
+        head_probe = (text or "").strip()[:200].lower()
         if isinstance(body, dict):
             detail = json.dumps(body, ensure_ascii=False, separators=(",", ":"))[:1500]
+        elif head_probe.startswith(("<!doctype", "<html")):
+            # Dumping a gateway's HTML homepage into the failure dialog told the user
+            # nothing; the shape checker's protocol-aware explanation does.
+            hint = response_shape_problem(None, text, protocol) or "上游返回了 HTML 网页"
+            detail = f"HTTP {status}：{hint}"
         else:
             detail = text[:1500]
         detail = _redact_text(detail, [redaction_key])
@@ -1449,6 +1513,9 @@ def validate_provider(
     provider["messages_path"] = normalize_path(
         str(provider.get("messages_path") or "/v1/messages"), "/v1/messages"
     )
+    provider["chat_path"] = normalize_path(
+        str(provider.get("chat_path") or "/v1/chat/completions"), "/v1/chat/completions"
+    )
     protocols = provider.get("protocols")
     if protocols is None:
         # Existing entries predate the Claude side and are all Responses gateways; assuming
@@ -1476,6 +1543,31 @@ def validate_provider(
     if home not in WORKSPACES:
         raise ValueError(f"Provider {provider_id!r} has an unknown workspace: {home!r}")
     provider["workspace"] = home
+    adapter = str(provider.get("request_adapter") or "").strip()
+    if adapter not in ("",) + REQUEST_ADAPTERS:
+        raise ValueError(
+            f"Provider {provider_id!r} has an unknown request_adapter: {adapter!r}"
+        )
+    provider["request_adapter"] = adapter
+    if (
+        adapter == MESSAGES_TO_CHAT_COMPLETIONS_ADAPTER
+        and "messages" not in provider["protocols"]
+    ):
+        # Mirror of the responses-bridge rule: without the messages protocol there is no
+        # Messages client for this bridge to translate, and a Responses client would
+        # receive a mangled body.
+        raise ValueError(
+            f"Provider {provider_id!r}: the Chat Completions bridge for Claude Desktop "
+            "needs the 'messages' protocol"
+        )
+    if adapter == RESPONSES_TO_CHAT_COMPLETIONS_ADAPTER and "responses" not in provider["protocols"]:
+        # The bridge translates Responses (the Codex App's wire protocol) into Chat
+        # Completions; without the responses protocol on the client side there is nothing
+        # for it to translate, and a Messages client would receive a mangled body.
+        raise ValueError(
+            f"Provider {provider_id!r}: the Chat Completions bridge needs the "
+            "'responses' protocol (it serves the Codex App side)"
+        )
     provider["auth_type"] = str(provider.get("auth_type") or "dpapi")
     raw_auth_header = str(provider.get("auth_header") or "Authorization")
     if _has_forbidden_header_control(raw_auth_header):

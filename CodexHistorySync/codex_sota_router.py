@@ -187,6 +187,8 @@ LOG_MAX_BYTES = 8 * 1024 * 1024
 # talks Responses to the local router and keeps the normal `juno--...` model slugs; only
 # that provider's outbound request is translated to the Anthropic Messages API.
 JUSTDOWORK_ADAPTER = "responses_to_anthropic_messages"
+CHAT_COMPLETIONS_ADAPTER = "responses_to_chat_completions"
+MESSAGES_TO_CHAT_COMPLETIONS_ADAPTER = "messages_to_chat_completions"
 JUSTDOWORK_CODEX_USER_AGENT = (
     "codex_cli_rs/0.144.1 (Windows 11.0.26200; x86_64) WindowsTerminal"
 )
@@ -209,6 +211,31 @@ def is_juno_adapter(provider: dict[str, Any]) -> bool:
     return (
         str(provider.get("id") or "").lower() == "juno"
         and provider.get("request_adapter") == JUSTDOWORK_ADAPTER
+    )
+
+
+def is_messages_to_chat_adapter(provider: dict[str, Any]) -> bool:
+    """Whether this provider is an OpenAI-Chat-only gateway bridged for Claude Desktop.
+
+    Mirror of the responses bridge: Anthropic Messages in, Chat Completions out, and the
+    gateway's answer translated back into Anthropic SSE.
+    """
+    return (
+        str(provider.get("request_adapter") or "").strip()
+        == MESSAGES_TO_CHAT_COMPLETIONS_ADAPTER
+    )
+
+
+def is_chat_completions_adapter(provider: dict[str, Any]) -> bool:
+    """Whether this provider is an OpenAI-Chat-only gateway bridged for the Codex App.
+
+    Not id-gated: the whole point is that any such vendor can be configured this way.  The
+    bridge translates Responses (the Codex App's protocol) into Chat Completions requests
+    and the gateway's answers back into Responses streams.
+    """
+    return (
+        str(provider.get("request_adapter") or "").strip()
+        == CHAT_COMPLETIONS_ADAPTER
     )
 
 
@@ -506,6 +533,390 @@ def _response_tool_kinds(tools: Any) -> dict[str, str]:
     return mapping
 
 
+def _chat_tool_definitions(tools: Any) -> list[dict[str, Any]]:
+    """Flatten Responses function/namespace/custom tools into Chat Completions tools.
+
+    The same shapes the Messages adapter handles: namespace tools carry leaf functions,
+    custom tools (a free-form string input) are expressed as one required string field
+    named ``input`` so the response side can unwrap them again.
+    """
+    result: list[dict[str, Any]] = []
+
+    def append_function(fn: dict[str, Any]) -> None:
+        name = fn.get("name")
+        if not isinstance(name, str) or not name:
+            return
+        schema = fn.get("parameters")
+        if not isinstance(schema, dict):
+            schema = fn.get("inputSchema")
+        if not isinstance(schema, dict):
+            schema = fn.get("input_schema")
+        if not isinstance(schema, dict):
+            schema = {"type": "object", "properties": {}}
+        result.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": str(fn.get("description") or ""),
+                    "parameters": schema,
+                },
+            }
+        )
+
+    def append_custom(fn: dict[str, Any]) -> None:
+        name = fn.get("name")
+        if not isinstance(name, str) or not name:
+            return
+        description = str(fn.get("description") or "")
+        tool_format = fn.get("format")
+        if isinstance(tool_format, dict):
+            format_type = str(tool_format.get("type") or "")
+            if format_type == "grammar":
+                syntax = str(tool_format.get("syntax") or "text")
+                definition = tool_format.get("definition")
+                if isinstance(definition, str) and definition:
+                    description = f"{description}\nInput format: {syntax} grammar.\n{definition}".strip()
+            elif format_type == "text":
+                description = f"{description}\nInput is unconstrained text.".strip()
+        result.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": (
+                        f"{description}\nPass the custom tool input as the single string field `input`."
+                    ).strip(),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"input": {"type": "string"}},
+                        "required": ["input"],
+                        "additionalProperties": False,
+                    },
+                },
+            }
+        )
+
+    if not isinstance(tools, list):
+        return result
+    for item in tools:
+        if not isinstance(item, dict):
+            continue
+        kind = item.get("type")
+        if kind == "function":
+            fn = item.get("function") if isinstance(item.get("function"), dict) else item
+            append_function(fn)
+        elif kind == "namespace":
+            nested = item.get("tools")
+            if not isinstance(nested, list):
+                continue
+            for nested_item in nested:
+                if not isinstance(nested_item, dict):
+                    continue
+                nested_kind = nested_item.get("type")
+                fn = nested_item.get("function")
+                if nested_kind == "custom":
+                    append_custom(nested_item)
+                elif nested_kind in {None, "function"}:
+                    append_function(fn if isinstance(fn, dict) else nested_item)
+        elif kind == "custom":
+            append_custom(item)
+        elif kind == "function_call":
+            fn = item.get("function") if isinstance(item.get("function"), dict) else item
+            append_function(fn)
+    return result
+
+
+def _anthropic_content_to_chat_parts(content: Any) -> tuple[str, list[dict[str, Any]]]:
+    """Split one Anthropic message content into (plain text, image parts)."""
+    text_parts: list[str] = []
+    parts: list[dict[str, Any]] = []
+    if isinstance(content, str):
+        return content, parts
+    items = content if isinstance(content, list) else [content]
+    for item in items:
+        if isinstance(item, str):
+            text_parts.append(item)
+            continue
+        if not isinstance(item, dict):
+            continue
+        kind = item.get("type")
+        if kind == "text":
+            text_parts.append(str(item.get("text") or ""))
+        elif kind == "image" and isinstance(item.get("source"), dict):
+            source = item["source"]
+            if source.get("type") == "base64" and source.get("data"):
+                media = str(source.get("media_type") or "image/png")
+                parts.append(
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:{media};base64,{source['data']}"},
+                    }
+                )
+            elif source.get("type") == "url" and source.get("url"):
+                parts.append({"type": "image_url", "image_url": {"url": str(source["url"])}})
+    return "\n".join(piece for piece in text_parts if piece), parts
+
+
+def _chat_tools_from_anthropic(tools: Any) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    if not isinstance(tools, list):
+        return result
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        name = tool.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+        schema = tool.get("input_schema")
+        if not isinstance(schema, dict):
+            schema = {"type": "object", "properties": {}}
+        result.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": str(tool.get("description") or ""),
+                    "parameters": schema,
+                },
+            }
+        )
+    return result
+
+
+def messages_to_chat_payload(payload: dict[str, Any], upstream_model: str) -> dict[str, Any]:
+    """Translate one Anthropic Messages request into an OpenAI Chat Completions request.
+
+    Thinking budgets are deliberately not forwarded: there is no faithful budget -> effort
+    mapping and a wrong guess would either be ignored or rejected; these chat models reason
+    by themselves.  Claude Desktop's slider therefore has no effect through this bridge.
+    """
+    messages: list[dict[str, Any]] = []
+    system = payload.get("system")
+    if system is not None:
+        text, _parts = _anthropic_content_to_chat_parts(system)
+        if text:
+            messages.append({"role": "system", "content": text})
+
+    source_messages = payload.get("messages") if isinstance(payload.get("messages"), list) else []
+    for message in source_messages:
+        if not isinstance(message, dict):
+            continue
+        role = str(message.get("role") or "user")
+        content = message.get("content")
+        items = content if isinstance(content, list) else [content]
+        text, image_parts = _anthropic_content_to_chat_parts(content)
+        tool_uses = [item for item in items if isinstance(item, dict) and item.get("type") == "tool_use"]
+        tool_results = [item for item in items if isinstance(item, dict) and item.get("type") == "tool_result"]
+
+        if role == "assistant":
+            entry: dict[str, Any] = {"role": "assistant", "content": text or None}
+            if tool_uses:
+                entry["tool_calls"] = [
+                    {
+                        "id": str(use.get("id") or f"call_{index}"),
+                        "type": "function",
+                        "function": {
+                            "name": str(use.get("name") or "tool"),
+                            "arguments": json.dumps(
+                                use.get("input") if isinstance(use.get("input"), dict) else {},
+                                ensure_ascii=False,
+                                separators=(",", ":"),
+                            ),
+                        },
+                    }
+                    for index, use in enumerate(tool_uses)
+                ]
+            messages.append(entry)
+            continue
+
+        # user role: tool results become their own tool messages, everything else is a
+        # normal user turn.  Anthropic requires tool_result blocks to lead the message.
+        if tool_results:
+            for result in tool_results:
+                result_content = result.get("content")
+                result_text, _ = _anthropic_content_to_chat_parts(result_content)
+                if not result_text and isinstance(result_content, str):
+                    result_text = result_content
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": str(result.get("tool_use_id") or ""),
+                        "content": result_text,
+                    }
+                )
+            if text:
+                messages.append({"role": "user", "content": text})
+            continue
+        if image_parts:
+            messages.append(
+                {"role": "user", "content": ([{"type": "text", "text": text}] if text else []) + image_parts}
+            )
+        else:
+            messages.append({"role": "user", "content": text})
+
+    if not messages:
+        messages.append({"role": "user", "content": ""})
+
+    result: dict[str, Any] = {
+        "model": upstream_model,
+        "messages": messages,
+        "max_tokens": max(1, int(payload.get("max_tokens") or 4096)),
+        "stream": bool(payload.get("stream")),
+    }
+    if payload.get("stream"):
+        result["stream_options"] = {"include_usage": True}
+    for key in ("temperature", "top_p"):
+        if payload.get(key) is not None:
+            result[key] = payload[key]
+    stop_sequences = payload.get("stop_sequences")
+    if isinstance(stop_sequences, list) and stop_sequences:
+        result["stop"] = stop_sequences
+    tools = _chat_tools_from_anthropic(payload.get("tools"))
+    if tools:
+        result["tools"] = tools
+        choice = payload.get("tool_choice")
+        if isinstance(choice, dict):
+            kind = str(choice.get("type") or "auto")
+            if kind == "any":
+                result["tool_choice"] = "required"
+            elif kind == "tool" and choice.get("name"):
+                result["tool_choice"] = {
+                    "type": "function",
+                    "function": {"name": str(choice["name"])},
+                }
+            elif kind == "none":
+                result.pop("tools", None)
+            else:
+                result["tool_choice"] = "auto"
+        else:
+            result["tool_choice"] = "auto"
+    return result
+
+
+def responses_to_chat_payload(payload: dict[str, Any], upstream_model: str) -> dict[str, Any]:
+    """Translate one Codex Responses request into an OpenAI Chat Completions request."""
+    messages: list[dict[str, Any]] = []
+    instructions = payload.get("instructions")
+    if instructions:
+        text = _text_from_content(instructions)
+        if text:
+            messages.append({"role": "system", "content": text})
+
+    input_value = payload.get("input", "")
+    input_items = input_value if isinstance(input_value, list) else [input_value]
+    for item in input_items:
+        if isinstance(item, str):
+            messages.append({"role": "user", "content": item})
+            continue
+        if not isinstance(item, dict):
+            continue
+        kind = str(item.get("type") or "")
+        role = str(item.get("role") or "user")
+        if kind == "message":
+            text = _text_from_content(item.get("content"))
+            if role in {"developer", "system"}:
+                if text:
+                    messages.append({"role": "system", "content": text})
+            else:
+                messages.append(
+                    {"role": "assistant" if role == "assistant" else "user", "content": text}
+                )
+        elif kind in {"input_text", "text"}:
+            messages.append({"role": "user", "content": str(item.get("text") or "")})
+        elif kind in {"function_call", "custom_tool_call", "tool_use"}:
+            name = str(item.get("name") or "tool")
+            arguments = item.get("arguments", item.get("input", "{}"))
+            if not isinstance(arguments, str):
+                arguments = json.dumps(arguments, ensure_ascii=False, separators=(",", ":"))
+            call_id = str(item.get("call_id") or item.get("id") or "call_unknown")
+            if kind == "custom_tool_call":
+                arguments = json.dumps({"input": arguments}, ensure_ascii=False)
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": call_id,
+                            "type": "function",
+                            "function": {"name": name, "arguments": arguments},
+                        }
+                    ],
+                }
+            )
+        elif kind in {"function_call_output", "custom_tool_call_output", "tool_result"}:
+            output = item.get("output", item.get("content", ""))
+            if not isinstance(output, str):
+                output = json.dumps(output, ensure_ascii=False, separators=(",", ":"))
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": str(
+                        item.get("call_id") or item.get("tool_use_id") or item.get("id") or ""
+                    ),
+                    "content": output,
+                }
+            )
+        elif kind == "reasoning":
+            # Chat Completions has no reasoning replay channel; summaries are advisory and
+            # safe to drop (the upstream never sees a plain text echo of its own thoughts).
+            continue
+        elif "content" in item:
+            text = _text_from_content(item["content"])
+            messages.append(
+                {"role": "assistant" if role == "assistant" else "user", "content": text}
+            )
+
+    if not messages:
+        messages.append({"role": "user", "content": ""})
+
+    max_tokens = max(
+        1, int(payload.get("max_output_tokens") or payload.get("max_tokens") or 4096)
+    )
+    result: dict[str, Any] = {
+        "model": upstream_model,
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "stream": bool(payload.get("stream")),
+    }
+    if payload.get("stream"):
+        # Without this most gateways omit usage from the stream entirely; harmless where
+        # the field is ignored.
+        result["stream_options"] = {"include_usage": True}
+    reasoning = payload.get("reasoning")
+    if isinstance(reasoning, dict):
+        effort = str(reasoning.get("effort") or "").strip().lower()
+        if effort and effort != "none":
+            result["reasoning_effort"] = effort
+    for key in ("temperature", "top_p", "presence_penalty", "frequency_penalty"):
+        if key in payload and payload[key] is not None:
+            result[key] = payload[key]
+    stop = payload.get("stop")
+    if stop is not None:
+        result["stop"] = stop if isinstance(stop, list) else [stop]
+    tools = _chat_tool_definitions(_response_tools(payload))
+    if tools:
+        result["tools"] = tools
+        choice = payload.get("tool_choice")
+        if choice == "none":
+            result.pop("tools", None)
+        elif choice == "required":
+            result["tool_choice"] = "required"
+        elif isinstance(choice, dict):
+            name = choice.get("name")
+            if not name and isinstance(choice.get("function"), dict):
+                name = choice["function"].get("name")
+            result["tool_choice"] = (
+                {"type": "function", "function": {"name": str(name)}}
+                if name
+                else "auto"
+            )
+        else:
+            result["tool_choice"] = "auto"
+    return result
+
+
 def responses_to_anthropic_payload(payload: dict[str, Any], upstream_model: str) -> dict[str, Any]:
     """Translate one Codex Responses request to the provider's Messages shape."""
     messages: list[dict[str, Any]] = []
@@ -650,6 +1061,181 @@ def _response_usage(usage: Any) -> dict[str, int]:
         "output_tokens": max(0, output_tokens),
         "total_tokens": max(0, input_tokens + output_tokens),
     }
+
+
+_CHAT_STOP_REASONS_TO_ANTHROPIC = {
+    "stop": "end_turn",
+    "length": "max_tokens",
+    "tool_calls": "tool_use",
+    "function_call": "tool_use",
+    "content_filter": "end_turn",
+}
+
+
+def chat_completion_to_anthropic_message(
+    completion: dict[str, Any], model: str = ""
+) -> dict[str, Any]:
+    """Translate one Chat Completions response into an Anthropic Messages object.
+
+    Reasoning output is intentionally dropped: Anthropic thinking blocks carry a
+    ``signature`` this bridge cannot produce, and an unsigned block risks the client
+    rejecting the whole answer.  The visible text is what the user asked for.
+    """
+    choices = completion.get("choices") if isinstance(completion.get("choices"), list) else []
+    choice = choices[0] if choices and isinstance(choices[0], dict) else {}
+    message = choice.get("message") if isinstance(choice.get("message"), dict) else {}
+    content: list[dict[str, Any]] = []
+    text = message.get("content")
+    if isinstance(text, str) and text:
+        content.append({"type": "text", "text": text})
+    tool_calls = message.get("tool_calls") if isinstance(message.get("tool_calls"), list) else []
+    for index, call in enumerate(tool_calls):
+        if not isinstance(call, dict):
+            continue
+        function = call.get("function") if isinstance(call.get("function"), dict) else {}
+        arguments = function.get("arguments")
+        try:
+            parsed = json.loads(arguments) if isinstance(arguments, str) and arguments else {}
+        except (ValueError, TypeError):
+            parsed = {"raw_arguments": arguments}
+        if not isinstance(parsed, dict):
+            parsed = {"value": parsed}
+        content.append(
+            {
+                "type": "tool_use",
+                "id": str(call.get("id") or f"toolu_{index}"),
+                "name": str(function.get("name") or "tool"),
+                "input": parsed,
+            }
+        )
+    if not content:
+        content.append({"type": "text", "text": ""})
+    usage = completion.get("usage") if isinstance(completion.get("usage"), dict) else {}
+    # Anthropic's contract: a message carrying tool_use blocks stops with reason
+    # "tool_use".  Gateways are inconsistent here (many report finish_reason "stop"
+    # even when they emitted tool calls), and clients that gate on the stop reason
+    # would silently never run the tool.
+    has_tool_use = any(block.get("type") == "tool_use" for block in content)
+    stop_reason = _CHAT_STOP_REASONS_TO_ANTHROPIC.get(
+        str(choice.get("finish_reason") or ""), "end_turn"
+    )
+    if has_tool_use:
+        stop_reason = "tool_use"
+    return {
+        "id": "msg_" + str(completion.get("id") or int(time.time() * 1000)).removeprefix("chatcmpl-"),
+        "type": "message",
+        "role": "assistant",
+        "model": model or str(completion.get("model") or ""),
+        "content": content,
+        "stop_reason": stop_reason,
+        "stop_sequence": None,
+        "usage": {
+            "input_tokens": int(usage.get("prompt_tokens") or 0),
+            "output_tokens": int(usage.get("completion_tokens") or 0),
+        },
+    }
+
+
+def chat_message_to_response(
+    completion: dict[str, Any],
+    model: str = "",
+    tool_namespaces: dict[str, str] | None = None,
+    tool_kinds: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Translate one Chat Completions response into a Responses-API object."""
+    choices = completion.get("choices") if isinstance(completion.get("choices"), list) else []
+    choice = choices[0] if choices and isinstance(choices[0], dict) else {}
+    message = choice.get("message") if isinstance(choice.get("message"), dict) else {}
+    finish_reason = str(choice.get("finish_reason") or "")
+    response_id = "resp_" + str(
+        completion.get("id") or int(time.time() * 1000)
+    ).removeprefix("chatcmpl-")
+    output: list[dict[str, Any]] = []
+    text_parts: list[str] = []
+
+    reasoning = message.get("reasoning_content")
+    if not (isinstance(reasoning, str) and reasoning):
+        # Gateways disagree on the name; some relays use a plain "reasoning".
+        reasoning = message.get("reasoning")
+    if isinstance(reasoning, str) and reasoning:
+        output.append(
+            {
+                "id": f"rs_{response_id.removeprefix('resp_')}_0",
+                "type": "reasoning",
+                "summary": [{"type": "summary_text", "text": reasoning}],
+            }
+        )
+    content = message.get("content")
+    if isinstance(content, str) and content:
+        text_parts.append(content)
+        output.append(
+            {
+                "id": f"msg_{response_id.removeprefix('resp_')}_0",
+                "type": "message",
+                "status": "completed",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": content, "annotations": []}],
+            }
+        )
+    tool_calls = message.get("tool_calls") if isinstance(message.get("tool_calls"), list) else []
+    for index, call in enumerate(tool_calls):
+        if not isinstance(call, dict):
+            continue
+        function = call.get("function") if isinstance(call.get("function"), dict) else {}
+        tool_name = str(function.get("name") or "tool")
+        arguments = function.get("arguments")
+        arguments = arguments if isinstance(arguments, str) else json.dumps(
+            arguments or {}, ensure_ascii=False, separators=(",", ":")
+        )
+        call_id = str(call.get("id") or f"call_{index}")
+        namespace = (tool_namespaces or {}).get(tool_name, "")
+        is_custom = (tool_kinds or {}).get(tool_name) == "custom"
+        if is_custom:
+            try:
+                parsed = json.loads(arguments)
+                custom_input = parsed.get("input", arguments) if isinstance(parsed, dict) else arguments
+            except (ValueError, TypeError):
+                custom_input = arguments
+            if not isinstance(custom_input, str):
+                custom_input = json.dumps(custom_input, ensure_ascii=False, separators=(",", ":"))
+            item: dict[str, Any] = {
+                "id": f"ctc_{response_id.removeprefix('resp_')}_{index}",
+                "type": "custom_tool_call",
+                "status": "completed",
+                "call_id": call_id,
+                "name": tool_name,
+                "input": custom_input,
+            }
+        else:
+            item = {
+                "id": f"fc_{response_id.removeprefix('resp_')}_{index}",
+                "type": "function_call",
+                "status": "completed",
+                "call_id": call_id,
+                "name": tool_name,
+                "arguments": arguments,
+            }
+        if namespace:
+            item["namespace"] = namespace
+        output.append(item)
+
+    usage = _response_usage(completion.get("usage"))
+    status = "incomplete" if finish_reason == "length" else "completed"
+    result: dict[str, Any] = {
+        "id": response_id,
+        "object": "response",
+        "created_at": int(completion.get("created") or time.time()),
+        "model": model or str(completion.get("model") or ""),
+        "status": status,
+        "output": output,
+        "parallel_tool_calls": True,
+        "tool_choice": "auto",
+        "output_text": "".join(text_parts),
+        "usage": usage,
+    }
+    if status == "incomplete":
+        result["incomplete_details"] = {"reason": "max_output_tokens"}
+    return result
 
 
 def anthropic_message_to_response(
@@ -986,6 +1572,621 @@ def response_to_sse(response: dict[str, Any]) -> list[bytes]:
     )
     events.append(b"data: [DONE]\n\n")
     return events
+
+
+def chat_sse_to_anthropic_sse(
+    upstream: Any,
+    model: str,
+    outcome: dict[str, Any] | None = None,
+) -> Any:
+    """Yield Anthropic Messages SSE events while consuming a Chat Completions stream.
+
+    Completion evidence is ``[DONE]`` or a non-null ``finish_reason``; without either the
+    stream is truncated and ``outcome`` says so, so the caller fails the turn instead of
+    pretending a half-answer is complete.
+    """
+    message_id = "msg_" + str(int(time.time() * 1000))
+    response_model = model
+    started = False
+    saw_completion = False
+    stop_reason = "end_turn"
+    usage: dict[str, int] = {}
+    next_block_index = 0
+    text_block: int | None = None
+    open_tool_blocks: dict[int, int] = {}
+
+    def message_start() -> bytes:
+        nonlocal started
+        started = True
+        return _sse_frame(
+            "message_start",
+            {
+                "type": "message_start",
+                "message": {
+                    "id": message_id,
+                    "type": "message",
+                    "role": "assistant",
+                    "model": response_model,
+                    "content": [],
+                    "stop_reason": None,
+                    "stop_sequence": None,
+                    "usage": {"input_tokens": 0, "output_tokens": 0},
+                },
+            },
+            None,
+        )
+
+    with upstream:
+        while True:
+            line = upstream.readline()
+            if not line:
+                break
+            decoded = line.decode("utf-8", "replace").rstrip("\r\n")
+            if not decoded.startswith("data:"):
+                continue
+            raw_payload = decoded[5:].strip()
+            if not raw_payload:
+                continue
+            if raw_payload == "[DONE]":
+                saw_completion = True
+                continue
+            try:
+                data = json.loads(raw_payload)
+            except (ValueError, TypeError):
+                continue
+            if not isinstance(data, dict):
+                continue
+            if data.get("usage"):
+                usage.update(data.get("usage") or {})
+            if data.get("model"):
+                response_model = str(data.get("model"))
+            choices = data.get("choices") if isinstance(data.get("choices"), list) else []
+            if not choices:
+                continue
+            choice = choices[0] if isinstance(choices[0], dict) else {}
+            finish = str(choice.get("finish_reason") or "")
+            if finish:
+                saw_completion = True
+                stop_reason = _CHAT_STOP_REASONS_TO_ANTHROPIC.get(finish, "end_turn")
+            delta = choice.get("delta") if isinstance(choice.get("delta"), dict) else {}
+            text = delta.get("content")
+            if isinstance(text, str) and text:
+                if not started:
+                    yield message_start()
+                if text_block is None:
+                    text_block = next_block_index
+                    next_block_index += 1
+                    yield _sse_frame(
+                        "content_block_start",
+                        {
+                            "type": "content_block_start",
+                            "index": text_block,
+                            "content_block": {"type": "text", "text": ""},
+                        },
+                        None,
+                    )
+                yield _sse_frame(
+                    "content_block_delta",
+                    {
+                        "type": "content_block_delta",
+                        "index": text_block,
+                        "delta": {"type": "text_delta", "text": text},
+                    },
+                    None,
+                )
+            tool_deltas = delta.get("tool_calls")
+            if isinstance(tool_deltas, list):
+                for fragment in tool_deltas:
+                    if not isinstance(fragment, dict):
+                        continue
+                    index = int(fragment.get("index") or 0)
+                    function = fragment.get("function") if isinstance(fragment.get("function"), dict) else {}
+                    if index not in open_tool_blocks:
+                        if not started:
+                            yield message_start()
+                        block_index = next_block_index
+                        next_block_index += 1
+                        open_tool_blocks[index] = block_index
+                        yield _sse_frame(
+                            "content_block_start",
+                            {
+                                "type": "content_block_start",
+                                "index": block_index,
+                                "content_block": {
+                                    "type": "tool_use",
+                                    "id": str(fragment.get("id") or f"toolu_{index}"),
+                                    "name": str(function.get("name") or "tool"),
+                                    "input": {},
+                                },
+                            },
+                            None,
+                        )
+                    arguments_fragment = function.get("arguments")
+                    if isinstance(arguments_fragment, str) and arguments_fragment:
+                        yield _sse_frame(
+                            "content_block_delta",
+                            {
+                                "type": "content_block_delta",
+                                "index": open_tool_blocks[index],
+                                "delta": {
+                                    "type": "input_json_delta",
+                                    "partial_json": arguments_fragment,
+                                },
+                            },
+                            None,
+                        )
+
+        if not started and not saw_completion:
+            # Nothing observable and no completion evidence: zero-content death, retryable.
+            if outcome is not None:
+                outcome["retryable"] = True
+            return
+        if not started:
+            yield message_start()
+        # Close every open block, text first, then the terminal delta.
+        stop_order = sorted(
+            [index for index in [text_block, *open_tool_blocks.values()] if index is not None]
+        )
+        for index in stop_order:
+            yield _sse_frame(
+                "content_block_stop", {"type": "content_block_stop", "index": index}, None
+            )
+        if saw_completion:
+            if open_tool_blocks and stop_reason == "end_turn":
+                # Same contract as the non-stream path: tool_use blocks mean the turn
+                # stopped to run a tool, whatever inconsistent finish_reason the gateway
+                # reported.
+                stop_reason = "tool_use"
+            yield _sse_frame(
+                "message_delta",
+                {
+                    "type": "message_delta",
+                    "delta": {"stop_reason": stop_reason, "stop_sequence": None},
+                    "usage": {
+                        "input_tokens": int(usage.get("prompt_tokens") or 0),
+                        "output_tokens": int(usage.get("completion_tokens") or 0),
+                    },
+                },
+                None,
+            )
+            yield _sse_frame("message_stop", {"type": "message_stop"}, None)
+        else:
+            if outcome is not None:
+                outcome["truncated"] = True
+            yield _sse_frame(
+                "error",
+                {
+                    "type": "error",
+                    "error": {
+                        "type": "upstream_stream_truncated",
+                        "message": "上游截断了响应流（未收到完成事件）",
+                    },
+                },
+                None,
+            )
+
+
+def chat_sse_to_responses(
+    upstream: Any,
+    model: str,
+    tool_namespaces: dict[str, str] | None = None,
+    tool_kinds: dict[str, str] | None = None,
+    outcome: dict[str, Any] | None = None,
+) -> Any:
+    """Yield Responses SSE frames while consuming an OpenAI Chat Completions SSE stream.
+
+    Completion evidence is ``[DONE]`` or a non-null ``finish_reason``; a stream that ends
+    with neither is truncated, which ``outcome`` reports so the caller can record a failure
+    and the client receives a terminal ``response.failed`` instead of a silent close.
+    """
+    response_id = "resp_" + str(int(time.time() * 1000))
+    response_model = model
+    output: list[dict[str, Any]] = []
+    text_buffers: dict[str, str] = {}
+    usage: dict[str, int] = {}
+    created_sent = False
+    completed_sent = False
+    saw_completion = False
+    # Tool calls stream as indexed fragments; the wire format gives the id and the name in
+    # the first fragment of each index and argument fragments after it.
+    tool_items: dict[int, dict[str, Any]] = {}
+
+    def ensure_created() -> bytes:
+        nonlocal created_sent
+        if created_sent:
+            return b""
+        created_sent = True
+        response = {
+            "id": response_id, "object": "response", "created_at": int(time.time()),
+            "model": response_model, "status": "in_progress", "output": [],
+            "parallel_tool_calls": True, "tool_choice": "auto", "usage": None,
+        }
+        return _sse_frame(
+            "response.created",
+            {"type": "response.created", "response": response},
+            response_id,
+        )
+
+    def ensure_text_item() -> tuple[dict[str, Any] | None, bytes]:
+        """Lazily materialize the assistant message item on the first visible text."""
+        nonlocal created_sent
+        item = text_items.get("main")
+        if item is not None:
+            return item, b""
+        item = {
+            "id": response_id.replace("resp_", "msg_", 1),
+            "type": "message",
+            "status": "in_progress",
+            "role": "assistant",
+            "content": [],
+        }
+        output.append(item)
+        text_items["main"] = item
+        text_buffers["main"] = ""
+        output_index = len(output) - 1
+        item["_output_index"] = output_index
+        item["content"].append({"type": "output_text", "text": "", "annotations": []})
+        frames = ensure_created()
+        frames += _sse_frame(
+            "response.output_item.added",
+            {
+                "type": "response.output_item.added",
+                "output_index": output_index,
+                "item": {k: v for k, v in item.items() if not k.startswith("_")},
+            },
+            response_id,
+        )
+        frames += _sse_frame(
+            "response.content_part.added",
+            {
+                "type": "response.content_part.added",
+                "item_id": item["id"],
+                "output_index": output_index,
+                "content_index": 0,
+                "part": {"type": "output_text", "text": "", "annotations": []},
+            },
+            response_id,
+        )
+        return item, frames
+
+    def ensure_reasoning_item() -> tuple[dict[str, Any], bytes]:
+        item = reasoning_item.get("main")
+        if item is not None:
+            return item, b""
+        item = {"id": f"rs_{response_id.removeprefix('resp_')}_r", "type": "reasoning", "summary": []}
+        output.append(item)
+        reasoning_item["main"] = item
+        item["_output_index"] = len(output) - 1
+        item["summary"].append({"type": "summary_text", "text": ""})
+        text_buffers["reasoning"] = ""
+        frames = ensure_created()
+        frames += _sse_frame(
+            "response.output_item.added",
+            {
+                "type": "response.output_item.added",
+                "output_index": item["_output_index"],
+                "item": {"id": item["id"], "type": "reasoning", "summary": []},
+            },
+            response_id,
+        )
+        frames += _sse_frame(
+            "response.reasoning_summary_part.added",
+            {
+                "type": "response.reasoning_summary_part.added",
+                "item_id": item["id"],
+                "output_index": item["_output_index"],
+                "summary_index": 0,
+                "part": {"type": "summary_text", "text": ""},
+            },
+            response_id,
+        )
+        return item, frames
+
+    text_items: dict[str, dict[str, Any]] = {}
+    reasoning_item: dict[str, dict[str, Any]] = {}
+
+    def finish() -> bytes:
+        nonlocal completed_sent
+        if completed_sent:
+            return b""
+        completed_sent = True
+        clean_output = [
+            {k: v for k, v in item.items() if not k.startswith("_")} for item in output
+        ]
+        response = {
+            "id": response_id, "object": "response", "created_at": int(time.time()),
+            "model": response_model, "status": "completed", "output": clean_output,
+            "parallel_tool_calls": True, "tool_choice": "auto",
+            "output_text": "".join(text_buffers.values()),
+            "usage": _response_usage(usage),
+        }
+        return _sse_frame(
+            "response.completed",
+            {"type": "response.completed", "response": response},
+            response_id,
+        )
+
+    event_name = ""
+    data_lines: list[str] = []
+    with upstream:
+        while True:
+            line = upstream.readline()
+            if not line:
+                if data_lines:
+                    line = b"\n"
+                else:
+                    break
+            decoded = line.decode("utf-8", "replace").rstrip("\r\n")
+            if decoded:
+                if decoded.startswith("event:"):
+                    event_name = decoded[6:].strip()
+                elif decoded.startswith("data:"):
+                    data_lines.append(decoded[5:].lstrip())
+                continue
+            if not data_lines:
+                event_name = ""
+                continue
+            raw_payload = "\n".join(data_lines)
+            data_lines, event_name = [], ""
+            if raw_payload.strip() == "[DONE]":
+                saw_completion = True
+                continue
+            try:
+                data = json.loads(raw_payload)
+            except (ValueError, TypeError):
+                continue
+            if not isinstance(data, dict):
+                continue
+            if data.get("usage"):
+                usage.update(data.get("usage") or {})
+            if data.get("model"):
+                response_model = str(data.get("model"))
+            choices = data.get("choices") if isinstance(data.get("choices"), list) else []
+            if not choices:
+                continue
+            choice = choices[0] if isinstance(choices[0], dict) else {}
+            if choice.get("finish_reason"):
+                saw_completion = True
+            delta = choice.get("delta") if isinstance(choice.get("delta"), dict) else {}
+            reasoning_text = delta.get("reasoning_content")
+            if not (isinstance(reasoning_text, str) and reasoning_text):
+                reasoning_text = delta.get("reasoning")
+            if isinstance(reasoning_text, str) and reasoning_text:
+                item, frames = ensure_reasoning_item()
+                text_buffers["reasoning"] = text_buffers.get("reasoning", "") + reasoning_text
+                item["summary"][0]["text"] = text_buffers["reasoning"]
+                if frames:
+                    yield frames
+                yield _sse_frame(
+                    "response.reasoning_summary_text.delta",
+                    {
+                        "type": "response.reasoning_summary_text.delta",
+                        "item_id": item["id"],
+                        "output_index": item["_output_index"],
+                        "summary_index": 0,
+                        "delta": reasoning_text,
+                    },
+                    response_id,
+                )
+            content_text = delta.get("content")
+            if isinstance(content_text, str) and content_text:
+                item, frames = ensure_text_item()
+                if frames:
+                    yield frames
+                text_buffers["main"] = text_buffers.get("main", "") + content_text
+                item["content"][0]["text"] = text_buffers["main"]
+                yield _sse_frame(
+                    "response.output_text.delta",
+                    {
+                        "type": "response.output_text.delta",
+                        "item_id": item["id"],
+                        "output_index": item["_output_index"],
+                        "content_index": 0,
+                        "delta": content_text,
+                    },
+                    response_id,
+                )
+            tool_deltas = delta.get("tool_calls")
+            if isinstance(tool_deltas, list):
+                for fragment in tool_deltas:
+                    if not isinstance(fragment, dict):
+                        continue
+                    index = int(fragment.get("index") or 0)
+                    function = fragment.get("function") if isinstance(fragment.get("function"), dict) else {}
+                    record = tool_items.get(index)
+                    if record is None:
+                        tool_name = str(function.get("name") or "tool")
+                        call_id = str(fragment.get("id") or f"call_{response_id.removeprefix('resp_')}_{index}")
+                        is_custom = (tool_kinds or {}).get(tool_name) == "custom"
+                        item_id = f"{'ctc' if is_custom else 'fc'}_{response_id.removeprefix('resp_')}_{index}"
+                        if is_custom:
+                            item = {
+                                "id": item_id, "type": "custom_tool_call", "status": "in_progress",
+                                "call_id": call_id, "name": tool_name, "input": "",
+                            }
+                        else:
+                            item = {
+                                "id": item_id, "type": "function_call", "status": "in_progress",
+                                "call_id": call_id, "name": tool_name, "arguments": "",
+                            }
+                        namespace = (tool_namespaces or {}).get(tool_name)
+                        if namespace:
+                            item["namespace"] = namespace
+                        output.append(item)
+                        item["_output_index"] = len(output) - 1
+                        record = tool_items[index] = {
+                            "item": item, "custom": is_custom, "arguments": "",
+                            "name_known": bool(function.get("name")),
+                        }
+                        yield ensure_created()
+                        yield _sse_frame(
+                            "response.output_item.added",
+                            {
+                                "type": "response.output_item.added",
+                                "output_index": item["_output_index"],
+                                "item": {k: v for k, v in item.items() if not k.startswith("_")},
+                            },
+                            response_id,
+                        )
+                    item = record["item"]
+                    arguments_fragment = function.get("arguments")
+                    if not isinstance(arguments_fragment, str) or not arguments_fragment:
+                        continue
+                    record["arguments"] += arguments_fragment
+                    if record["custom"]:
+                        # Custom tools are bridged as {"input": <string>}; unwrap on the fly
+                        # when a fragment happens to be complete JSON, else pass it through.
+                        try:
+                            parsed = json.loads(arguments_fragment)
+                            piece = parsed.get("input", arguments_fragment) if isinstance(parsed, dict) else arguments_fragment
+                        except (ValueError, TypeError):
+                            piece = arguments_fragment
+                        if not isinstance(piece, str):
+                            piece = json.dumps(piece, ensure_ascii=False, separators=(",", ":"))
+                        item["input"] = str(item.get("input") or "") + piece
+                        yield _sse_frame(
+                            "response.custom_tool_call_input.delta",
+                            {
+                                "type": "response.custom_tool_call_input.delta",
+                                "item_id": item["id"],
+                                "output_index": item["_output_index"],
+                                "delta": piece,
+                            },
+                            response_id,
+                        )
+                    else:
+                        item["arguments"] = str(item.get("arguments") or "") + arguments_fragment
+                        yield _sse_frame(
+                            "response.function_call_arguments.delta",
+                            {
+                                "type": "response.function_call_arguments.delta",
+                                "item_id": item["id"],
+                                "output_index": item["_output_index"],
+                                "delta": arguments_fragment,
+                            },
+                            response_id,
+                        )
+
+        # Close every open item in order, then emit the terminal events.
+        for item in output:
+            output_index = item["_output_index"]
+            if item["type"] == "message":
+                buffer = text_buffers.get("main", "")
+                yield _sse_frame(
+                    "response.output_text.done",
+                    {
+                        "type": "response.output_text.done",
+                        "item_id": item["id"],
+                        "output_index": output_index,
+                        "content_index": 0,
+                        "text": buffer,
+                    },
+                    response_id,
+                )
+                yield _sse_frame(
+                    "response.content_part.done",
+                    {
+                        "type": "response.content_part.done",
+                        "item_id": item["id"],
+                        "output_index": output_index,
+                        "content_index": 0,
+                        "part": {"type": "output_text", "text": buffer, "annotations": []},
+                    },
+                    response_id,
+                )
+            elif item["type"] == "reasoning" and item.get("summary"):
+                buffer = text_buffers.get("reasoning", "")
+                yield _sse_frame(
+                    "response.reasoning_summary_text.done",
+                    {
+                        "type": "response.reasoning_summary_text.done",
+                        "item_id": item["id"],
+                        "output_index": output_index,
+                        "summary_index": 0,
+                        "text": buffer,
+                    },
+                    response_id,
+                )
+                yield _sse_frame(
+                    "response.reasoning_summary_part.done",
+                    {
+                        "type": "response.reasoning_summary_part.done",
+                        "item_id": item["id"],
+                        "output_index": output_index,
+                        "summary_index": 0,
+                        "part": {"type": "summary_text", "text": buffer},
+                    },
+                    response_id,
+                )
+            elif item["type"] == "function_call":
+                yield _sse_frame(
+                    "response.function_call_arguments.done",
+                    {
+                        "type": "response.function_call_arguments.done",
+                        "item_id": item["id"],
+                        "output_index": output_index,
+                        "arguments": item.get("arguments", ""),
+                    },
+                    response_id,
+                )
+            elif item["type"] == "custom_tool_call":
+                yield _sse_frame(
+                    "response.custom_tool_call_input.done",
+                    {
+                        "type": "response.custom_tool_call_input.done",
+                        "item_id": item["id"],
+                        "output_index": output_index,
+                        "input": item.get("input", ""),
+                    },
+                    response_id,
+                )
+            item["status"] = "completed"
+            yield _sse_frame(
+                "response.output_item.done",
+                {
+                    "type": "response.output_item.done",
+                    "output_index": output_index,
+                    "item": {k: v for k, v in item.items() if not k.startswith("_")},
+                },
+                response_id,
+            )
+
+        if not output and not saw_completion:
+            # Nothing observable was produced and the stream carries no completion
+            # evidence: a zero-content death the caller may retry invisibly.
+            if outcome is not None:
+                outcome["retryable"] = True
+            return
+        if not created_sent:
+            created = ensure_created()
+            if created:
+                yield created
+        if saw_completion:
+            final = finish()
+            if final:
+                yield final
+        else:
+            if outcome is not None:
+                outcome["truncated"] = True
+            yield _sse_frame(
+                "response.failed",
+                {
+                    "type": "response.failed",
+                    "response": {
+                        "id": response_id,
+                        "object": "response",
+                        "created_at": int(time.time()),
+                        "status": "failed",
+                        "error": {
+                            "code": "upstream_stream_truncated",
+                            "message": "上游截断了响应流（未收到完成事件）",
+                        },
+                        "output": [],
+                    },
+                },
+                response_id,
+            )
+        yield b"data: [DONE]\n\n"
 
 
 def anthropic_sse_to_responses(
@@ -2056,14 +3257,22 @@ class SotaRouterHandler(BaseHTTPRequestHandler):
 
     def _json_response(self, status: int, payload: Any) -> None:
         data = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(data)))
-        self.send_header("Connection", "close")
-        self.end_headers()
-        if self.command != "HEAD":
-            self.wfile.write(data)
-        self.close_connection = True
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(data)
+        except CLIENT_GONE_ERRORS:
+            # The client hung up before the answer could be written -- Claude Desktop
+            # cancels count_tokens on nearly every edit, so this is routine.  Nobody is
+            # left to tell, and letting it bubble wrote a full traceback into the crash
+            # log for a healthy router.
+            pass
+        finally:
+            self.close_connection = True
 
     def _client_protocol(self) -> str:
         """The wire protocol the client below us speaks, from the path it called."""
@@ -2525,9 +3734,56 @@ class SotaRouterHandler(BaseHTTPRequestHandler):
                 },
             )
             return
+        if request_protocol == "responses" and candidates:
+            primary_provider = routing.providers.get(candidates[0][0])
+            if primary_provider is not None and is_messages_to_chat_adapter(primary_provider):
+                # The Messages bridge serves Claude Desktop; a Responses client would need
+                # the other bridge.  Refuse locally instead of forwarding a mangled body.
+                self._json_response(
+                    501,
+                    {
+                        "error": {
+                            "message": (
+                                "这家供应商配置的是 Claude 侧（Messages）的 Chat Completions "
+                                "桥接，只服务 Claude Desktop；Codex 侧请勾选对应方向的桥接"
+                            ),
+                            "type": "unsupported_adapter_operation",
+                        }
+                    },
+                )
+                return
+        if (
+            request_protocol == "messages"
+            and candidates
+            and clean_path not in COUNT_TOKENS_PATHS
+        ):
+            # count_tokens is exempt: it is answered locally for bridged vendors further
+            # down (the loop estimates instead of forwarding), so refusing it here would
+            # turn a working local answer into a 501.
+            primary_provider = routing.providers.get(candidates[0][0])
+            if primary_provider is not None and is_chat_completions_adapter(primary_provider):
+                # The bridge translates Responses -> Chat Completions.  A Messages client
+                # (Claude Desktop) would need the opposite translation, which does not
+                # exist; refuse locally instead of forwarding a mangled body.
+                self._json_response(
+                    501,
+                    {
+                        "error": {
+                            "message": (
+                                "这家供应商配置的是 Chat Completions 桥接，只服务 Codex App；"
+                                "Claude 侧暂不支持这种网关"
+                            ),
+                            "type": "unsupported_adapter_operation",
+                        }
+                    },
+                )
+                return
         if clean_path in COMPACT_PATHS:
             primary_provider = routing.providers.get(candidates[0][0]) if candidates else None
-            if primary_provider is not None and is_juno_adapter(primary_provider):
+            if primary_provider is not None and (
+                is_juno_adapter(primary_provider)
+                or is_chat_completions_adapter(primary_provider)
+            ):
                 # There is no semantics-preserving Responses -> Messages mapping for compact.
                 # Refuse locally before credentials, retries, or failover can reach an upstream.
                 self._json_response(
@@ -2598,7 +3854,11 @@ class SotaRouterHandler(BaseHTTPRequestHandler):
                 continue
             body = outgoing_body
             adapter = is_juno_adapter(provider)
-            if counting_tokens and adapter:
+            if counting_tokens and (
+                adapter
+                or is_chat_completions_adapter(provider)
+                or is_messages_to_chat_adapter(provider)
+            ):
                 # This adapter's upstream endpoint is a *generation* Messages endpoint.  It
                 # cannot safely forward /messages/count_tokens: the generic adapter URL rewrite
                 # would turn that harmless metadata request into a real /v1/messages generation
@@ -2611,11 +3871,14 @@ class SotaRouterHandler(BaseHTTPRequestHandler):
                 if forced_fast and clean_path not in {"/messages", "/v1/messages"} and not adapter:
                     payload["service_tier"] = "priority"
                 try:
-                    translated = (
-                        responses_to_anthropic_payload(payload, upstream_model)
-                        if adapter
-                        else payload
-                    )
+                    if adapter:
+                        translated = responses_to_anthropic_payload(payload, upstream_model)
+                    elif is_chat_completions_adapter(provider):
+                        translated = responses_to_chat_payload(payload, upstream_model)
+                    elif is_messages_to_chat_adapter(provider):
+                        translated = messages_to_chat_payload(payload, upstream_model)
+                    else:
+                        translated = payload
                     body = json.dumps(translated, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
                 except (TypeError, ValueError, OverflowError) as error:
                     self._json_response(
@@ -2901,6 +4164,279 @@ class SotaRouterHandler(BaseHTTPRequestHandler):
             )
         return False
 
+    def _relay_chat(
+        self,
+        upstream: Any,
+        vendor: str,
+        status: int,
+        started: float,
+        model: str,
+        request_payload: dict[str, Any] | None,
+        tool_namespaces: dict[str, str] | None = None,
+        tool_kinds: dict[str, str] | None = None,
+        is_final_attempt: bool = True,
+    ) -> bool:
+        """Bridge one Chat Completions response back to the Responses wire shape.
+
+        Mirrors the Messages adapter's relay: response headers are held back until the
+        first frame so a zero-content death can still be retried invisibly, and a stream
+        that ends without completion evidence records a failure instead of a silent 200.
+        """
+        headers_sent = False
+        relay_error = ""
+        head = bytearray()
+        tail = deque(maxlen=64)
+        tail_bytes = 0
+        frames_written = 0
+
+        def write_chunk(chunk: bytes) -> None:
+            nonlocal tail_bytes, headers_sent, frames_written
+            if not chunk:
+                return
+            if not headers_sent and not self._relay_headers_sent:
+                self.send_response(status)
+                self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                headers_sent = True
+                self._relay_headers_sent = True
+            self.wfile.write(chunk)
+            self.wfile.flush()
+            frames_written += 1
+            if len(head) < USAGE_HEAD_BYTES:
+                head.extend(chunk[: USAGE_HEAD_BYTES - len(head)])
+            tail.append(chunk)
+            tail_bytes += len(chunk)
+            while tail_bytes > USAGE_TAIL_BYTES and len(tail) > 1:
+                tail_bytes -= len(tail.popleft())
+
+        try:
+            with upstream:
+                content_type = str(upstream.headers.get("Content-Type") or "").lower()
+                upstream_is_sse = "text/event-stream" in content_type
+                stream_requested = bool((request_payload or {}).get("stream"))
+                if (stream_requested or upstream_is_sse) and self.command != "HEAD":
+                    if upstream_is_sse:
+                        outcome: dict[str, Any] = {}
+                        for chunk in chat_sse_to_responses(
+                            upstream, model, tool_namespaces, tool_kinds, outcome
+                        ):
+                            write_chunk(chunk)
+                        if outcome.get("truncated"):
+                            status = 502
+                            relay_error = "truncated SSE stream: no completion event"
+                        elif outcome.get("retryable") and not is_final_attempt:
+                            return True
+                    else:
+                        raw = upstream.read(MAX_REQUEST_BODY_BYTES + 1)
+                        if len(raw) > MAX_REQUEST_BODY_BYTES:
+                            raise ValueError("upstream response exceeded the adapter limit")
+                        response = chat_message_to_response(
+                            json.loads(raw), model, tool_namespaces, tool_kinds
+                        )
+                        for chunk in response_to_sse(response):
+                            write_chunk(chunk)
+                elif self.command == "HEAD":
+                    pass
+                else:
+                    raw = upstream.read(MAX_REQUEST_BODY_BYTES + 1)
+                    if len(raw) > MAX_REQUEST_BODY_BYTES:
+                        raise ValueError("upstream response exceeded the adapter limit")
+                    response = chat_message_to_response(
+                        json.loads(raw), model, tool_namespaces, tool_kinds
+                    )
+                    data = json.dumps(response, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+                    self.send_response(status)
+                    self.send_header("Content-Type", "application/json; charset=utf-8")
+                    self.send_header("Content-Length", str(len(data)))
+                    self.send_header("Connection", "close")
+                    self.end_headers()
+                    headers_sent = True
+                    self._relay_headers_sent = True
+                    write_chunk(data)
+        except CLIENT_GONE_ERRORS as error:
+            status = 499
+            relay_error = f"client gone: {type(error).__name__}"
+        except Exception as error:  # noqa: BLE001 - report, never crash the handler thread
+            status = 502
+            relay_error = f"{type(error).__name__}: {error}"
+            if frames_written == 0 and not is_final_attempt:
+                self.close_connection = True
+                return True
+            if not headers_sent and not self._relay_headers_sent and not self.wfile.closed:
+                try:
+                    self._json_response(
+                        502,
+                        {
+                            "error": {
+                                "message": friendly_upstream_error(str(error), vendor),
+                                "type": "sota_router_adapter_error",
+                            }
+                        },
+                    )
+                except CLIENT_GONE_ERRORS:
+                    pass
+            elif headers_sent or self._relay_headers_sent:
+                self._write_stream_error_frame(
+                    friendly_upstream_error(relay_error, vendor), protocol="responses"
+                )
+        finally:
+            self.close_connection = True
+            if not relay_error and not 200 <= status < 300 and head:
+                relay_error = bytes(head[:400]).decode("utf-8", "replace").strip()
+            try:
+                usage = extract_token_usage(bytes(head), b"".join(tail))
+            except Exception:  # noqa: BLE001 - telemetry must never affect a served response
+                usage = {}
+            self.state.record(
+                vendor,
+                self.command,
+                self.path,
+                status,
+                time.monotonic() - started,
+                relay_error,
+                model=model,
+                usage=usage,
+            )
+        return False
+
+    def _relay_messages_chat(
+        self,
+        upstream: Any,
+        vendor: str,
+        status: int,
+        started: float,
+        model: str,
+        request_payload: dict[str, Any] | None,
+        is_final_attempt: bool = True,
+    ) -> bool:
+        """Bridge one Chat Completions response back to the Anthropic Messages wire.
+
+        Same contract as the other bridges: headers are held back until the first frame so
+        a zero-content death can be retried invisibly, and a stream without completion
+        evidence fails the turn (Anthropic ``error`` event) instead of faking success.
+        """
+        headers_sent = False
+        relay_error = ""
+        head = bytearray()
+        tail = deque(maxlen=64)
+        tail_bytes = 0
+        frames_written = 0
+
+        def write_chunk(chunk: bytes) -> None:
+            nonlocal tail_bytes, headers_sent, frames_written
+            if not chunk:
+                return
+            if not headers_sent and not self._relay_headers_sent:
+                self.send_response(status)
+                self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                headers_sent = True
+                self._relay_headers_sent = True
+            self.wfile.write(chunk)
+            self.wfile.flush()
+            frames_written += 1
+            if len(head) < USAGE_HEAD_BYTES:
+                head.extend(chunk[: USAGE_HEAD_BYTES - len(head)])
+            tail.append(chunk)
+            tail_bytes += len(chunk)
+            while tail_bytes > USAGE_TAIL_BYTES and len(tail) > 1:
+                tail_bytes -= len(tail.popleft())
+
+        try:
+            with upstream:
+                content_type = str(upstream.headers.get("Content-Type") or "").lower()
+                upstream_is_sse = "text/event-stream" in content_type
+                stream_requested = bool((request_payload or {}).get("stream"))
+                if (stream_requested or upstream_is_sse) and self.command != "HEAD":
+                    if upstream_is_sse:
+                        outcome: dict[str, Any] = {}
+                        for chunk in chat_sse_to_anthropic_sse(upstream, model, outcome):
+                            write_chunk(chunk)
+                        if outcome.get("truncated"):
+                            status = 502
+                            relay_error = "truncated SSE stream: no completion event"
+                        elif outcome.get("retryable") and not is_final_attempt:
+                            return True
+                    else:
+                        raw = upstream.read(MAX_REQUEST_BODY_BYTES + 1)
+                        if len(raw) > MAX_REQUEST_BODY_BYTES:
+                            raise ValueError("upstream response exceeded the adapter limit")
+                        message = chat_completion_to_anthropic_message(json.loads(raw), model)
+                        data = json.dumps(message, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+                        self.send_response(status)
+                        self.send_header("Content-Type", "application/json; charset=utf-8")
+                        self.send_header("Content-Length", str(len(data)))
+                        self.send_header("Connection", "close")
+                        self.end_headers()
+                        headers_sent = True
+                        self._relay_headers_sent = True
+                        write_chunk(data)
+                elif self.command == "HEAD":
+                    pass
+                else:
+                    raw = upstream.read(MAX_REQUEST_BODY_BYTES + 1)
+                    if len(raw) > MAX_REQUEST_BODY_BYTES:
+                        raise ValueError("upstream response exceeded the adapter limit")
+                    message = chat_completion_to_anthropic_message(json.loads(raw), model)
+                    data = json.dumps(message, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+                    self.send_response(status)
+                    self.send_header("Content-Type", "application/json; charset=utf-8")
+                    self.send_header("Content-Length", str(len(data)))
+                    self.send_header("Connection", "close")
+                    self.end_headers()
+                    headers_sent = True
+                    self._relay_headers_sent = True
+                    write_chunk(data)
+        except CLIENT_GONE_ERRORS as error:
+            status = 499
+            relay_error = f"client gone: {type(error).__name__}"
+        except Exception as error:  # noqa: BLE001 - report, never crash the handler thread
+            status = 502
+            relay_error = f"{type(error).__name__}: {error}"
+            if frames_written == 0 and not is_final_attempt:
+                self.close_connection = True
+                return True
+            if not headers_sent and not self._relay_headers_sent and not self.wfile.closed:
+                try:
+                    self._json_response(
+                        502,
+                        {
+                            "error": {
+                                "message": friendly_upstream_error(str(error), vendor),
+                                "type": "sota_router_adapter_error",
+                            }
+                        },
+                    )
+                except CLIENT_GONE_ERRORS:
+                    pass
+            elif headers_sent or self._relay_headers_sent:
+                self._write_stream_error_frame(
+                    friendly_upstream_error(relay_error, vendor), protocol="messages"
+                )
+        finally:
+            self.close_connection = True
+            if not relay_error and not 200 <= status < 300 and head:
+                relay_error = bytes(head[:400]).decode("utf-8", "replace").strip()
+            try:
+                usage = extract_token_usage(bytes(head), b"".join(tail))
+            except Exception:  # noqa: BLE001 - telemetry must never affect a served response
+                usage = {}
+            self.state.record(
+                vendor,
+                self.command,
+                self.path,
+                status,
+                time.monotonic() - started,
+                relay_error,
+                model=model,
+                usage=usage,
+            )
+        return False
+
     def _relay(
         self,
         upstream: Any,
@@ -2921,6 +4457,28 @@ class SotaRouterHandler(BaseHTTPRequestHandler):
         invisibly.  Response headers are held back until the first body byte so a
         zero-content death can still be answered with a plain JSON error.
         """
+        if provider is not None and is_messages_to_chat_adapter(provider) and 200 <= status < 300:
+            return self._relay_messages_chat(
+                upstream,
+                vendor,
+                status,
+                started,
+                model,
+                request_payload,
+                is_final_attempt=is_final_attempt,
+            )
+        if provider is not None and is_chat_completions_adapter(provider) and 200 <= status < 300:
+            return self._relay_chat(
+                upstream,
+                vendor,
+                status,
+                started,
+                model,
+                request_payload,
+                tool_namespaces,
+                tool_kinds,
+                is_final_attempt=is_final_attempt,
+            )
         if provider is not None and is_juno_adapter(provider) and 200 <= status < 300:
             return self._relay_juno(
                 upstream,
@@ -3234,7 +4792,14 @@ class SotaRouterHandler(BaseHTTPRequestHandler):
                 name.lower() == "anthropic-version" for name in headers
             ):
                 headers["anthropic-version"] = DEFAULT_ANTHROPIC_VERSION
-            if adapter:
+            if is_chat_completions_adapter(provider) or is_messages_to_chat_adapter(provider):
+                # Both bridges talk to the gateway's Chat Completions endpoint, with the
+                # caller's query string preserved (some gateways carry options there).
+                parsed = urllib.parse.urlsplit(self.path)
+                upstream_url = endpoint_url(provider, "chat")
+                if parsed.query:
+                    upstream_url += ("&" if "?" in upstream_url else "?") + parsed.query
+            elif adapter:
                 parsed = urllib.parse.urlsplit(self.path)
                 upstream_url = endpoint_url(provider, "messages")
                 if parsed.query:

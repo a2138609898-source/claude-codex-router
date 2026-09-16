@@ -363,6 +363,34 @@ FORM_OWNED_PROVIDER_KEYS = (
 )
 
 
+def mapping_conflicts(
+    models: list[dict[str, Any]],
+    provider: dict[str, Any],
+    candidate: str,
+    *,
+    self_model: dict[str, Any] | None = None,
+) -> list[str]:
+    """Enabled models, other than ``self_model``, that already publish as ``candidate``.
+
+    The alias IS the routing key: a request carries only the published name, so two models
+    sharing one name would make dispatch ambiguous -- the registry refuses it at save time.
+    Checking here as well lets the mapping dialog say so while the user is still typing,
+    instead of failing later with a save-time error.  Disabled models are ignored, matching
+    validate_registry, which only guards selectable (enabled) slugs.
+    """
+    conflicts: list[str] = []
+    for other in models:
+        if other is self_model or not other.get("enabled"):
+            continue
+        try:
+            slug = published_slug(provider, other)
+        except Exception:  # noqa: BLE001 - a malformed draft must not break the dialog
+            continue
+        if slug == candidate:
+            conflicts.append(str(other.get("id") or "?"))
+    return conflicts
+
+
 def comparable_provider(provider: dict[str, Any]) -> dict[str, Any]:
     """Provider snapshot without probe bookkeeping, for "did the user change anything".
 
@@ -1030,6 +1058,7 @@ class ModelMappingDialog(tk.Toplevel):
         suggestions: list[str],
         *,
         workspace_name: str = "claude",
+        conflict_check: Callable[[str], list[str]] | None = None,
     ):
         super().__init__(parent)
         self.title("模型映射（Claude）" if workspace_name == "claude" else "模型映射（Codex）")
@@ -1041,6 +1070,7 @@ class ModelMappingDialog(tk.Toplevel):
         self.result: str | None = None
         self.prefix = prefix
         self.workspace_name = workspace_name
+        self.conflict_check = conflict_check
 
         prompt = (
             "在 Claude Desktop 里显示为（可下拉选一个 Claude 型号名，也可自己输入）："
@@ -1155,6 +1185,18 @@ class ModelMappingDialog(tk.Toplevel):
                 "映射名无效", "映射名不能只有前缀，前缀后面要有型号名。", parent=self
             )
             return
+        if alias and self.conflict_check is not None:
+            owners = self.conflict_check(alias)
+            if owners:
+                messagebox.showerror(
+                    "这个名字已经被占用",
+                    f"{alias} 已经是「{'、'.join(owners)}」的发布名或其默认名。\n\n"
+                    "一个名字只能指向一个模型：请求里只有名字，路由器靠它决定调用哪个模型。\n\n"
+                    "给每个模型取不同的名字即可（加后缀不影响 Claude 的能力识别），例如：\n"
+                    "  · claude-fable-5\n  · claude-fable-5-vision\n  · claude-fable-5-2",
+                    parent=self,
+                )
+                return
         self.result = alias
         self.destroy()
 
@@ -1209,6 +1251,10 @@ class CodexSotaApp(tk.Tk):
         self.failover_var = tk.BooleanVar(value=False)
         self.proto_responses_var = tk.BooleanVar(value=True)
         self.proto_messages_var = tk.BooleanVar(value=False)
+        # Bridges a gateway that only speaks OpenAI Chat Completions into the Codex App's
+        # Responses protocol. It never rewrites other providers' configuration: the value
+        # is carried as the provider's request_adapter field.
+        self.chat_bridge_var = tk.BooleanVar(value=False)
         self.claude_status_var = tk.StringVar(value="Claude Desktop：检查中")
         self._claude_entries: list[dict[str, Any]] = []
         self.reasoning_var = tk.StringVar(value="low")
@@ -1492,6 +1538,12 @@ class CodexSotaApp(tk.Tk):
             enabled_wrap, text="说 Messages 协议（Claude Desktop）", variable=self.proto_messages_var
         )
         self.proto_messages_check.pack(anchor="w")
+        self.chat_bridge_check = ttk.Checkbutton(
+            enabled_wrap,
+            text="只支持 Chat Completions 网关（自动桥接）",
+            variable=self.chat_bridge_var,
+        )
+        self.chat_bridge_check.pack(anchor="w", pady=(4, 0))
 
         ttk.Separator(tab).grid(row=7, column=0, columnspan=2, sticky="ew", pady=(2, 16))
         ttk.Label(tab, text="认证与端点", style="Section.TLabel").grid(row=8, column=0, columnspan=2, sticky="w", pady=(0, 14))
@@ -1878,8 +1930,10 @@ class CodexSotaApp(tk.Tk):
         self.timeout_var.set("120")
         self.enabled_var.set(True)
         self.failover_var.set(False)
+        self.chat_bridge_var.set(False)
         self.proto_responses_var.set(self.workspace is not CLAUDE)
         self.proto_messages_var.set(self.workspace is CLAUDE)
+        self.chat_bridge_var.set(False)
         self._set_key_revealed(False)
         self.headers_text.configure(state="normal")
         self.headers_text.delete("1.0", "end")
@@ -1990,6 +2044,10 @@ class CodexSotaApp(tk.Tk):
         protocols = provider.get("protocols") or ["responses"]
         self.proto_responses_var.set("responses" in protocols)
         self.proto_messages_var.set("messages" in protocols)
+        self.chat_bridge_var.set(
+            provider.get("request_adapter")
+            in {"responses_to_chat_completions", "messages_to_chat_completions"}
+        )
         self.headers_text.delete("1.0", "end")
         self.headers_text.insert("1.0", json.dumps(provider.get("extra_headers") or {}, ensure_ascii=False, indent=2))
         self.draft_models = deepcopy(provider["models"])
@@ -2084,6 +2142,7 @@ class CodexSotaApp(tk.Tk):
         self.timeout_var.set("120")
         self.enabled_var.set(True)
         self.failover_var.set(False)
+        self.chat_bridge_var.set(False)
         self.proto_responses_var.set(self.workspace is not CLAUDE)
         self.proto_messages_var.set(self.workspace is CLAUDE)
         self.headers_text.configure(state="normal")
@@ -2255,6 +2314,22 @@ class CodexSotaApp(tk.Tk):
                 "models": deepcopy(self.draft_models),
             }
         )
+        # The bridge switch owns exactly the two Chat-Completions bridge values; which one
+        # applies follows the workspace (Codex App speaks Responses, Claude Desktop speaks
+        # Messages).  juno's Messages translation is left untouched unless the box is
+        # ticked or unticked here.
+        existing_adapter = str((existing or {}).get("request_adapter") or "").strip()
+        bridge_values = {"responses_to_chat_completions", "messages_to_chat_completions"}
+        if self.chat_bridge_var.get():
+            provider["request_adapter"] = (
+                "messages_to_chat_completions"
+                if self.workspace is CLAUDE
+                else "responses_to_chat_completions"
+            )
+        elif existing_adapter in bridge_values:
+            provider["request_adapter"] = ""
+        else:
+            provider["request_adapter"] = existing_adapter
         provider.update(pinned)
         return validate_provider(provider, allow_missing_secret=True)
 
@@ -2431,11 +2506,25 @@ class CodexSotaApp(tk.Tk):
             prefix,
             suggestions,
             workspace_name=self.workspace.name,
+            conflict_check=lambda candidate: mapping_conflicts(
+                self.draft_models, provider, candidate, self_model=model
+            ),
         )
         self.wait_window(dialog)
         if dialog.result is None:
             return
         alias = dialog.result
+        # Defence in depth: the dialog already refuses a conflicting alias, but the models
+        # list can only be checked here if a future caller opens the dialog differently.
+        if alias:
+            owners = mapping_conflicts(self.draft_models, provider, alias, self_model=model)
+            if owners:
+                messagebox.showerror(
+                    "这个名字已经被占用",
+                    f"{alias} 已经是「{'、'.join(owners)}」的发布名，本次映射没有应用。",
+                    parent=self,
+                )
+                return
         model["publish_as"] = alias
         self._render_models()
         if self.model_tree.exists(f"model_{index}"):
