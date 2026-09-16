@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import re
 import sys
 import tomllib
 import urllib.error
@@ -59,6 +61,73 @@ def _same_path(value: object, expected: Path) -> bool:
         return candidate.resolve(strict=False) == expected.resolve(strict=False)
     except OSError:
         return False
+
+
+def _catalog_slug_list(catalog: Path) -> list[str]:
+    """The selectable slugs in catalog order (the order is the picker's priority)."""
+    try:
+        with catalog.open("rb") as stream:
+            data = json.load(stream)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return []
+    models = data.get("models") if isinstance(data, dict) else None
+    if not isinstance(models, list):
+        return []
+    return [
+        str(model.get("slug"))
+        for model in models
+        if isinstance(model, dict) and isinstance(model.get("slug"), str)
+    ]
+
+
+def _provider_prefix_of(slug: str) -> str:
+    if ".anthropic." in slug:
+        return slug.split(".anthropic.", 1)[0] + ".anthropic."
+    if "--" in slug:
+        return slug.split("--", 1)[0] + "--"
+    return ""
+
+
+def repair_pinned_models(root: Path, catalog: Path) -> dict[str, Any]:
+    """Rewrite config.toml's pinned model names when they fell out of the catalog.
+
+    Providers and model mappings change constantly; the Codex App pins whatever the user
+    last selected into config.toml, so a stale pin is a routine event, not a broken
+    install.  Refusing to launch over it was wrong.  Prefer another model from the same
+    provider namespace; fall back to the first selectable model otherwise.
+    """
+    config_path = root / "config.toml"
+    try:
+        text = config_path.read_text(encoding="utf-8")
+    except OSError:
+        return {"reason": "config_unreadable", "repaired": {}}
+    slugs = _catalog_slug_list(catalog)
+    slug_set = set(slugs)
+    if not slugs:
+        return {"reason": "catalog_unreadable", "repaired": {}}
+    repaired: dict[str, Any] = {}
+    for field in ("model", "review_model"):
+        pattern = re.compile(r'(?m)^([ \t]*' + field + r'[ \t]*=[ \t]*")([^"]*)(")')
+        match = pattern.search(text)
+        if match is None:
+            continue
+        current = _without_context_1m_suffix(match.group(2).strip())
+        if current in slug_set:
+            continue
+        prefix = _provider_prefix_of(current)
+        candidates = [slug for slug in slugs if prefix and slug.startswith(prefix)]
+        replacement = (candidates or slugs)[0]
+        text = text[: match.start()] + match.group(1) + replacement + match.group(3) + text[match.end():]
+        repaired[field] = {"from": match.group(2), "to": replacement}
+    if repaired:
+        temporary = config_path.with_name(config_path.name + ".repair-new")
+        try:
+            temporary.write_text(text, encoding="utf-8")
+            os.replace(temporary, config_path)
+        except OSError as error:
+            temporary.unlink(missing_ok=True)
+            return {"reason": f"write_failed: {error}", "repaired": {}}
+    return {"reason": "ok", "repaired": repaired}
 
 
 def validate_profile(profile: str, root: Path, catalog: Path | None) -> tuple[bool, str]:
@@ -171,8 +240,18 @@ def main() -> int:
     parser.add_argument("--catalog", type=Path)
     parser.add_argument("--probe-cockpit", action="store_true")
     parser.add_argument("--timeout-seconds", type=float, default=2.0)
+    parser.add_argument(
+        "--repair",
+        action="store_true",
+        help=(
+            "Rewrite a stale pinned model (model/review_model no longer in the catalog) "
+            "and re-validate.  Only that one failure class is repaired: a genuinely broken "
+            "config still reports invalid."
+        ),
+    )
     args = parser.parse_args()
 
+    repair_report: dict[str, Any] | None = None
     try:
         if args.probe_cockpit:
             if args.profile != "Cockpit":
@@ -181,10 +260,22 @@ def main() -> int:
                 valid, reason = probe_cockpit(args.root, max(0.1, args.timeout_seconds))
         else:
             valid, reason = validate_profile(args.profile, args.root, args.catalog)
+            if (
+                not valid
+                and args.repair
+                and args.catalog is not None
+                and reason in {"model_not_in_catalog", "review_model_not_in_catalog"}
+            ):
+                repair_report = repair_pinned_models(args.root, args.catalog)
+                if repair_report.get("repaired"):
+                    valid, reason = validate_profile(args.profile, args.root, args.catalog)
     except Exception:
         valid, reason = False, "validation_failed"
 
-    print(json.dumps({"valid": valid, "reason": reason}, separators=(",", ":")))
+    payload: dict[str, Any] = {"valid": valid, "reason": reason}
+    if repair_report is not None:
+        payload["repair"] = repair_report
+    print(json.dumps(payload, separators=(",", ":")))
     return 0 if valid else 1
 
 

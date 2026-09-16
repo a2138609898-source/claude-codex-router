@@ -92,7 +92,8 @@ try {
         'test_codex_sota_regressions.HeaderValidationTests',
         'test_codex_sota_regressions.RegistryRecoveryRegressionTests',
         'test_codex_sota_regressions.LauncherAndArtifactTests',
-        'test_sync_build_regressions.SyncAndBuildRegressionTests'
+        'test_sync_build_regressions.SyncAndBuildRegressionTests',
+        'test_sync_build_regressions.StalePinnedModelRepairTests'
     )
 }
 finally {

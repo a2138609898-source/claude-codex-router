@@ -396,6 +396,7 @@ function Get-PythonExecutable {
 }
 
 function Invoke-SotaConfigValidator {
+    param([switch]$Repair)
     if (-not (Test-Path -LiteralPath $configValidatorPath)) {
         return [pscustomobject]@{ valid = $false; reason = 'validator_missing' }
     }
@@ -403,11 +404,17 @@ function Invoke-SotaConfigValidator {
     if (-not $python) {
         return [pscustomobject]@{ valid = $false; reason = 'python_missing' }
     }
+    $validatorArguments = @(
+        $configValidatorPath, '--profile', 'Sota', '--root', $sotaRoot, '--catalog', $catalogPath
+    )
+    if ($Repair) {
+        $validatorArguments += '--repair'
+    }
     $previous = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
     try {
         $output = @(
-            & $python $configValidatorPath --profile Sota --root $sotaRoot --catalog $catalogPath 2>&1
+            & $python @validatorArguments 2>&1
         )
         $exitCode = $LASTEXITCODE
     }
@@ -660,6 +667,16 @@ $appExecutable = Get-CodexAppExecutable
 $authStatus = Get-SotaAuthStatus
 $authMode = $authStatus.mode
 $configValid = Test-SotaConfig
+# A provider or model mapping that changed since the Codex App last pinned a model leaves
+# config.toml pointing at a slug the catalog no longer offers.  That is a routine edit
+# outcome, not a broken install, so repair it once (same provider namespace preferred)
+# and re-check instead of refusing the launch.
+if (-not $configValid -and -not $AuditOnly) {
+    $validatorResult = Invoke-SotaConfigValidator -Repair
+    if ($null -ne $validatorResult -and $validatorResult.valid -eq $true) {
+        $configValid = $true
+    }
+}
 $registryExists = Test-Path -LiteralPath $registryPath
 $registryValid = $false
 $registryProviders = @()

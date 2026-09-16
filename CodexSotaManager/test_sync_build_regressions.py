@@ -25,6 +25,7 @@ import sync_after_codex_exit as post_exit  # noqa: E402
 import claude_desktop as claude  # noqa: E402
 import codex_sota_router as router  # noqa: E402
 import sota_registry as registry  # noqa: E402
+import validate_codex_profile as profile_validator  # noqa: E402
 from test_codex_sota_regressions import (  # noqa: E402
     LocalUpstream,
     RouterHarness,
@@ -857,3 +858,79 @@ class SyncAndBuildRegressionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+class StalePinnedModelRepairTests(unittest.TestCase):
+    """Deleting a provider (or remapping a model) must never block a launch again.
+
+    The Codex App pins whatever model was selected into config.toml.  Providers and
+    mappings change; when the pinned slug falls out of the catalog the launcher repairs
+    config.toml instead of refusing to start.
+    """
+
+    def _fixture(self, root: Path, catalog_path: Path, model: str) -> None:
+        (root / "config.toml").write_text(
+            'model_provider = "tango_relay"\n'
+            f'model = "{model}"\n'
+            'review_model = "provider_a--gpt-5.6-terra"\n'
+            'cli_auth_credentials_store = "file"\n'
+            'forced_login_method = "api"\n'
+            f'model_catalog_json = "{catalog_path.as_posix()}"\n'
+            '\n[model_providers.tango_relay]\n'
+            'base_url = "http://127.0.0.1:17895"\n'
+            'wire_api = "responses"\n'
+            'requires_openai_auth = true\n',
+            encoding="utf-8",
+        )
+        slugs = [
+            "tango-relay--gpt-5.6-sol",
+            "tango-relay--gpt-6-astra",
+            "provider_a--gpt-5.6-sol",
+            "provider_a--gpt-5.6-terra",
+        ]
+        catalog_path.write_text(
+            json.dumps({"models": [{"slug": slug} for slug in slugs]}),
+            encoding="utf-8",
+        )
+
+    def test_a_deleted_providers_pinned_model_is_repaired_not_fatal(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            catalog_path = root / "sota-multi-vendor-model-catalog.json"
+            self._fixture(root, catalog_path, "golf--gpt-6-astra")
+
+            valid, reason = profile_validator.validate_profile("Sota", root, catalog_path)
+            self.assertFalse(valid)
+            self.assertEqual(reason, "model_not_in_catalog")
+
+            report = profile_validator.repair_pinned_models(root, catalog_path)
+            self.assertEqual(
+                report["repaired"]["model"]["to"], "tango-relay--gpt-5.6-sol"
+            )
+            valid, reason = profile_validator.validate_profile("Sota", root, catalog_path)
+            self.assertTrue(valid, reason)
+
+    def test_remapping_keeps_the_same_provider_when_still_available(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            catalog_path = root / "sota-multi-vendor-model-catalog.json"
+            self._fixture(root, catalog_path, "tango-relay--old-name")
+
+            profile_validator.repair_pinned_models(root, catalog_path)
+
+            config = (root / "config.toml").read_text(encoding="utf-8")
+            self.assertIn('model = "tango-relay--gpt-5.6-sol"', config)
+            # The untouched review_model stays exactly as it was.
+            self.assertIn('review_model = "provider_a--gpt-5.6-terra"', config)
+
+    def test_a_healthy_config_is_left_alone(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            catalog_path = root / "sota-multi-vendor-model-catalog.json"
+            self._fixture(root, catalog_path, "tango-relay--gpt-6-astra")
+            before = (root / "config.toml").read_text(encoding="utf-8")
+
+            report = profile_validator.repair_pinned_models(root, catalog_path)
+
+            self.assertEqual(report["repaired"], {})
+            self.assertEqual((root / "config.toml").read_text(encoding="utf-8"), before)
+
