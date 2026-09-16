@@ -1213,7 +1213,7 @@ class RouterRegressionTests(unittest.TestCase):
             upstream_body.get("thinking"), {"type": "enabled", "budget_tokens": 8192}
         )
         self.assertEqual(upstream_body.get("max_tokens"), 10240)
-        self.assertEqual(received[0]["ua"], router.JUSTDOWORK_CODEX_USER_AGENT)
+        self.assertEqual(received[0]["ua"], router.JUNO_CODEX_USER_AGENT)
         self.assertEqual(received[0]["originator"], "codex_cli_rs")
         self.assertIn("response.reasoning_summary_part.added", stream)
         self.assertIn("response.reasoning_summary_text.delta", stream)

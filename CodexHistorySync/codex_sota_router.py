@@ -186,10 +186,10 @@ LOG_MAX_BYTES = 8 * 1024 * 1024
 # This is deliberately a provider marker instead of a global protocol switch.  Codex still
 # talks Responses to the local router and keeps the normal `juno--...` model slugs; only
 # that provider's outbound request is translated to the Anthropic Messages API.
-JUSTDOWORK_ADAPTER = "responses_to_anthropic_messages"
+JUNO_ADAPTER = "responses_to_anthropic_messages"
 CHAT_COMPLETIONS_ADAPTER = "responses_to_chat_completions"
 MESSAGES_TO_CHAT_COMPLETIONS_ADAPTER = "messages_to_chat_completions"
-JUSTDOWORK_CODEX_USER_AGENT = (
+JUNO_CODEX_USER_AGENT = (
     "codex_cli_rs/0.144.1 (Windows 11.0.26200; x86_64) WindowsTerminal"
 )
 
@@ -210,7 +210,7 @@ REASONING_EFFORT_BUDGETS = {
 def is_juno_adapter(provider: dict[str, Any]) -> bool:
     return (
         str(provider.get("id") or "").lower() == "juno"
-        and provider.get("request_adapter") == JUSTDOWORK_ADAPTER
+        and provider.get("request_adapter") == JUNO_ADAPTER
     )
 
 
@@ -4782,7 +4782,7 @@ class SotaRouterHandler(BaseHTTPRequestHandler):
             # CLI signature the vendors document -- the real apps behind this router send
             # it themselves, and nothing downstream needs the caller's original UA.
             headers.setdefault("Accept", "application/json")
-            headers["User-Agent"] = JUSTDOWORK_CODEX_USER_AGENT
+            headers["User-Agent"] = JUNO_CODEX_USER_AGENT
             headers["originator"] = "codex_cli_rs"
             # Forwarding is a denylist, so a client that sent anthropic-version keeps its own
             # value whatever the casing; only a caller that omitted one gets the default, and
