@@ -1823,6 +1823,92 @@ class RouterRegressionTests(unittest.TestCase):
         self.assertIn("event: message_stop", stream)
         self.assertNotIn("event: error", stream)
 
+    def test_messages_bridge_forwards_thinking_and_pings_without_it(self) -> None:
+        """Reasoning streams as a thinking block when asked, as pings when not.
+
+        A thinking model streams its reasoning before the answer; forwarding nothing for
+        that whole stretch made the client look hung and eventually drop the connection.
+        """
+
+        class ReasoningSse(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, _format: str, *_args: object) -> None:
+                return
+
+            def do_POST(self) -> None:
+                length = int(self.headers.get("Content-Length") or 0)
+                self.rfile.read(length)
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Connection", "close")
+                self.end_headers()
+
+                def send(payload: dict) -> None:
+                    nl = chr(10) * 2
+                    frame = "data: " + json.dumps(payload, separators=(",", ":")) + nl
+                    self.wfile.write(frame.encode("utf-8"))
+                    self.wfile.flush()
+
+                send({"choices": [{"index": 0, "delta": {"reasoning": "先想一下"}}]})
+                send({"choices": [{"index": 0, "delta": {"content": "答案"}}]})
+                send({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]})
+                send({"choices": [], "usage": {"prompt_tokens": 5, "completion_tokens": 3}})
+                nl = chr(10) * 2
+                self.wfile.write(("data: [DONE]" + nl).encode("utf-8"))
+                self.wfile.flush()
+                self.close_connection = True
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), ReasoningSse)
+        server.daemon_threads = True
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                registry_path = root / "providers.json"
+                auth_path = root / "auth.json"
+                write_auth(auth_path)
+                write_registry(
+                    registry_path,
+                    [
+                        self._claude_default_provider(f"http://127.0.0.1:{server.server_port}"),
+                        self._claude_chat_provider("golf", f"http://127.0.0.1:{server.server_port}"),
+                    ],
+                )
+                with RouterHarness(registry_path, auth_path, root / "router.log") as local:
+                    def ask(extra: dict) -> str:
+                        payload = {
+                            "model": "golf.anthropic.nova-vision",
+                            "max_tokens": 64,
+                            "stream": True,
+                            "messages": [{"role": "user", "content": "hi"}],
+                        }
+                        payload.update(extra)
+                        request = urllib.request.Request(
+                            local.url + "/v1/messages",
+                            data=json.dumps(payload).encode("utf-8"),
+                            headers={"Content-Type": "application/json", "anthropic-version": "2023-06-01"},
+                            method="POST",
+                        )
+                        with urllib.request.urlopen(request, timeout=10) as response:
+                            return response.read().decode("utf-8", "replace")
+
+                    with_thinking = ask({"thinking": {"type": "enabled", "budget_tokens": 2048}})
+                    without_thinking = ask({})
+        finally:
+            server.shutdown()
+            server.server_close()
+
+        self.assertIn('"content_block":{"type":"thinking","thinking":""}', with_thinking)
+        self.assertIn('"type":"thinking_delta","thinking":"先想一下"', with_thinking)
+        self.assertIn("\"text\":\"答案\"", with_thinking)
+        self.assertIn("event: message_stop", with_thinking)
+
+        self.assertNotIn('"type":"thinking"', without_thinking)
+        self.assertIn("event: ping", without_thinking)
+        self.assertIn("答案", without_thinking)
+        self.assertIn("event: message_stop", without_thinking)
+
     def test_messages_bridge_truncation_and_early_retry(self) -> None:
         """Truncated chat streams fail the turn; zero-content deaths retry invisibly."""
         mode = {"value": "truncate"}

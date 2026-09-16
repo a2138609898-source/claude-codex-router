@@ -1119,7 +1119,9 @@ def response_shape_problem(body: Any, text: str, protocol: str = "responses") ->
             return (
                 "上游返回的是 HTML 网页而不是 API 结果，"
                 "通常说明 Responses 路径写错了（比如少了 /v1）；"
-                "如果各路径都如此，这家网关可能只支持 OpenAI Chat Completions"
+                "如果各路径都如此，这家网关可能只支持 OpenAI Chat Completions——"
+                "请在「供应商配置」页勾选「只支持 Chat Completions 网关（自动桥接）」"
+                "并保存后再测试，桥接会自动完成协议转换"
             )
         return f"上游返回的不是 JSON 对象：{head!r}"
     if protocol == "messages":

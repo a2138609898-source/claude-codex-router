@@ -1073,18 +1073,25 @@ _CHAT_STOP_REASONS_TO_ANTHROPIC = {
 
 
 def chat_completion_to_anthropic_message(
-    completion: dict[str, Any], model: str = ""
+    completion: dict[str, Any], model: str = "", thinking_enabled: bool = False
 ) -> dict[str, Any]:
     """Translate one Chat Completions response into an Anthropic Messages object.
 
-    Reasoning output is intentionally dropped: Anthropic thinking blocks carry a
-    ``signature`` this bridge cannot produce, and an unsigned block risks the client
-    rejecting the whole answer.  The visible text is what the user asked for.
+    A thinking model's reasoning is surfaced as an Anthropic thinking block when the
+    client asked for thinking; it is dropped otherwise, so a client that never requested
+    reasoning cannot receive a block it did not expect.
     """
     choices = completion.get("choices") if isinstance(completion.get("choices"), list) else []
     choice = choices[0] if choices and isinstance(choices[0], dict) else {}
     message = choice.get("message") if isinstance(choice.get("message"), dict) else {}
     content: list[dict[str, Any]] = []
+    reasoning = message.get("reasoning_content")
+    if not (isinstance(reasoning, str) and reasoning):
+        reasoning = message.get("reasoning")
+    if thinking_enabled and isinstance(reasoning, str) and reasoning:
+        # Empty signature: there is nothing to verify on replay, and the bridge never
+        # sends thinking blocks back upstream, so it is never asked for.
+        content.append({"type": "thinking", "thinking": reasoning, "signature": ""})
     text = message.get("content")
     if isinstance(text, str) and text:
         content.append({"type": "text", "text": text})
@@ -1578,8 +1585,15 @@ def chat_sse_to_anthropic_sse(
     upstream: Any,
     model: str,
     outcome: dict[str, Any] | None = None,
+    thinking_enabled: bool = False,
 ) -> Any:
     """Yield Anthropic Messages SSE events while consuming a Chat Completions stream.
+
+    A thinking model streams its reasoning before the answer.  When the client enabled
+    thinking the reasoning becomes a live thinking block; when it did not, the reasoning
+    is still *received* but only acknowledged with periodic pings, because forwarding
+    nothing at all for the whole think made the client look hung and, past its patience,
+    drop the connection.
 
     Completion evidence is ``[DONE]`` or a non-null ``finish_reason``; without either the
     stream is truncated and ``outcome`` says so, so the caller fails the turn instead of
@@ -1593,7 +1607,9 @@ def chat_sse_to_anthropic_sse(
     usage: dict[str, int] = {}
     next_block_index = 0
     text_block: int | None = None
+    thinking_block: int | None = None
     open_tool_blocks: dict[int, int] = {}
+    last_ping = 0.0
 
     def message_start() -> bytes:
         nonlocal started
@@ -1649,6 +1665,41 @@ def chat_sse_to_anthropic_sse(
                 saw_completion = True
                 stop_reason = _CHAT_STOP_REASONS_TO_ANTHROPIC.get(finish, "end_turn")
             delta = choice.get("delta") if isinstance(choice.get("delta"), dict) else {}
+            reasoning_fragment = delta.get("reasoning_content")
+            if not (isinstance(reasoning_fragment, str) and reasoning_fragment):
+                reasoning_fragment = delta.get("reasoning")
+            if isinstance(reasoning_fragment, str) and reasoning_fragment:
+                if not started:
+                    yield message_start()
+                if thinking_enabled:
+                    if thinking_block is None:
+                        thinking_block = next_block_index
+                        next_block_index += 1
+                        yield _sse_frame(
+                            "content_block_start",
+                            {
+                                "type": "content_block_start",
+                                "index": thinking_block,
+                                "content_block": {"type": "thinking", "thinking": ""},
+                            },
+                            None,
+                        )
+                    yield _sse_frame(
+                        "content_block_delta",
+                        {
+                            "type": "content_block_delta",
+                            "index": thinking_block,
+                            "delta": {"type": "thinking_delta", "thinking": reasoning_fragment},
+                        },
+                        None,
+                    )
+                else:
+                    # Keep-alive only: the client did not ask for thinking, but it must
+                    # see traffic while the model thinks or it will time the turn out.
+                    now = time.monotonic()
+                    if now - last_ping >= 5.0:
+                        last_ping = now
+                        yield _sse_frame("ping", {"type": "ping"}, None)
             text = delta.get("content")
             if isinstance(text, str) and text:
                 if not started:
@@ -1725,7 +1776,11 @@ def chat_sse_to_anthropic_sse(
             yield message_start()
         # Close every open block, text first, then the terminal delta.
         stop_order = sorted(
-            [index for index in [text_block, *open_tool_blocks.values()] if index is not None]
+            [
+                index
+                for index in [thinking_block, text_block, *open_tool_blocks.values()]
+                if index is not None
+            ]
         )
         for index in stop_order:
             yield _sse_frame(
@@ -4351,10 +4406,17 @@ class SotaRouterHandler(BaseHTTPRequestHandler):
                 content_type = str(upstream.headers.get("Content-Type") or "").lower()
                 upstream_is_sse = "text/event-stream" in content_type
                 stream_requested = bool((request_payload or {}).get("stream"))
+                thinking_enabled = bool(
+                    isinstance((request_payload or {}).get("thinking"), dict)
+                    and str((request_payload or {}).get("thinking", {}).get("type") or "")
+                    == "enabled"
+                )
                 if (stream_requested or upstream_is_sse) and self.command != "HEAD":
                     if upstream_is_sse:
                         outcome: dict[str, Any] = {}
-                        for chunk in chat_sse_to_anthropic_sse(upstream, model, outcome):
+                        for chunk in chat_sse_to_anthropic_sse(
+                            upstream, model, outcome, thinking_enabled
+                        ):
                             write_chunk(chunk)
                         if outcome.get("truncated"):
                             status = 502
@@ -4365,7 +4427,9 @@ class SotaRouterHandler(BaseHTTPRequestHandler):
                         raw = upstream.read(MAX_REQUEST_BODY_BYTES + 1)
                         if len(raw) > MAX_REQUEST_BODY_BYTES:
                             raise ValueError("upstream response exceeded the adapter limit")
-                        message = chat_completion_to_anthropic_message(json.loads(raw), model)
+                        message = chat_completion_to_anthropic_message(
+                            json.loads(raw), model, thinking_enabled
+                        )
                         data = json.dumps(message, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
                         self.send_response(status)
                         self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -4381,7 +4445,9 @@ class SotaRouterHandler(BaseHTTPRequestHandler):
                     raw = upstream.read(MAX_REQUEST_BODY_BYTES + 1)
                     if len(raw) > MAX_REQUEST_BODY_BYTES:
                         raise ValueError("upstream response exceeded the adapter limit")
-                    message = chat_completion_to_anthropic_message(json.loads(raw), model)
+                    message = chat_completion_to_anthropic_message(
+                        json.loads(raw), model, thinking_enabled
+                    )
                     data = json.dumps(message, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
                     self.send_response(status)
                     self.send_header("Content-Type", "application/json; charset=utf-8")

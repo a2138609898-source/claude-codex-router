@@ -696,7 +696,18 @@ if ($registryExists) {
                     break
                 }
                 foreach ($modelEntry in @($provider.models | Where-Object { $_.enabled -eq $true })) {
-                    $expectedCatalogModels += ((Get-EffectiveModelPrefix -Provider $provider) + [string]$modelEntry.id)
+                    # publish_as (the model-mapping alias) overrides prefix+id, exactly
+                    # like sota_registry.published_slug: the catalog is generated from
+                    # the published slug, so a mapped model must be expected under its
+                    # alias or every mapped provider fails the launch preflight with a
+                    # misleading "catalog is missing".
+                    $publishedAlias = [string]$modelEntry.publish_as
+                    if (-not [string]::IsNullOrWhiteSpace($publishedAlias)) {
+                        $expectedCatalogModels += $publishedAlias
+                    }
+                    else {
+                        $expectedCatalogModels += ((Get-EffectiveModelPrefix -Provider $provider) + [string]$modelEntry.id)
+                    }
                 }
             }
         }
@@ -870,7 +881,7 @@ if ($PrepareOnly) {
             throw "SOTA provider registry is missing or invalid: $registryPath"
         }
         if (-not $catalogValid) {
-            throw "Multi-vendor SOTA model catalog is missing: $catalogPath"
+            throw "Multi-vendor SOTA model catalog is missing or out of date: $catalogPath"
         }
         if ($authStatus.state -ne 'ready') {
             throw "Tango Relay API key is not configured correctly (state: $($authStatus.state))."
@@ -905,7 +916,7 @@ try {
         throw "SOTA provider registry is missing or invalid: $registryPath"
     }
     if (-not $catalogValid) {
-        throw "Multi-vendor SOTA model catalog is missing: $catalogPath"
+        throw "Multi-vendor SOTA model catalog is missing or out of date: $catalogPath"
     }
     if ($authStatus.state -ne 'ready') {
         throw "Tango Relay API key is not configured correctly (state: $($authStatus.state)). Run codex-sota again and paste only the API key when prompted."
