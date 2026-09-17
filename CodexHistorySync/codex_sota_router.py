@@ -131,6 +131,12 @@ STREAM_STATE_MARKERS = (
 # this path exists to prevent. A rejection that arrived in under this many seconds is a
 # decision, not a queue.
 SAME_VENDOR_RETRY_MAX_ELAPSED = 20.0
+# An invisible retry after a zero-content death is only safe while the failure is clearly a
+# connection-level one.  A gateway that spent time THINKING and then timed out has already
+# processed (and billed) the request; resending it is exactly what those relays warn against
+# ("do not resend the same request - it will keep failing and keep consuming your quota").
+# Past this window the death is treated as post-processing and is never replayed.
+STREAM_RETRY_EARLY_WINDOW = 10.0
 
 # POST /responses, /messages, and compact are all conservatively considered billable. The
 # router cannot know whether a gateway charged a request whose response was lost, and a vendor
@@ -4134,9 +4140,22 @@ class SotaRouterHandler(BaseHTTPRequestHandler):
                                 # and the log can see the gateway truncating.
                                 status = 502
                                 relay_error = "truncated SSE stream: no message_stop"
-                            elif outcome.get("retryable") and not is_final_attempt:
-                                # Zero frames reached the client: invisible retry.
-                                return True
+                            elif outcome.get("retryable"):
+                                if (
+                                    not is_final_attempt
+                                    and (time.monotonic() - started) < STREAM_RETRY_EARLY_WINDOW
+                                ):
+                                    # Zero frames reached the client: invisible retry.
+                                    return True
+                                # Too late (or the final attempt) to replay: the client
+                                # still needs a terminal event, not an empty stream.
+                                self._write_stream_error_frame(
+                                    friendly_upstream_error("timeout", vendor),
+                                    protocol="responses",
+                                    send_status=True,
+                                )
+                                status = 502
+                                relay_error = "stream died with no content and was not replayed"
                         else:
                             raw = upstream.read(MAX_REQUEST_BODY_BYTES + 1)
                             if len(raw) > MAX_REQUEST_BODY_BYTES:
@@ -4175,7 +4194,11 @@ class SotaRouterHandler(BaseHTTPRequestHandler):
         except Exception as error:  # noqa: BLE001 - report, never crash the handler thread
             status = 502
             relay_error = f"{type(error).__name__}: {error}"
-            if frames_written == 0 and not is_final_attempt:
+            if (
+                frames_written == 0
+                and not is_final_attempt
+                and (time.monotonic() - started) < STREAM_RETRY_EARLY_WINDOW
+            ):
                 # Nothing reached the client: hand the attempt back for an invisible retry.
                 self.close_connection = True
                 return True
@@ -4281,8 +4304,21 @@ class SotaRouterHandler(BaseHTTPRequestHandler):
                         if outcome.get("truncated"):
                             status = 502
                             relay_error = "truncated SSE stream: no completion event"
-                        elif outcome.get("retryable") and not is_final_attempt:
-                            return True
+                        elif outcome.get("retryable"):
+                            if (
+                                not is_final_attempt
+                                and (time.monotonic() - started) < STREAM_RETRY_EARLY_WINDOW
+                            ):
+                                return True
+                            # Not replayable: answer with the terminal event the client
+                            # understands instead of leaving it an empty stream.
+                            self._write_stream_error_frame(
+                                friendly_upstream_error("timeout", vendor),
+                                protocol="messages" if is_messages_to_chat_adapter(provider) else "responses",
+                                send_status=True,
+                            )
+                            status = 502
+                            relay_error = "stream died with no content and was not replayed"
                     else:
                         raw = upstream.read(MAX_REQUEST_BODY_BYTES + 1)
                         if len(raw) > MAX_REQUEST_BODY_BYTES:
@@ -4316,7 +4352,11 @@ class SotaRouterHandler(BaseHTTPRequestHandler):
         except Exception as error:  # noqa: BLE001 - report, never crash the handler thread
             status = 502
             relay_error = f"{type(error).__name__}: {error}"
-            if frames_written == 0 and not is_final_attempt:
+            if (
+                frames_written == 0
+                and not is_final_attempt
+                and (time.monotonic() - started) < STREAM_RETRY_EARLY_WINDOW
+            ):
                 self.close_connection = True
                 return True
             if not headers_sent and not self._relay_headers_sent and not self.wfile.closed:
@@ -4421,8 +4461,21 @@ class SotaRouterHandler(BaseHTTPRequestHandler):
                         if outcome.get("truncated"):
                             status = 502
                             relay_error = "truncated SSE stream: no completion event"
-                        elif outcome.get("retryable") and not is_final_attempt:
-                            return True
+                        elif outcome.get("retryable"):
+                            if (
+                                not is_final_attempt
+                                and (time.monotonic() - started) < STREAM_RETRY_EARLY_WINDOW
+                            ):
+                                return True
+                            # Not replayable: answer with the terminal event the client
+                            # understands instead of leaving it an empty stream.
+                            self._write_stream_error_frame(
+                                friendly_upstream_error("timeout", vendor),
+                                protocol="messages" if is_messages_to_chat_adapter(provider) else "responses",
+                                send_status=True,
+                            )
+                            status = 502
+                            relay_error = "stream died with no content and was not replayed"
                     else:
                         raw = upstream.read(MAX_REQUEST_BODY_BYTES + 1)
                         if len(raw) > MAX_REQUEST_BODY_BYTES:
@@ -4463,7 +4516,11 @@ class SotaRouterHandler(BaseHTTPRequestHandler):
         except Exception as error:  # noqa: BLE001 - report, never crash the handler thread
             status = 502
             relay_error = f"{type(error).__name__}: {error}"
-            if frames_written == 0 and not is_final_attempt:
+            if (
+                frames_written == 0
+                and not is_final_attempt
+                and (time.monotonic() - started) < STREAM_RETRY_EARLY_WINDOW
+            ):
                 self.close_connection = True
                 return True
             if not headers_sent and not self._relay_headers_sent and not self.wfile.closed:
@@ -4661,11 +4718,25 @@ class SotaRouterHandler(BaseHTTPRequestHandler):
                         # at the TCP level half the time, which used to look exactly like a
                         # normal end: the client silently lost the rest of the answer and
                         # the log recorded a healthy 200.
-                        if not state_seen and not is_final_attempt:
-                            # Only advisory traffic (comments, pings, rate-limit notices)
-                            # ever reached the client, so the death is still invisible.
-                            self.close_connection = True
-                            return True
+                        if not state_seen:
+                            if (
+                                not is_final_attempt
+                                and (time.monotonic() - started) < STREAM_RETRY_EARLY_WINDOW
+                            ):
+                                # Only advisory traffic (comments, pings, rate-limit notices)
+                                # ever reached the client, so the death is still invisible.
+                                self.close_connection = True
+                                return True
+                            # Not replayable (a late death may already be billed, or this is
+                            # the final attempt): tell the client instead of sending nothing.
+                            self._write_stream_error_frame(
+                                friendly_upstream_error("timeout", vendor),
+                                protocol=self._client_protocol(),
+                                send_status=True,
+                            )
+                            status = 502
+                            relay_error = "stream died with no content and was not replayed"
+                            return
                         self._write_stream_error_frame(
                             friendly_upstream_error("truncated", vendor),
                             protocol=self._client_protocol(),
@@ -4681,7 +4752,10 @@ class SotaRouterHandler(BaseHTTPRequestHandler):
             status = 502
             relay_error = f"{type(error).__name__}: {error}"
             if not state_seen and not headers_sent and not self._relay_headers_sent:
-                if not is_final_attempt:
+                if (
+                    not is_final_attempt
+                    and (time.monotonic() - started) < STREAM_RETRY_EARLY_WINDOW
+                ):
                     self.close_connection = True
                     return True
                 if not self.wfile.closed:
@@ -4718,6 +4792,7 @@ class SotaRouterHandler(BaseHTTPRequestHandler):
                 self._write_stream_error_frame(
                     friendly_upstream_error(relay_error, vendor),
                     protocol=self._client_protocol(),
+                    send_status=True,
                 )
         finally:
             self.close_connection = True

@@ -1823,6 +1823,75 @@ class RouterRegressionTests(unittest.TestCase):
         self.assertIn("event: message_stop", stream)
         self.assertNotIn("event: error", stream)
 
+    def test_a_late_zero_content_death_is_not_replayed(self) -> None:
+        """A gateway that died after processing may already have billed: never replay it.
+
+        The relays warn against resending a timed-out request ("it will keep failing and
+        keep consuming your quota"), so the invisible retry is fenced to the first seconds;
+        a later death must produce a terminal event instead of a second upstream attempt.
+        """
+        calls: list[int] = []
+
+        class SilentLateDeath(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, _format: str, *_args: object) -> None:
+                return
+
+            def do_POST(self) -> None:
+                length = int(self.headers.get("Content-Length") or 0)
+                self.rfile.read(length)
+                calls.append(1)
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                time.sleep(2.0)  # longer than the patched window below
+                self.close_connection = True
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), SilentLateDeath)
+        server.daemon_threads = True
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                registry_path = root / "providers.json"
+                auth_path = root / "auth.json"
+                write_auth(auth_path)
+                write_registry(
+                    registry_path,
+                    [self._claude_default_provider(f"http://127.0.0.1:{server.server_port}")],
+                )
+                with mock.patch.object(router, "STREAM_RETRY_EARLY_WINDOW", 1.0):
+                    with RouterHarness(registry_path, auth_path, root / "router.log") as local:
+                        request = urllib.request.Request(
+                            local.url + "/v1/messages",
+                            data=json.dumps(
+                                {
+                                    "model": "claude-opus-5",
+                                    "max_tokens": 8,
+                                    "stream": True,
+                                    "messages": [{"role": "user", "content": "hi"}],
+                                }
+                            ).encode("utf-8"),
+                            headers={"Content-Type": "application/json", "anthropic-version": "2023-06-01"},
+                            method="POST",
+                        )
+                        with urllib.request.urlopen(request, timeout=15) as response:
+                            stream = response.read().decode("utf-8", "replace")
+                log_lines = [
+                    json.loads(line)
+                    for line in (root / "router.log").read_text(encoding="utf-8").splitlines()
+                    if line.strip()
+                ]
+        finally:
+            server.shutdown()
+            server.server_close()
+
+        self.assertEqual(len(calls), 1, "a late zero-content death was replayed upstream")
+        self.assertIn("event: error", stream, "the client got no terminal event")
+        self.assertEqual(log_lines[-1]["status"], 502)
+
     def test_messages_bridge_forwards_thinking_and_pings_without_it(self) -> None:
         """Reasoning streams as a thinking block when asked, as pings when not.
 
