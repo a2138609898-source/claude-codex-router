@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
+import re
 from pathlib import Path
 import signal
 import socket
@@ -1385,6 +1386,20 @@ def friendly_upstream_error(detail: str, vendor: str = "") -> str:
     else:
         reason = "连接中断"
     return f"上游 {vendor} {reason}" if vendor else f"上游{reason}"
+
+
+GATEWAY_TIMEOUT_NOTICE_RE = re.compile(r"exceeded\s+\d+\s*s\s+limit", re.IGNORECASE)
+
+
+def gateway_timeout_notice(text: str) -> bool:
+    """Whether a 200 response body is actually the relay's processing-timeout advisory.
+
+    Some relays answer a timed-out generation with HTTP 200 and this notice as the message
+    content; the log then recorded a healthy 200 for a request that in fact failed, which
+    is exactly the lie that makes diagnosis impossible.  The vendor text is still
+    forwarded untouched -- only the logging and the health picture are corrected.
+    """
+    return bool(GATEWAY_TIMEOUT_NOTICE_RE.search(text or ""))
 
 
 def _sse_frame(
@@ -4226,6 +4241,17 @@ class SotaRouterHandler(BaseHTTPRequestHandler):
             self.close_connection = True
             if not relay_error and not 200 <= status < 300 and head:
                 relay_error = bytes(head[:400]).decode("utf-8", "replace").strip()
+            # The relay dressed its own processing-timeout up as a normal answer: the
+            # vendor text is forwarded untouched, but the log and the health picture
+            # must not record a failed generation as a healthy 200.
+            if (
+                not relay_error
+                and 200 <= status < 300
+                and head
+                and gateway_timeout_notice(bytes(head).decode("utf-8", "replace"))
+            ):
+                relay_error = "upstream returned its processing-timeout notice as content"
+                status = 502
             try:
                 usage = extract_token_usage(bytes(head), b"".join(tail))
             except Exception:  # noqa: BLE001 - telemetry must never affect a served response
@@ -4380,6 +4406,17 @@ class SotaRouterHandler(BaseHTTPRequestHandler):
             self.close_connection = True
             if not relay_error and not 200 <= status < 300 and head:
                 relay_error = bytes(head[:400]).decode("utf-8", "replace").strip()
+            # The relay dressed its own processing-timeout up as a normal answer: the
+            # vendor text is forwarded untouched, but the log and the health picture
+            # must not record a failed generation as a healthy 200.
+            if (
+                not relay_error
+                and 200 <= status < 300
+                and head
+                and gateway_timeout_notice(bytes(head).decode("utf-8", "replace"))
+            ):
+                relay_error = "upstream returned its processing-timeout notice as content"
+                status = 502
             try:
                 usage = extract_token_usage(bytes(head), b"".join(tail))
             except Exception:  # noqa: BLE001 - telemetry must never affect a served response
@@ -4544,6 +4581,17 @@ class SotaRouterHandler(BaseHTTPRequestHandler):
             self.close_connection = True
             if not relay_error and not 200 <= status < 300 and head:
                 relay_error = bytes(head[:400]).decode("utf-8", "replace").strip()
+            # The relay dressed its own processing-timeout up as a normal answer: the
+            # vendor text is forwarded untouched, but the log and the health picture
+            # must not record a failed generation as a healthy 200.
+            if (
+                not relay_error
+                and 200 <= status < 300
+                and head
+                and gateway_timeout_notice(bytes(head).decode("utf-8", "replace"))
+            ):
+                relay_error = "upstream returned its processing-timeout notice as content"
+                status = 502
             try:
                 usage = extract_token_usage(bytes(head), b"".join(tail))
             except Exception:  # noqa: BLE001 - telemetry must never affect a served response
@@ -4802,6 +4850,17 @@ class SotaRouterHandler(BaseHTTPRequestHandler):
                 # channel from a rejected model id, which is exactly the question asked after
                 # the fact. Keep a short prefix of whatever it said.
                 relay_error = bytes(head[:400]).decode("utf-8", "replace").strip()
+            # The relay dressed its own processing-timeout up as a normal answer: the
+            # vendor text is forwarded untouched, but the log and the health picture
+            # must not record a failed generation as a healthy 200.
+            if (
+                not relay_error
+                and 200 <= status < 300
+                and head
+                and gateway_timeout_notice(bytes(head).decode("utf-8", "replace"))
+            ):
+                relay_error = "upstream returned its processing-timeout notice as content"
+                status = 502
             usage: dict[str, int] = {}
             try:
                 usage = extract_token_usage(bytes(head), b"".join(tail))
