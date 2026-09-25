@@ -5,6 +5,7 @@ import json
 import os
 import re
 import sys
+import tempfile
 import tomllib
 import urllib.error
 import urllib.request
@@ -51,12 +52,12 @@ def _without_context_1m_suffix(value: str) -> str:
     return value[:-len(suffix)] if value.lower().endswith(suffix) else value
 
 
-def _same_path(value: object, expected: Path) -> bool:
+def _same_path(value: object, expected: Path, config_root: Path) -> bool:
     if not isinstance(value, str) or not value.strip():
         return False
     candidate = Path(value).expanduser()
     if not candidate.is_absolute():
-        candidate = expected.parent / candidate
+        candidate = config_root / candidate
     try:
         return candidate.resolve(strict=False) == expected.resolve(strict=False)
     except OSError:
@@ -99,34 +100,51 @@ def repair_pinned_models(root: Path, catalog: Path) -> dict[str, Any]:
     config_path = root / "config.toml"
     try:
         text = config_path.read_text(encoding="utf-8")
-    except OSError:
+        parsed = tomllib.loads(text)
+    except (OSError, ValueError):
         return {"reason": "config_unreadable", "repaired": {}}
+    original_text = text
     slugs = _catalog_slug_list(catalog)
     slug_set = set(slugs)
     if not slugs:
         return {"reason": "catalog_unreadable", "repaired": {}}
     repaired: dict[str, Any] = {}
     for field in ("model", "review_model"):
-        pattern = re.compile(r'(?m)^([ \t]*' + field + r'[ \t]*=[ \t]*")([^"]*)(")')
-        match = pattern.search(text)
-        if match is None:
+        original_value = parsed.get(field)
+        if not isinstance(original_value, str):
             continue
-        current = _without_context_1m_suffix(match.group(2).strip())
+        current = _without_context_1m_suffix(original_value.strip())
         if current in slug_set:
             continue
         prefix = _provider_prefix_of(current)
         candidates = [slug for slug in slugs if prefix and slug.startswith(prefix)]
         replacement = (candidates or slugs)[0]
-        text = text[: match.start()] + match.group(1) + replacement + match.group(3) + text[match.end():]
-        repaired[field] = {"from": match.group(2), "to": replacement}
+        expected = {**parsed, field: replacement}
+        pattern = re.compile(r'(?m)^([ \t]*' + field + r'''[ \t]*=[ \t]*)("(?:[^"\\\n]|\\.)*"|'[^'\n]*')''')
+        for match in pattern.finditer(text):
+            candidate = text[:match.start(2)] + json.dumps(replacement, ensure_ascii=False) + text[match.end(2):]
+            try:
+                candidate_data = tomllib.loads(candidate)
+            except ValueError:
+                continue
+            # Match the parsed root setting, never a profile or a multiline string.
+            if candidate_data == expected:
+                text, parsed = candidate, candidate_data
+                repaired[field] = {"from": original_value, "to": replacement}
+                break
     if repaired:
-        temporary = config_path.with_name(config_path.name + ".repair-new")
+        fd, name = tempfile.mkstemp(prefix=".config-repair-", dir=root)
+        os.close(fd)
+        temporary = Path(name)
         try:
             temporary.write_text(text, encoding="utf-8")
+            if config_path.read_text(encoding="utf-8") != original_text:
+                return {"reason": "config_changed_during_repair", "repaired": {}}
             os.replace(temporary, config_path)
         except OSError as error:
-            temporary.unlink(missing_ok=True)
             return {"reason": f"write_failed: {error}", "repaired": {}}
+        finally:
+            temporary.unlink(missing_ok=True)
     return {"reason": "ok", "repaired": repaired}
 
 
@@ -171,9 +189,9 @@ def validate_profile(profile: str, root: Path, catalog: Path | None) -> tuple[bo
         return True, "ok"
 
     if profile == "Sota":
-        if data.get("model_provider") != "tango_relay":
+        if data.get("model_provider") != "true_sota":
             return False, "model_provider_mismatch"
-        if catalog is None or not _same_path(data.get("model_catalog_json"), catalog):
+        if catalog is None or not _same_path(data.get("model_catalog_json"), catalog, root):
             return False, "model_catalog_mismatch"
         slugs = _catalog_slugs(catalog) if catalog is not None else None
         if slugs is None:
@@ -191,7 +209,7 @@ def validate_profile(profile: str, root: Path, catalog: Path | None) -> tuple[bo
                 return False, f"{field}_unqualified"
             if slug not in slugs:
                 return False, f"{field}_not_in_catalog"
-        provider = _provider(data, "tango_relay")
+        provider = _provider(data, "true_sota")
         if provider.get("base_url") != "http://127.0.0.1:17895":
             return False, "base_url_mismatch"
         if provider.get("wire_api") != "responses":

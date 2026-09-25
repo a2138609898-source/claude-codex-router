@@ -1,8 +1,8 @@
-"""Offline end-to-end checks for the juno Responses -> Messages adapter.
+"""Offline end-to-end checks for the justdowork Responses -> Messages adapter.
 
 The fake upstream speaks Anthropic Messages on a loopback port.  A shadow SOTA router uses a
 throwaway registry and auth file, so this check never touches the live listener, credentials, or
-the real juno endpoint.
+the real justdowork endpoint.
 """
 
 from __future__ import annotations
@@ -27,7 +27,7 @@ from fixture_ports import reserve_port, serve_on_free_port  # noqa: E402
 from sota_registry import registry_digest, load_registry  # noqa: E402
 
 
-MODEL = "juno--gpt-5.6-sol"
+MODEL = "justdowork--gpt-5.6-sol"
 UPSTREAM_MODEL = "gpt-5.6-sol"
 TOOL = {
     "type": "namespace",
@@ -89,6 +89,8 @@ class FakeAnthropic(BaseHTTPRequestHandler):
         else:
             content = [{"type": "text", "text": "done" if has_tool_result else "hello"}]
             stop_reason = "end_turn"
+        metadata = body.get("metadata") if isinstance(body.get("metadata"), dict) else {}
+        stop_reason = str(metadata.get("fixture_stop_reason") or stop_reason)
         if stream:
             self._send_stream(content, stop_reason)
             return
@@ -158,8 +160,8 @@ def write_registry(path: Path, upstream_port: int) -> None:
         "version": 1,
         "providers": [
             {
-                "id": "juno",
-                "name": "juno fixture",
+                "id": "justdowork",
+                "name": "justdowork fixture",
                 "workspace": "codex",
                 "enabled": True,
                 "protected": False,
@@ -167,7 +169,7 @@ def write_registry(path: Path, upstream_port: int) -> None:
                 "allow_failover": False,
                 "auth_type": "codex_auth",
                 "base_url": f"http://127.0.0.1:{upstream_port}",
-                "prefix": "juno--",
+                "prefix": "justdowork--",
                 "models_path": "/v1/models",
                 "responses_path": "/responses",
                 "messages_path": "/v1/messages",
@@ -288,6 +290,42 @@ def main() -> int:
             status, stream_body = ask(router_port, {"model": MODEL, "input": "stream", "stream": True})
             stream_text = stream_body.decode("utf-8", "replace")
             results.append(check("streaming text is translated to Responses events", status == 200 and "response.output_text.delta" in stream_text and '"delta":"hello"' in stream_text and "response.completed" in stream_text))
+
+            status, raw_body = ask(
+                router_port,
+                {
+                    "model": MODEL,
+                    "input": "truncate non-stream",
+                    "metadata": {"fixture_stop_reason": "max_tokens"},
+                    "stream": False,
+                },
+            )
+            body = json.loads(raw_body)
+            results.append(check(
+                "non-stream max_tokens preserves the Responses incomplete result",
+                status == 200
+                and body.get("status") == "incomplete"
+                and body.get("incomplete_details", {}).get("reason") == "max_output_tokens",
+            ))
+
+            status, stream_body = ask(
+                router_port,
+                {
+                    "model": MODEL,
+                    "input": "truncate stream",
+                    "metadata": {"fixture_stop_reason": "max_tokens"},
+                    "stream": True,
+                },
+            )
+            stream_text = stream_body.decode("utf-8", "replace")
+            results.append(check(
+                "stream max_tokens ends with response.incomplete, not a false completed event",
+                status == 200
+                and "response.incomplete" in stream_text
+                and '"status":"incomplete"' in stream_text
+                and '"reason":"max_output_tokens"' in stream_text
+                and "response.completed" not in stream_text,
+            ))
 
             status, stream_body = ask(router_port, {"model": MODEL, "input": "stream tool", "tools": [TOOL], "stream": True})
             stream_text = stream_body.decode("utf-8", "replace")

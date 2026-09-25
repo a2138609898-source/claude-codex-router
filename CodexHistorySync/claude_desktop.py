@@ -35,7 +35,7 @@ META_PATH = CONFIG_LIBRARY / "_meta.json"
 BACKUP_ROOT = CLAUDE.root / "backups" / "claude-3p"
 LIBRARY_LOCK_PATH = CLAUDE.root / "claude-library.lock"
 # appliedId in _meta.json is a single global slot that every 3P manager on the machine shares
-# (cc-switch, Foreign Vendor, this one).  There is no way to own it privately, so ownership is
+# (cc-switch, APIKEY.FUN, this one).  There is no way to own it privately, so ownership is
 # tracked here instead: who we displaced, so the slot can be handed back on exit.
 SLOT_CLAIM_PATH = CLAUDE.root / "claude-slot-claim.json"
 _DEFAULT_CONFIG_LIBRARY = CONFIG_LIBRARY

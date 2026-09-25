@@ -19,9 +19,7 @@ from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 
 sys.stdout.reconfigure(encoding="utf-8")
-import os.path  # noqa: E402 - keeps this script runnable from any checkout
-
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from fixture_ports import reserve_port, serve_on_free_port  # noqa: E402
 from sota_registry import (  # noqa: E402
@@ -51,7 +49,7 @@ def pick_provider() -> tuple[str, str]:
     invisible rather than loud: nothing ends up with fast_tier_forced set, the slug it asks for
     routes nowhere, the echo server is never reached, and both rows then print "没有这个字段" --
     which reads like a finding about the router instead of a dead fixture. The prefix comes from
-    the registry too, because it is not always the id plus "--" (xray_gateway is not).
+    the registry too, because it is not always the id plus "--" (xlinks_gateway is not).
     """
     registry = json.loads(Path(REGISTRY_PATH).read_text(encoding="utf-8-sig"))
     for provider in registry["providers"]:

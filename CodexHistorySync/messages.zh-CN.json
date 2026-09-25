@@ -1,7 +1,7 @@
 {
   "success_title": "Codex 对话同步完成",
   "failure_title": "Codex 对话同步失败",
-  "success_intro": "Cockpit、GPT Plus 与 Tango Relay 三方对话同步完成。",
+  "success_intro": "Cockpit、GPT Plus 与 True SOTA 三方对话同步完成。",
   "cockpit": "Cockpit API",
   "plus": "GPT Plus",
   "main_threads": "个主对话",

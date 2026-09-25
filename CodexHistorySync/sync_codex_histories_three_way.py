@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import filecmp
 import json
 import logging
 import os
@@ -18,9 +19,11 @@ from pathlib import Path
 import shutil
 import sqlite3
 import tempfile
+import time
 import traceback
-from typing import Any
+from typing import Any, Callable
 
+import codex_app_lifecycle as lifecycle
 import sync_codex_histories as core
 
 
@@ -31,20 +34,14 @@ DEFAULT_SOTA_ROOT = Path.home() / ".codex-sota"
 DEFAULT_BACKUP_BASE = INSTALL_DIR / "backups" / "three-way"
 COCKPIT_PROVIDER = "codex_local_access"
 PLUS_PROVIDER = "openai"
-SOTA_PROVIDER = "tango_relay"
+SOTA_PROVIDER = "true_sota"
 MAX_THREE_WAY_BACKUPS = 10
 # How many runs keep their outer-snapshot undo image.  Raise it to be able to undo an older
 # sync; each extra run costs a full second copy of every session tree it touched.
 KEEP_OUTER_SNAPSHOTS = 1
-# Session rollout files past this size are recorded in the snapshot manifest but not copied
-# into the undo image.  Two runaway conversations on this install are 255 MB and 327 MB, so
-# one full snapshot used to weigh 7.5 GB and the copy dominated every sync run. Skipping them
-# is safe: every session mutation the sync performs is an atomic temp-file swap, so there is
-# never a torn copy to roll back, and pass-* backups plus the sibling roots still hold the
-# pre-sync content of anything the sync actually changed.
-OUTER_SNAPSHOT_MAX_FILE_BYTES = 64 * 1024 * 1024
 OUTER_SNAPSHOT_FILES = (
     "state_5.sqlite",
+    "thread_history_1.sqlite",
     ".codex-global-state.json",
     "session_index.jsonl",
 )
@@ -91,7 +88,11 @@ def ensure_sota_initialized(
     (sota_root / "archived_sessions").mkdir(parents=True, exist_ok=True)
 
     if target_db.is_file():
-        return False
+        with contextlib.closing(sqlite3.connect(target_db.as_uri() + "?mode=ro", uri=True)) as db:
+            if core.table_exists(db, "threads"):
+                return False
+            if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").fetchone():
+                raise core.SyncError(f"SOTA database has an unexpected schema: {target_db}")
     if not source_db.is_file():
         raise core.SyncError(f"Bootstrap source database is missing: {source_db}")
     stale_sidecars = [
@@ -145,7 +146,19 @@ def rotate_three_way_backups(
         reverse=True,
     )
     for old in runs[keep:]:
+        if recovery_must_be_preserved(old):
+            continue
         shutil.rmtree(old, ignore_errors=True)
+
+
+def recovery_must_be_preserved(run: Path) -> bool:
+    marker = run / "rollback-result.json"
+    if not marker.exists():
+        return False
+    try:
+        return core.read_json_retry(marker).get("status") != "restored"
+    except (OSError, ValueError, core.SyncError):
+        return True
 
 
 def thread_ids_for_root(root: Path) -> set[str]:
@@ -189,6 +202,8 @@ def prune_outer_snapshots(
     )
     removed: list[str] = []
     for run in runs[max(keep, 0) :]:
+        if recovery_must_be_preserved(run):
+            continue
         for name in ("outer-snapshot", "failed-mutated-state"):
             image = run / name
             if not image.is_dir():
@@ -199,30 +214,8 @@ def prune_outer_snapshots(
     return removed
 
 
-def oversize_ignore_filter(skip_log: list[dict[str, Any]]):
-    """copytree ignore hook that leaves files past the snapshot cap out of the copy.
-
-    Every skip is recorded so the manifest and the rollback can account for exactly which
-    files a snapshot copy does not contain.
-    """
-
-    def ignore(directory: str, names: list[str]) -> list[str]:
-        drop: list[str] = []
-        for entry in names:
-            candidate = Path(directory) / entry
-            try:
-                size = candidate.stat().st_size
-            except OSError:
-                continue
-            if candidate.is_file() and size > OUTER_SNAPSHOT_MAX_FILE_BYTES:
-                drop.append(entry)
-                skip_log.append({"path": str(candidate), "bytes": size})
-        return drop
-
-    return ignore
-
-
-def create_outer_snapshot(roots: list[Path], run_backup_root: Path) -> dict[str, Any]:
+def create_outer_snapshot(roots: list[Path], run_backup_root: Path,
+                          quiescence_check: Callable[[], None] | None = None) -> dict[str, Any]:
     """Snapshot every file the three-way sync is allowed to mutate.
 
     Authentication, provider configuration, plugins, and secrets are intentionally outside
@@ -235,6 +228,8 @@ def create_outer_snapshot(roots: list[Path], run_backup_root: Path) -> dict[str,
         "created_at": core.iso_now(),
         "roots": {},
     }
+    previous = next((run / "outer-snapshot" for run in sorted(run_backup_root.parent.iterdir(), reverse=True)
+                     if run != run_backup_root and (run / "outer-snapshot" / "manifest.json").is_file()), None)
     for label, root in zip(("cockpit", "plus", "sota"), roots):
         destination = snapshot_root / label
         destination.mkdir(parents=True, exist_ok=False)
@@ -243,15 +238,34 @@ def create_outer_snapshot(roots: list[Path], run_backup_root: Path) -> dict[str,
             "root_existed": root.exists(),
             "files": {},
             "directories": {},
+            "reused_bytes": 0,
         }
+
+        def copy_rollout(source: str, target: str) -> str:
+            if quiescence_check is not None:
+                quiescence_check()
+            # Only immutable backup copies share storage, never the live rollout.
+            relative = Path(source.removeprefix('\\\\?\\')).relative_to(root)
+            candidate = previous / label / relative if previous else None
+            if candidate is not None and candidate.is_file():
+                try:
+                    if filecmp.cmp(source, core.extended_path(candidate), shallow=False):
+                        os.link(core.extended_path(candidate), target)
+                        root_record["reused_bytes"] += candidate.stat().st_size
+                        return target
+                except OSError:
+                    pass
+            return shutil.copy2(source, target)
         for name in OUTER_SNAPSHOT_FILES:
+            if quiescence_check is not None:
+                quiescence_check()
             source = root / name
             exists = source.is_file()
             root_record["files"][name] = exists
             if not exists:
                 continue
             target = destination / name
-            if name == "state_5.sqlite":
+            if name.endswith(".sqlite"):
                 sqlite_snapshot(source, target)
             else:
                 target.parent.mkdir(parents=True, exist_ok=True)
@@ -265,22 +279,32 @@ def create_outer_snapshot(roots: list[Path], run_backup_root: Path) -> dict[str,
                 # rollout names already run past 100 characters, into a backup root that is itself
                 # deep. See core.extended_path -- the plain form fails with a bare WinError 3 that
                 # names neither path.
-                skipped: list[dict[str, Any]] = []
                 shutil.copytree(
                     core.extended_path(source),
                     core.extended_path(destination / name),
-                    copy_function=shutil.copy2,
+                    copy_function=copy_rollout,
                     symlinks=True,
-                    ignore=oversize_ignore_filter(skipped),
                 )
-                if skipped:
-                    root_record["oversize_skipped"] = skipped
         manifest["roots"][label] = root_record
     core.atomic_write_json(snapshot_root / "manifest.json", manifest)
     return {
         "root": snapshot_root,
         "manifest": manifest,
     }
+
+
+def restore_sqlite_snapshot(source_path: Path, destination_path: Path) -> None:
+    """Restore transactionally without unlinking a database's active WAL/SHM files."""
+    deadline = time.monotonic() + 30
+
+    def check_progress(_status: int, _remaining: int, _total: int) -> None:
+        if time.monotonic() >= deadline:
+            raise core.SyncError(f"SQLite restore timed out: {destination_path}")
+
+    with contextlib.closing(
+        sqlite3.connect(source_path.resolve().as_uri() + "?mode=ro", uri=True, timeout=1)
+    ) as source, contextlib.closing(sqlite3.connect(destination_path, timeout=1)) as target:
+        source.backup(target, pages=256, progress=check_progress, sleep=0.05)
 
 
 def restore_outer_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
@@ -331,19 +355,22 @@ def restore_outer_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
             current = root / name
             recovery_copy = failed_destination / name
             expected = bool(root_record["directories"].get(name))
+            recovery_ready = False
+            mutation_started = False
             try:
                 if current.exists():
-                    recovery_skipped: list[dict[str, Any]] = []
                     shutil.copytree(
                         current,
                         recovery_copy,
                         copy_function=shutil.copy2,
                         symlinks=True,
                         dirs_exist_ok=True,
-                        ignore=oversize_ignore_filter(recovery_skipped),
                     )
+                    recovery_ready = True
+                    mutation_started = True
                     shutil.rmtree(current)
                 if expected:
+                    mutation_started = True
                     shutil.copytree(
                         source_root / name,
                         current,
@@ -352,41 +379,56 @@ def restore_outer_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
                     )
             except Exception as error:  # noqa: BLE001 - rollback must report every failure
                 errors.append(f"{root}\\{name}: {error}")
-                with contextlib.suppress(Exception):
-                    if current.exists():
-                        shutil.rmtree(current)
-                    if recovery_copy.exists():
-                        shutil.copytree(
-                            recovery_copy,
-                            current,
-                            copy_function=shutil.copy2,
-                            symlinks=True,
-                        )
+                if mutation_started:
+                    try:
+                        if current.exists():
+                            shutil.rmtree(current)
+                        if recovery_ready:
+                            shutil.copytree(
+                                recovery_copy,
+                                current,
+                                copy_function=shutil.copy2,
+                                symlinks=True,
+                            )
+                    except Exception as recovery_error:
+                        errors.append(f"{root}\\{name} recovery: {recovery_error}")
         restore_preserved()
 
         for name in OUTER_SNAPSHOT_FILES:
             current = root / name
             recovery_copy = failed_destination / name
             expected = bool(root_record["files"].get(name))
+            recovery_ready = False
+            mutation_started = False
             try:
                 if current.is_file():
                     recovery_copy.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(current, recovery_copy)
-                if name == "state_5.sqlite":
-                    for suffix in ("-wal", "-shm"):
-                        sidecar = root / f"{name}{suffix}"
-                        if sidecar.is_file():
-                            shutil.copy2(sidecar, failed_destination / sidecar.name)
-                            sidecar.unlink()
+                    if name.endswith(".sqlite"):
+                        sqlite_snapshot(current, recovery_copy)
+                    else:
+                        shutil.copy2(current, recovery_copy)
+                    recovery_ready = True
+                mutation_started = True
                 if expected:
-                    core.atomic_copy_file(source_root / name, current)
+                    if name.endswith(".sqlite"):
+                        restore_sqlite_snapshot(source_root / name, current)
+                    else:
+                        core.atomic_copy_file(source_root / name, current)
                 else:
                     current.unlink(missing_ok=True)
+                    if name.endswith(".sqlite"):
+                        for suffix in ("-wal", "-shm"):
+                            (root / f"{name}{suffix}").unlink(missing_ok=True)
             except Exception as error:  # noqa: BLE001 - rollback must report every failure
                 errors.append(f"{root}\\{name}: {error}")
-                with contextlib.suppress(Exception):
-                    if recovery_copy.is_file():
-                        core.atomic_copy_file(recovery_copy, current)
+                if mutation_started and recovery_ready:
+                    try:
+                        if name.endswith(".sqlite"):
+                            restore_sqlite_snapshot(recovery_copy, current)
+                        else:
+                            core.atomic_copy_file(recovery_copy, current)
+                    except Exception as recovery_error:
+                        errors.append(f"{root}\\{name} recovery: {recovery_error}")
 
         if not root_record.get("root_existed"):
             with contextlib.suppress(OSError):
@@ -416,16 +458,78 @@ def account_ids_for_roots(roots: list[Path]) -> set[str]:
     return account_ids
 
 
+def purge_final_exact_duplicates(
+    roots: list[Path],
+    backup_root: Path,
+) -> tuple[dict[str, int], list[str]]:
+    """Remove legacy exact clones left by the final pairwise pass.
+
+    Pairwise sync can create a clone after its own pre-sync cleanup.  At the
+    end of a three-way run, inspect each pair again with fresh snapshots.  A
+    clone is only removed from a pair where both the clone and its canonical
+    row are present and equal, so a profile that lacks proof is untouched.
+    Repeating the three pairs makes the cleanup independent of which pair
+    propagated the last clone.
+    """
+    totals = {
+        "exact_duplicates_removed": 0,
+        "duplicate_main_threads_removed": 0,
+        "duplicate_auxiliary_threads_removed": 0,
+        "duplicate_session_files_removed": 0,
+    }
+    warnings: list[str] = []
+    pairs = ((0, 1), (0, 2), (1, 2))
+    model_guards = core.build_model_guard_contexts(roots)
+
+    for round_number in range(1, 4):
+        removed_this_round = False
+        for pair_number, (left_index, right_index) in enumerate(pairs, start=1):
+            left_root, right_root = roots[left_index], roots[right_index]
+            left = core.load_root_snapshot(left_root)
+            right = core.load_root_snapshot(right_root)
+            plan, find_warnings = core.find_legacy_exact_clones(
+                left, right, model_guards
+            )
+            warnings.extend(find_warnings)
+            if not plan:
+                continue
+            pair_backup = (
+                backup_root
+                / "final-exact-cleanup"
+                / f"round-{round_number:02d}-pair-{pair_number:02d}"
+            )
+            cleanup = core.purge_legacy_exact_clones(
+                [left_root, right_root], plan, pair_backup
+            )
+            for key in totals:
+                totals[key] += int(cleanup.get(key) or 0)
+            removed_this_round = True
+        if not removed_this_round:
+            break
+    return totals, warnings
+
+
 def execute_three_way_mutations(
     started: Any,
     roots: list[Path],
     providers: dict[Path, str],
     run_backup_root: Path,
     backup_base: Path,
+    quiescence_check: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
+    if quiescence_check is not None:
+        quiescence_check()
     bootstrap_created = ensure_sota_initialized(
         roots[0], roots[2], run_backup_root
     )
+    # SOTA is the UI this launcher opens. Preserve the user's archive/unarchive
+    # decisions there throughout every pass, even if another profile's metadata
+    # has a newer updated_at due to background migrations.
+    archive_states = {
+        thread_id: {"archived": int(row.get("archived") or 0),
+                    "archived_at": row.get("archived_at")}
+        for thread_id, row in core.load_root_snapshot(roots[2]).threads.items()
+    }
     passes = (
         ("cockpit-plus", roots[0], roots[1]),
         ("cockpit-sota", roots[0], roots[2]),
@@ -463,6 +567,8 @@ def execute_three_way_mutations(
     for round_number in range(1, MAX_CONVERGENCE_ROUNDS + 1):
         rounds_run = round_number
         for index, (label, left_root, right_root) in enumerate(passes, start=1):
+            if quiescence_check is not None:
+                quiescence_check()
             # Keep round 1's directory names exactly as they were; only a repeat needs the suffix.
             pass_name = f"pass-{index:02d}-{label}"
             if round_number > 1:
@@ -474,6 +580,7 @@ def execute_three_way_mutations(
                 pass_backup_base,
                 providers[left_root],
                 providers[right_root],
+                archive_state_overrides=archive_states,
             )
             last_result = result
             for key in totals:
@@ -505,6 +612,18 @@ def execute_three_way_mutations(
         )
 
     assert last_result is not None
+    final_cleanup, final_cleanup_warnings = purge_final_exact_duplicates(
+        roots, run_backup_root
+    )
+    for key in final_cleanup:
+        totals[key] += final_cleanup[key]
+    warnings.extend(final_cleanup_warnings)
+    for root in roots:
+        snapshot = core.load_root_snapshot(root)
+        for thread_id, state in archive_states.items():
+            row = snapshot.threads.get(thread_id)
+            if row is not None and int(row.get("archived") or 0) != state["archived"]:
+                raise core.SyncError(f"归档保护校验失败：{root} / {thread_id}")
     verification = core.verify_roots(
         roots,
         account_ids_for_roots(roots),
@@ -554,6 +673,40 @@ def execute_three_way_mutations(
     return result
 
 
+def preflight_rollout_availability(roots: list[Path]) -> None:
+    """Reject irrecoverable missing files before snapshots or any mutation/rollback."""
+    core.validate_lineage(roots)
+    missing: set[str] = set()
+    available: set[str] = set()
+    for index, root in enumerate(roots):
+        database = root / "state_5.sqlite"
+        if not database.is_file():
+            continue
+        connection = sqlite3.connect(database.as_uri() + "?mode=ro", uri=True)
+        try:
+            if not core.table_exists(connection, "threads"):
+                user_table = connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").fetchone()
+                if index == 2 and user_table is None:
+                    continue
+                raise core.SyncError(f"History database is missing its threads table: {database}")
+            for thread_id, rollout_path in connection.execute("SELECT id, rollout_path FROM threads"):
+                if rollout_path and Path(rollout_path).is_file():
+                    available.add(str(thread_id))
+                else:
+                    missing.add(str(thread_id))
+        finally:
+            connection.close()
+    missing -= available
+    if missing:
+        for root in roots:
+            missing.difference_update(core.scan_sessions(root))
+    if missing:
+        raise core.SyncError(
+            "同步前发现会话文件缺失，未修改任何历史数据，也未执行回滚："
+            + ", ".join(sorted(missing))
+        )
+
+
 def run_three_way_sync(
     cockpit_root: Path,
     plus_root: Path,
@@ -562,6 +715,8 @@ def run_three_way_sync(
     cockpit_provider: str = COCKPIT_PROVIDER,
     plus_provider: str = PLUS_PROVIDER,
     sota_provider: str = SOTA_PROVIDER,
+    *,
+    quiescence_check: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     started = core.utc_now()
     roots = [
@@ -583,12 +738,17 @@ def run_three_way_sync(
         if not (root / "state_5.sqlite").is_file():
             raise core.SyncError(f"Required Codex database is missing: {root}")
 
+    if quiescence_check is not None:
+        quiescence_check()
+    preflight_rollout_availability(roots)
     backup_base.mkdir(parents=True, exist_ok=True)
     run_name = core.utc_now().strftime("%Y%m%d-%H%M%S-%f")
     run_backup_root = backup_base / run_name
     run_backup_root.mkdir(parents=True, exist_ok=False)
     try:
-        outer_snapshot = create_outer_snapshot(roots, run_backup_root)
+        outer_snapshot = create_outer_snapshot(roots, run_backup_root, quiescence_check)
+        if quiescence_check is not None:
+            quiescence_check()
     except BaseException:
         # The snapshot itself failed, so nothing has been mutated and there is nothing to roll back;
         # this run's backup dir holds only a half-written image with no recovery value. Drop it so a
@@ -608,6 +768,7 @@ def run_three_way_sync(
             providers,
             run_backup_root,
             backup_base,
+            quiescence_check,
         )
     except Exception as error:
         rollback = restore_outer_snapshot(outer_snapshot)
@@ -629,6 +790,7 @@ def run_three_way_sync(
         # name sorts newest, so the image this rollback may still need is never the one dropped.
         try:
             prune_outer_snapshots(backup_base)
+            rotate_three_way_backups(backup_base)
         except OSError:
             # Reclaiming disk is best-effort cleanup; it must never replace the real error with an
             # error about tidying up, nor fail a sync that actually committed.
@@ -742,7 +904,7 @@ def reusable_result_matches_request(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Synchronize Cockpit, Plus, and Tango Relay Codex histories."
+        description="Synchronize Cockpit, Plus, and True SOTA Codex histories."
     )
     parser.add_argument("--cockpit-root", type=Path, default=DEFAULT_COCKPIT_ROOT)
     parser.add_argument("--plus-root", type=Path, default=DEFAULT_PLUS_ROOT)
@@ -758,6 +920,10 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Wait for an in-progress sync to release the lock before syncing.",
     )
+    parser.add_argument("--lock-wait-seconds", type=float, default=None,
+                        help="Override the sync-lock wait; 0 coalesces a busy request immediately.")
+    parser.add_argument("--defer-if-app-running", action="store_true",
+                        help="Sync only while the app is offline; return deferred when it is busy.")
     return parser
 
 
@@ -791,14 +957,24 @@ def main() -> int:
             if core.LAST_RESULT_PATH.exists()
             else 0
         )
-        # A real three-way sync takes minutes (280 s observed on this install), so a 180 s
-        # wait used to expire while the winning sync was still running and turned a launch
-        # into "History sync is already running" failure.  15 minutes covers any sync this
-        # machine actually performs; the wait ends the moment the holder releases.
-        lock_timeout = 900.0 if args.wait_for_existing else 0.0
-        with core.SingleInstanceLock(
-            core.LOCK_PATH, wait_timeout=lock_timeout
-        ) as lock:
+        lock_timeout = args.lock_wait_seconds
+        if lock_timeout is None:
+            lock_timeout = 900.0 if args.wait_for_existing else 0.0
+        # Real profiles are never written while Electron/app-server owns them,
+        # even through an older manual entrypoint without the new watcher flag.
+        use_lifecycle = args.defer_if_app_running or bool(requested_roots & default_roots)
+        with contextlib.ExitStack() as stack:
+            quiescence_check = None
+            if use_lifecycle:
+                lifecycle.assert_quiescent()
+                stack.enter_context(lifecycle.lifecycle_lock(wait_timeout=0.0))
+                lifecycle.assert_quiescent()
+                quiescence_check = lifecycle.assert_quiescent
+            lock = stack.enter_context(core.SingleInstanceLock(
+                core.LOCK_PATH, wait_timeout=lock_timeout, cancel_check=quiescence_check
+            ))
+            if quiescence_check is not None:
+                quiescence_check()
             if (
                 args.wait_for_existing
                 and lock.waited_for_existing
@@ -844,6 +1020,7 @@ def main() -> int:
                 args.cockpit_provider,
                 args.plus_provider,
                 args.sota_provider,
+                quiescence_check=quiescence_check,
             )
             result["log_path"] = str(log_path)
             if requested_roots == default_roots:
@@ -858,6 +1035,21 @@ def main() -> int:
                 )
             )
             return 0
+    except (core.SyncBusy, lifecycle.LifecycleBusy, lifecycle.AppNotQuiescent) as exc:
+        if isinstance(exc, core.SyncBusy):
+            reason = "sync_busy"
+        elif isinstance(exc, lifecycle.AppNotQuiescent):
+            reason = str(exc)
+        else:
+            reason = "launch_in_progress" if lifecycle.launch_pending() else "sync_busy"
+        result = {"status": "deferred", "mode": "three-way", "reason": reason,
+                  "finished_at": core.iso_now(), "log_path": str(log_path)}
+        # A losing/idle watcher must not replace the winner's success marker
+        # with an error. The next offline opportunity will retry this request.
+        logging.info("Three-way sync deferred: %s", reason)
+        print(json.dumps(result, ensure_ascii=args.json, separators=(",", ":") if args.json else None,
+                         indent=None if args.json else 2))
+        return 0
     except Exception as exc:
         result = {
             "status": "error",

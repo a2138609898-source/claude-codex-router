@@ -27,9 +27,7 @@ from pathlib import Path
 from unittest import mock
 
 sys.stdout.reconfigure(encoding="utf-8")
-import os.path  # noqa: E402 - keeps this script runnable from any checkout
-
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import claude_desktop as cd  # noqa: E402
 import codex_sota_router as router  # noqa: E402
@@ -188,15 +186,15 @@ if __name__ == "__main__":
     print("=== 1) 谁配得上 1M：走的是跟思考档同一套归一化 ===")
     for slug, want in [
         ("claude-opus-5", True),
-        ("tango.anthropic.claude-opus-5", True),
-        ("alfa-relay.anthropic.claude-opus-4-8", True),
-        ("sierra.anthropic.claude-opus-4-6", True),
+        ("truesota.anthropic.claude-opus-5", True),
+        ("agent-router.anthropic.claude-opus-4-8", True),
+        ("seekai.anthropic.claude-opus-4-6", True),
         ("anthropic.claude-sonnet-4-5-v2:0", True),
-        ("Tango.Anthropic.Claude-Opus-5", True),
+        ("Truesota.Anthropic.Claude-Opus-5", True),
         ("x.anthropic.claude-fable-5", True),
         ("claude-haiku-4-5", False),
-        ("kilo.anthropic.claude-opus-5-thinking", False),
-        ("tango--claude-opus-5", False),
+        ("kktoken.anthropic.claude-opus-5-thinking", False),
+        ("truesota--claude-opus-5", False),
         ("gpt-5.6-sol", False),
     ]:
         got = cd.supports_1m_context(slug)
@@ -204,28 +202,28 @@ if __name__ == "__main__":
 
     print("\n=== 2) build_inference_models：该给的给，不该给的一个都不给 ===")
     reg = {"providers": [
-        provider("juno", ["messages"], ["claude-opus-5"], enabled=True, is_default=True,
+        provider("justdowork", ["messages"], ["claude-opus-5"], enabled=True, is_default=True,
                  prefix=""),
-        provider("sierra", ["messages"], ["claude-opus-4-6", "claude-haiku-4-5"], enabled=True,
-                 prefix="sierra.anthropic."),
-        provider("mike", ["responses"], ["gpt-5.6-sol"], enabled=True, prefix="mike--"),
+        provider("seekai", ["messages"], ["claude-opus-4-6", "claude-haiku-4-5"], enabled=True,
+                 prefix="seekai.anthropic."),
+        provider("miaomiao", ["responses"], ["gpt-5.6-sol"], enabled=True, prefix="miaomiao--"),
         provider("offline", ["messages"], ["claude-opus-5"], enabled=False, prefix="off.anthropic."),
     ]}
     built = cd.build_inference_models(reg)
     by_name = {m["name"]: m for m in built}
     check("只收 messages 且启用的供应商", sorted(by_name) == sorted([
-        "claude-opus-5", "sierra.anthropic.claude-opus-4-6", "sierra.anthropic.claude-haiku-4-5"]),
+        "claude-opus-5", "seekai.anthropic.claude-opus-4-6", "seekai.anthropic.claude-haiku-4-5"]),
         str(sorted(by_name)))
     check("opus 带上了 supports1m", by_name["claude-opus-5"].get("supports1m") is True)
-    check("4-6 也带上了", by_name["sierra.anthropic.claude-opus-4-6"].get("supports1m") is True)
+    check("4-6 也带上了", by_name["seekai.anthropic.claude-opus-4-6"].get("supports1m") is True)
     check("haiku 没有这个键（不是 False，是没有）",
-          "supports1m" not in by_name["sierra.anthropic.claude-haiku-4-5"],
-          str(by_name["sierra.anthropic.claude-haiku-4-5"]))
+          "supports1m" not in by_name["seekai.anthropic.claude-haiku-4-5"],
+          str(by_name["seekai.anthropic.claude-haiku-4-5"]))
     check("谁都没有被塞 prefer1m：默认档位由用户自己挑",
           all("prefer1m" not in m for m in built))
     check("labelOverride 照旧带着厂商和真实上游 id",
-          by_name["sierra.anthropic.claude-opus-4-6"]["labelOverride"] == "Sierra · claude-opus-4-6",
-          by_name["sierra.anthropic.claude-opus-4-6"]["labelOverride"])
+          by_name["seekai.anthropic.claude-opus-4-6"]["labelOverride"] == "Seekai · claude-opus-4-6",
+          by_name["seekai.anthropic.claude-opus-4-6"]["labelOverride"])
 
     print("\n=== 3) write_profile 不再把能力位刮掉（一次性档库，真实档库没碰）===")
     library_root = Path(tempfile.mkdtemp())
@@ -249,8 +247,8 @@ if __name__ == "__main__":
         check("supports1m 活着写进了档", saved["claude-opus-5"].get("supports1m") is True,
               str(saved["claude-opus-5"]))
         check("haiku 那条还是干净的两个键",
-              set(saved["sierra.anthropic.claude-haiku-4-5"]) == {"name", "labelOverride"},
-              str(saved["sierra.anthropic.claude-haiku-4-5"]))
+              set(saved["seekai.anthropic.claude-haiku-4-5"]) == {"name", "labelOverride"},
+              str(saved["seekai.anthropic.claude-haiku-4-5"]))
         check("四个能力位一起写时全都留下",
               saved["manual.anthropic.claude-sonnet-5"] == {
                   "name": "manual.anthropic.claude-sonnet-5", "labelOverride": "手写",
@@ -276,7 +274,7 @@ if __name__ == "__main__":
     for raw, want in [
         ("claude-opus-5[1m]", "claude-opus-5"),
         ("claude-opus-5[1M]", "claude-opus-5"),
-        ("tango.anthropic.claude-opus-5[1m]", "tango.anthropic.claude-opus-5"),
+        ("truesota.anthropic.claude-opus-5[1m]", "truesota.anthropic.claude-opus-5"),
         ("claude-opus-5", "claude-opus-5"),
         ("claude-opus-5[preview]", "claude-opus-5[preview]"),
         ("claude-opus-5[1m]x", "claude-opus-5[1m]x"),
@@ -350,7 +348,6 @@ if __name__ == "__main__":
     total, passed = len(results), sum(results)
     print(f"\n合计 {passed}/{total} 项通过；线上 17895/17994 与真实档库全程未动。")
     raise SystemExit(0 if passed == total else 1)
-
 
 
 

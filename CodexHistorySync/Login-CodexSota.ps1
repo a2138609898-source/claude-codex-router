@@ -44,7 +44,7 @@ if ((Test-ExistingSotaAuth) -and -not $Force) {
 }
 
 if ($NonInteractive) {
-    throw 'Tango Relay API key is missing or invalid, and this run cannot prompt for it. Open PowerShell, run codex-sota, and paste the key when prompted.'
+    throw 'True SOTA API key is missing or invalid, and this run cannot prompt for it. Open PowerShell, run codex-sota, and paste the key when prompted.'
 }
 
 if (-not $CodexExecutable) {
@@ -62,9 +62,9 @@ foreach ($name in $apiEnvironmentNames) {
     Remove-Item -LiteralPath "Env:$name" -ErrorAction SilentlyContinue
 }
 
-Write-Host 'Tango Relay needs its own API key.'
+Write-Host 'True SOTA needs its own API key.'
 Write-Host 'Paste only the key itself. Do not paste a PowerShell command, quotes, or the word Bearer.'
-$secureKey = Read-Host -Prompt 'Tango Relay API Key' -AsSecureString
+$secureKey = Read-Host -Prompt 'True SOTA API Key' -AsSecureString
 $keyPointer = [IntPtr]::Zero
 $plainKey = $null
 try {
@@ -89,8 +89,8 @@ finally {
 }
 
 if (-not (Test-ExistingSotaAuth)) {
-    throw 'Codex did not persist a structurally valid Tango Relay API-key login.'
+    throw 'Codex did not persist a structurally valid True SOTA API-key login.'
 }
 
-Write-Host 'Tango Relay API key saved to the isolated profile.'
+Write-Host 'True SOTA API key saved to the isolated profile.'
 exit 0

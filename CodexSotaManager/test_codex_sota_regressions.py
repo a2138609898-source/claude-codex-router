@@ -566,7 +566,7 @@ class RouterRegressionTests(unittest.TestCase):
             auth_path = root / "auth.json"
             write_auth(auth_path)
             provider = provider_config(
-                "juno",
+                "justdowork",
                 upstream.url,
                 prefix="",
                 is_default=True,
@@ -1007,11 +1007,11 @@ class RouterRegressionTests(unittest.TestCase):
                     upstream.paths(), [], "it kept asking a gateway that already said no"
                 )
 
-    def test_juno_adapter_count_tokens_never_becomes_a_generation(self) -> None:
+    def test_justdowork_adapter_count_tokens_never_becomes_a_generation(self) -> None:
         """The Responses-to-Messages adapter must not rewrite count_tokens onto /messages.
 
         Codex-compatible clients may ask the local router for context usage.  Forwarding that
-        request through the juno adapter used to hit its billable generation endpoint,
+        request through the justdowork adapter used to hit its billable generation endpoint,
         because the adapter maps every outbound call to /v1/messages.  The router must answer
         locally without sending even one byte to the provider.
         """
@@ -1021,9 +1021,9 @@ class RouterRegressionTests(unittest.TestCase):
             auth_path = root / "auth.json"
             write_auth(auth_path)
             provider = provider_config(
-                "juno",
+                "justdowork",
                 upstream.url,
-                prefix="juno--",
+                prefix="justdowork--",
                 is_default=True,
                 protocols=("responses", "messages"),
                 model_id="gpt-5.6-sol",
@@ -1036,7 +1036,7 @@ class RouterRegressionTests(unittest.TestCase):
                     local.url + "/v1/messages/count_tokens",
                     data=json.dumps(
                         {
-                            "model": "juno--gpt-5.6-sol",
+                            "model": "justdowork--gpt-5.6-sol",
                             "messages": [{"role": "user", "content": "hello there"}],
                         }
                     ).encode("utf-8"),
@@ -1051,10 +1051,10 @@ class RouterRegressionTests(unittest.TestCase):
             self.assertEqual(
                 upstream.requests,
                 [],
-                "count_tokens escaped to juno's billable /messages endpoint",
+                "count_tokens escaped to justdowork's billable /messages endpoint",
             )
 
-    def test_juno_adapter_rejects_responses_compact_without_upstream_hit(self) -> None:
+    def test_justdowork_adapter_rejects_responses_compact_without_upstream_hit(self) -> None:
         """Compact is not an ordinary generation and must never be rewritten to Messages."""
         with tempfile.TemporaryDirectory() as temporary, ScriptedUpstream() as upstream:
             root = Path(temporary)
@@ -1062,9 +1062,9 @@ class RouterRegressionTests(unittest.TestCase):
             auth_path = root / "auth.json"
             write_auth(auth_path)
             provider = provider_config(
-                "juno",
+                "justdowork",
                 upstream.url,
-                prefix="juno--",
+                prefix="justdowork--",
                 is_default=True,
                 protocols=("responses", "messages"),
                 model_id="gpt-5.6-sol",
@@ -1077,7 +1077,7 @@ class RouterRegressionTests(unittest.TestCase):
                     request = urllib.request.Request(
                         local.url + path,
                         data=json.dumps(
-                            {"model": "juno--gpt-5.6-sol", "input": "compact me"}
+                            {"model": "justdowork--gpt-5.6-sol", "input": "compact me"}
                         ).encode("utf-8"),
                         headers={"Content-Type": "application/json"},
                         method="POST",
@@ -1093,7 +1093,7 @@ class RouterRegressionTests(unittest.TestCase):
             self.assertEqual(
                 upstream.requests,
                 [],
-                "Responses compact was rewritten into juno's billable Messages endpoint",
+                "Responses compact was rewritten into justdowork's billable Messages endpoint",
             )
 
     def test_adapter_reasoning_effort_maps_to_thinking_budget(self) -> None:
@@ -1172,9 +1172,9 @@ class RouterRegressionTests(unittest.TestCase):
                 auth_path = root / "auth.json"
                 write_auth(auth_path)
                 provider = provider_config(
-                    "juno",
+                    "justdowork",
                     f"http://127.0.0.1:{server.server_port}",
-                    prefix="juno--",
+                    prefix="justdowork--",
                     is_default=True,
                     protocols=("responses", "messages"),
                     model_id="gpt-5.6-sol",
@@ -1187,7 +1187,7 @@ class RouterRegressionTests(unittest.TestCase):
                         local.url + "/responses",
                         data=json.dumps(
                             {
-                                "model": "juno--gpt-5.6-sol",
+                                "model": "justdowork--gpt-5.6-sol",
                                 "input": "which is bigger",
                                 "reasoning": {"effort": "ultra"},
                                 "stream": True,
@@ -1213,7 +1213,7 @@ class RouterRegressionTests(unittest.TestCase):
             upstream_body.get("thinking"), {"type": "enabled", "budget_tokens": 8192}
         )
         self.assertEqual(upstream_body.get("max_tokens"), 10240)
-        self.assertEqual(received[0]["ua"], router.JUNO_CODEX_USER_AGENT)
+        self.assertEqual(received[0]["ua"], router.JUSTDOWORK_CODEX_USER_AGENT)
         self.assertEqual(received[0]["originator"], "codex_cli_rs")
         self.assertIn("response.reasoning_summary_part.added", stream)
         self.assertIn("response.reasoning_summary_text.delta", stream)
@@ -1352,9 +1352,9 @@ class RouterRegressionTests(unittest.TestCase):
                 auth_path = root / "auth.json"
                 write_auth(auth_path)
                 provider = provider_config(
-                    "juno",
+                    "justdowork",
                     f"http://127.0.0.1:{server.server_port}",
-                    prefix="juno--",
+                    prefix="justdowork--",
                     is_default=True,
                     protocols=("responses", "messages"),
                     model_id="gpt-5.6-sol",
@@ -1366,7 +1366,7 @@ class RouterRegressionTests(unittest.TestCase):
                     request = urllib.request.Request(
                         local.url + "/responses",
                         data=json.dumps(
-                            {"model": "juno--gpt-5.6-sol", "input": "hi", "stream": True}
+                            {"model": "justdowork--gpt-5.6-sol", "input": "hi", "stream": True}
                         ).encode("utf-8"),
                         headers={"Content-Type": "application/json"},
                         method="POST",
@@ -1446,15 +1446,15 @@ class RouterRegressionTests(unittest.TestCase):
                         models=[{"id": "claude-opus-5", "enabled": True}],
                     ),
                     self._claude_provider(
-                        "juno",
+                        "justdowork",
                         upstream.url,
-                        prefix="juno.anthropic.",
+                        prefix="justdowork.anthropic.",
                         is_default=False,
                         models=[
                             {
                                 "id": "gpt-5.6-sol",
                                 "enabled": True,
-                                "publish_as": "juno.anthropic.claude-opus-5",
+                                "publish_as": "justdowork.anthropic.claude-opus-5",
                             }
                         ],
                     ),
@@ -1464,9 +1464,9 @@ class RouterRegressionTests(unittest.TestCase):
                 with urllib.request.urlopen(local.url + "/v1/models", timeout=10) as response:
                     listing = json.loads(response.read())
                 ids = [entry["id"] for entry in listing["data"]]
-                self.assertIn("juno.anthropic.claude-opus-5", ids)
+                self.assertIn("justdowork.anthropic.claude-opus-5", ids)
                 self.assertNotIn(
-                    "juno.anthropic.gpt-5.6-sol",
+                    "justdowork.anthropic.gpt-5.6-sol",
                     ids,
                     "the plain slug must not stay advertised beside its alias",
                 )
@@ -1475,7 +1475,7 @@ class RouterRegressionTests(unittest.TestCase):
                     local.url + "/v1/messages",
                     data=json.dumps(
                         {
-                            "model": "juno.anthropic.claude-opus-5",
+                            "model": "justdowork.anthropic.claude-opus-5",
                             "max_tokens": 8,
                             "messages": [{"role": "user", "content": "hi"}],
                         }
@@ -1496,7 +1496,7 @@ class RouterRegressionTests(unittest.TestCase):
                     local.url + "/v1/messages",
                     data=json.dumps(
                         {
-                            "model": "juno.anthropic.gpt-5.6-sol",
+                            "model": "justdowork.anthropic.gpt-5.6-sol",
                             "max_tokens": 8,
                             "messages": [{"role": "user", "content": "hi"}],
                         }
@@ -1512,7 +1512,7 @@ class RouterRegressionTests(unittest.TestCase):
         """The Codex side of publish_as: alias answers, upstream gets the real id.
 
         The Codex App reads capability metadata from the generated catalog, whose templates
-        are keyed on known GPT slugs.  Mapping a non-GPT model onto ``sierra--gpt-5.6-sol``
+        are keyed on known GPT slugs.  Mapping a non-GPT model onto ``seekai--gpt-5.6-sol``
         must both route requests by that alias and build the catalog entry from the
         gpt-5.6-sol template instead of silently wearing the default one.
         """
@@ -1522,15 +1522,15 @@ class RouterRegressionTests(unittest.TestCase):
             auth_path = root / "auth.json"
             write_auth(auth_path)
             base = provider_config(
-                "sierra",
+                "seekai",
                 upstream.url,
-                prefix="sierra--",
+                prefix="seekai--",
                 is_default=True,
                 protocols=("responses",),
                 model_id="placeholder",
             )
             base["models"] = [
-                {"id": "claude-opus-5", "enabled": True, "publish_as": "sierra--gpt-5.6-sol"}
+                {"id": "claude-opus-5", "enabled": True, "publish_as": "seekai--gpt-5.6-sol"}
             ]
             write_registry(registry_path, [base])
 
@@ -1538,13 +1538,13 @@ class RouterRegressionTests(unittest.TestCase):
                 with urllib.request.urlopen(local.url + "/models", timeout=10) as response:
                     listing = json.loads(response.read())
                 ids = [entry["id"] for entry in listing["data"]]
-                self.assertIn("sierra--gpt-5.6-sol", ids)
-                self.assertNotIn("sierra--claude-opus-5", ids)
+                self.assertIn("seekai--gpt-5.6-sol", ids)
+                self.assertNotIn("seekai--claude-opus-5", ids)
 
                 alias_request = urllib.request.Request(
                     local.url + "/responses",
                     data=json.dumps(
-                        {"model": "sierra--gpt-5.6-sol", "input": "hi", "stream": False}
+                        {"model": "seekai--gpt-5.6-sol", "input": "hi", "stream": False}
                     ).encode("utf-8"),
                     headers={"Content-Type": "application/json"},
                     method="POST",
@@ -1561,7 +1561,7 @@ class RouterRegressionTests(unittest.TestCase):
                 plain_request = urllib.request.Request(
                     local.url + "/responses",
                     data=json.dumps(
-                        {"model": "sierra--claude-opus-5", "input": "hi", "stream": False}
+                        {"model": "seekai--claude-opus-5", "input": "hi", "stream": False}
                     ).encode("utf-8"),
                     headers={"Content-Type": "application/json"},
                     method="POST",
@@ -1585,7 +1585,7 @@ class RouterRegressionTests(unittest.TestCase):
         return provider
 
     @staticmethod
-    def _claude_chat_provider(provider_id: str, base_url: str, model_id: str = "nova-vision") -> dict[str, object]:
+    def _claude_chat_provider(provider_id: str, base_url: str, model_id: str = "sensenova-vision") -> dict[str, object]:
         provider = provider_config(
             provider_id,
             base_url,
@@ -1616,7 +1616,7 @@ class RouterRegressionTests(unittest.TestCase):
                     "id": "chatcmpl-m1",
                     "object": "chat.completion",
                     "created": 1700000000,
-                    "model": "nova-vision",
+                    "model": "sensenova-vision",
                     "choices": [
                         {
                             "index": 0,
@@ -1646,7 +1646,7 @@ class RouterRegressionTests(unittest.TestCase):
                     registry_path,
                     [
                         self._claude_default_provider(f"http://127.0.0.1:{server.server_port}"),
-                        self._claude_chat_provider("golf", f"http://127.0.0.1:{server.server_port}"),
+                        self._claude_chat_provider("mfsense", f"http://127.0.0.1:{server.server_port}"),
                     ],
                 )
                 with RouterHarness(registry_path, auth_path, root / "router.log") as local:
@@ -1654,7 +1654,7 @@ class RouterRegressionTests(unittest.TestCase):
                         local.url + "/v1/messages",
                         data=json.dumps(
                             {
-                                "model": "golf.anthropic.nova-vision",
+                                "model": "mfsense.anthropic.sensenova-vision",
                                 "max_tokens": 128,
                                 "system": "Be terse.",
                                 "messages": [
@@ -1695,7 +1695,7 @@ class RouterRegressionTests(unittest.TestCase):
             server.server_close()
 
         sent = received[-1]
-        self.assertEqual(sent["model"], "nova-vision")
+        self.assertEqual(sent["model"], "sensenova-vision")
         self.assertEqual(sent["messages"][0], {"role": "system", "content": "Be terse."})
         self.assertEqual(sent["messages"][1], {"role": "user", "content": "首都在哪"})
         assistant_turn = sent["messages"][2]
@@ -1719,7 +1719,7 @@ class RouterRegressionTests(unittest.TestCase):
 
     def test_messages_bridge_count_tokens_is_estimated_locally(self) -> None:
         """count_tokens must be answered locally, never refused and never forwarded."""
-        provider = self._claude_chat_provider("golf", "http://127.0.0.1:1")
+        provider = self._claude_chat_provider("mfsense", "http://127.0.0.1:1")
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             registry_path = root / "providers.json"
@@ -1734,7 +1734,7 @@ class RouterRegressionTests(unittest.TestCase):
                     local.url + "/v1/messages/count_tokens",
                     data=json.dumps(
                         {
-                            "model": "golf.anthropic.nova-vision",
+                            "model": "mfsense.anthropic.sensenova-vision",
                             "messages": [{"role": "user", "content": "count me"}],
                         }
                     ).encode("utf-8"),
@@ -1767,7 +1767,7 @@ class RouterRegressionTests(unittest.TestCase):
                     self.wfile.write(f"data: {json.dumps(payload, separators=(',', ':'))}\n\n".encode())
                     self.wfile.flush()
 
-                send({"id": "chatcmpl-s", "model": "nova-vision", "choices": [{"index": 0, "delta": {"role": "assistant", "content": "北"}}]})
+                send({"id": "chatcmpl-s", "model": "sensenova-vision", "choices": [{"index": 0, "delta": {"role": "assistant", "content": "北"}}]})
                 send({"choices": [{"index": 0, "delta": {"content": "京"}}]})
                 send({"choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "id": "toolu_a", "function": {"name": "lookup", "arguments": "{\"q\":"}}]}}]})
                 send({"choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "function": {"arguments": "1}"}}]}}]})
@@ -1790,7 +1790,7 @@ class RouterRegressionTests(unittest.TestCase):
                     registry_path,
                     [
                         self._claude_default_provider(f"http://127.0.0.1:{server.server_port}"),
-                        self._claude_chat_provider("golf", f"http://127.0.0.1:{server.server_port}"),
+                        self._claude_chat_provider("mfsense", f"http://127.0.0.1:{server.server_port}"),
                     ],
                 )
                 with RouterHarness(registry_path, auth_path, root / "router.log") as local:
@@ -1798,7 +1798,7 @@ class RouterRegressionTests(unittest.TestCase):
                         local.url + "/v1/messages",
                         data=json.dumps(
                             {
-                                "model": "golf.anthropic.nova-vision",
+                                "model": "mfsense.anthropic.sensenova-vision",
                                 "max_tokens": 64,
                                 "stream": True,
                                 "messages": [{"role": "user", "content": "hi"}],
@@ -1941,13 +1941,13 @@ class RouterRegressionTests(unittest.TestCase):
                     registry_path,
                     [
                         self._claude_default_provider(f"http://127.0.0.1:{server.server_port}"),
-                        self._claude_chat_provider("golf", f"http://127.0.0.1:{server.server_port}"),
+                        self._claude_chat_provider("mfsense", f"http://127.0.0.1:{server.server_port}"),
                     ],
                 )
                 with RouterHarness(registry_path, auth_path, root / "router.log") as local:
                     def ask(extra: dict) -> str:
                         payload = {
-                            "model": "golf.anthropic.nova-vision",
+                            "model": "mfsense.anthropic.sensenova-vision",
                             "max_tokens": 64,
                             "stream": True,
                             "messages": [{"role": "user", "content": "hi"}],
@@ -2022,12 +2022,12 @@ class RouterRegressionTests(unittest.TestCase):
                     registry_path,
                     [
                         self._claude_default_provider(f"http://127.0.0.1:{server.server_port}"),
-                        self._claude_chat_provider("golf", f"http://127.0.0.1:{server.server_port}"),
+                        self._claude_chat_provider("mfsense", f"http://127.0.0.1:{server.server_port}"),
                     ],
                 )
                 with RouterHarness(registry_path, auth_path, root / "router.log") as local:
                     payload = {
-                        "model": "golf.anthropic.nova-vision",
+                        "model": "mfsense.anthropic.sensenova-vision",
                         "max_tokens": 32,
                         "stream": True,
                         "messages": [{"role": "user", "content": "hi"}],
@@ -2067,7 +2067,7 @@ class RouterRegressionTests(unittest.TestCase):
 
     def test_messages_bridge_guards_and_validation(self) -> None:
         """A Responses request is refused; the bridge requires the messages protocol."""
-        provider = self._claude_chat_provider("golf", "http://127.0.0.1:1")
+        provider = self._claude_chat_provider("mfsense", "http://127.0.0.1:1")
         provider["protocols"] = ["responses", "messages"]
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -2082,7 +2082,7 @@ class RouterRegressionTests(unittest.TestCase):
                 request = urllib.request.Request(
                     local.url + "/responses",
                     data=json.dumps(
-                        {"model": "golf.anthropic.nova-vision", "input": "hi", "stream": False}
+                        {"model": "mfsense.anthropic.sensenova-vision", "input": "hi", "stream": False}
                     ).encode("utf-8"),
                     headers={"Content-Type": "application/json"},
                     method="POST",
@@ -2093,17 +2093,17 @@ class RouterRegressionTests(unittest.TestCase):
                 payload = json.loads(raised.exception.read())
                 self.assertEqual(payload["error"]["type"], "unsupported_adapter_operation")
 
-        broken = self._claude_chat_provider("golf", "http://127.0.0.1:1")
+        broken = self._claude_chat_provider("mfsense", "http://127.0.0.1:1")
         broken["protocols"] = ["responses"]
         with self.assertRaises(ValueError) as caught:
             registry.validate_provider(deepcopy(broken), allow_missing_secret=True)
         self.assertIn("messages", str(caught.exception))
 
-        probe_ok = self._claude_chat_provider("golf", "http://127.0.0.1:1")
+        probe_ok = self._claude_chat_provider("mfsense", "http://127.0.0.1:1")
         self.assertEqual(registry.probe_protocol(probe_ok), "chat")
 
     @staticmethod
-    def _chat_provider(provider_id: str, base_url: str, model_id: str = "nova-test") -> dict[str, object]:
+    def _chat_provider(provider_id: str, base_url: str, model_id: str = "sensenova-test") -> dict[str, object]:
         provider = provider_config(
             provider_id,
             base_url,
@@ -2133,7 +2133,7 @@ class RouterRegressionTests(unittest.TestCase):
                     "id": "chatcmpl-1",
                     "object": "chat.completion",
                     "created": 1700000000,
-                    "model": "nova-test",
+                    "model": "sensenova-test",
                     "choices": [
                         {
                             "index": 0,
@@ -2168,7 +2168,7 @@ class RouterRegressionTests(unittest.TestCase):
                         local.url + "/responses",
                         data=json.dumps(
                             {
-                                "model": "chatvendor--nova-test",
+                                "model": "chatvendor--sensenova-test",
                                 "instructions": "You are terse.",
                                 "input": [
                                     {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]},
@@ -2209,7 +2209,7 @@ class RouterRegressionTests(unittest.TestCase):
             server.server_close()
 
         sent = received[-1]
-        self.assertEqual(sent["model"], "nova-test")
+        self.assertEqual(sent["model"], "sensenova-test")
         self.assertEqual(sent["messages"][0], {"role": "system", "content": "You are terse."})
         self.assertEqual(sent["messages"][1]["role"], "user")
         tool_call_message = sent["messages"][2]
@@ -2251,7 +2251,7 @@ class RouterRegressionTests(unittest.TestCase):
                     self.wfile.write(f"data: {json.dumps(payload, separators=(',', ':'))}\n\n".encode())
                     self.wfile.flush()
 
-                send({"id": "chatcmpl-s", "model": "nova-test", "choices": [{"index": 0, "delta": {"role": "assistant", "content": "Hel"}}]})
+                send({"id": "chatcmpl-s", "model": "sensenova-test", "choices": [{"index": 0, "delta": {"role": "assistant", "content": "Hel"}}]})
                 send({"choices": [{"index": 0, "delta": {"content": "lo"}}]})
                 send({"choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "id": "call_a", "function": {"name": "lookup", "arguments": "{\"q\":"}}]}}]})
                 send({"choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "function": {"arguments": "7}"}}]}}]})
@@ -2277,7 +2277,7 @@ class RouterRegressionTests(unittest.TestCase):
                 with RouterHarness(registry_path, auth_path, root / "router.log") as local:
                     request = urllib.request.Request(
                         local.url + "/responses",
-                        data=json.dumps({"model": "chatvendor--nova-test", "input": "hi", "stream": True}).encode("utf-8"),
+                        data=json.dumps({"model": "chatvendor--sensenova-test", "input": "hi", "stream": True}).encode("utf-8"),
                         headers={"Content-Type": "application/json"},
                         method="POST",
                     )
@@ -2322,7 +2322,7 @@ class RouterRegressionTests(unittest.TestCase):
                 self.rfile.read(length)
                 payload = {
                     "id": "chatcmpl-c",
-                    "model": "nova-test",
+                    "model": "sensenova-test",
                     "choices": [
                         {
                             "index": 0,
@@ -2366,7 +2366,7 @@ class RouterRegressionTests(unittest.TestCase):
                         local.url + "/responses",
                         data=json.dumps(
                             {
-                                "model": "chatvendor--nova-test",
+                                "model": "chatvendor--sensenova-test",
                                 "input": "patch it",
                                 "stream": False,
                                 "tools": [
@@ -2430,7 +2430,7 @@ class RouterRegressionTests(unittest.TestCase):
                 with RouterHarness(registry_path, auth_path, root / "router.log") as local:
                     request = urllib.request.Request(
                         local.url + "/responses",
-                        data=json.dumps({"model": "chatvendor--nova-test", "input": "hi", "stream": True}).encode("utf-8"),
+                        data=json.dumps({"model": "chatvendor--sensenova-test", "input": "hi", "stream": True}).encode("utf-8"),
                         headers={"Content-Type": "application/json"},
                         method="POST",
                     )
@@ -2493,7 +2493,7 @@ class RouterRegressionTests(unittest.TestCase):
                 with RouterHarness(registry_path, auth_path, root / "router.log") as local:
                     request = urllib.request.Request(
                         local.url + "/responses",
-                        data=json.dumps({"model": "chatvendor--nova-test", "input": "hi", "stream": True}).encode("utf-8"),
+                        data=json.dumps({"model": "chatvendor--sensenova-test", "input": "hi", "stream": True}).encode("utf-8"),
                         headers={"Content-Type": "application/json"},
                         method="POST",
                     )
@@ -2523,7 +2523,7 @@ class RouterRegressionTests(unittest.TestCase):
                     local.url + "/v1/messages",
                     data=json.dumps(
                         {
-                            "model": "chatvendor--nova-test",
+                            "model": "chatvendor--sensenova-test",
                             "max_tokens": 8,
                             "messages": [{"role": "user", "content": "hi"}],
                         }
@@ -2541,7 +2541,7 @@ class RouterRegressionTests(unittest.TestCase):
         """The GUI's test path probes Chat Completions, and validation gates the bridge."""
         provider = self._chat_provider("chatvendor", "http://127.0.0.1:1")
         self.assertEqual(registry.probe_protocol(provider), "chat")
-        url, payload, extra, protocol = registry.probe_request(provider, "nova-test")
+        url, payload, extra, protocol = registry.probe_request(provider, "sensenova-test")
         self.assertTrue(url.endswith("/v1/chat/completions"))
         self.assertEqual(protocol, "chat")
         self.assertIn("choices", registry.response_shape_problem({"choices": []}, "", "chat") or "choices")
@@ -2566,9 +2566,9 @@ class RouterRegressionTests(unittest.TestCase):
 
         def build_registry(models: list[dict[str, object]]) -> dict[str, object]:
             base = provider_config(
-                "sierra",
+                "seekai",
                 "http://127.0.0.1:1",
-                prefix="sierra--",
+                prefix="seekai--",
                 is_default=True,
                 protocols=("responses",),
                 model_id="placeholder",
@@ -2605,7 +2605,7 @@ class RouterRegressionTests(unittest.TestCase):
                         {
                             "id": "claude-opus-5",
                             "enabled": True,
-                            "publish_as": "sierra--gpt-5.6-terra",
+                            "publish_as": "seekai--gpt-5.6-terra",
                         }
                     ]
                 ),
@@ -2614,20 +2614,20 @@ class RouterRegressionTests(unittest.TestCase):
             )
             catalog = json.loads(destination.read_text(encoding="utf-8"))
             entry = catalog["models"][0]
-            self.assertEqual(entry["slug"], "sierra--gpt-5.6-terra")
+            self.assertEqual(entry["slug"], "seekai--gpt-5.6-terra")
             self.assertEqual(
                 entry["supported_reasoning_levels"],
                 ["low", "high"],
                 "the catalog entry must follow the alias's template, not the raw id fallback",
             )
-            self.assertEqual(result["models"], ["sierra--gpt-5.6-terra"])
+            self.assertEqual(result["models"], ["seekai--gpt-5.6-terra"])
 
     def test_codex_model_mapping_rejects_namespace_escape(self) -> None:
         """A Codex alias must stay inside its provider prefix, same as the Claude side."""
         base = provider_config(
-            "sierra",
+            "seekai",
             "http://127.0.0.1:1",
-            prefix="sierra--",
+            prefix="seekai--",
             is_default=True,
             protocols=("responses",),
             model_id="placeholder",
@@ -2654,9 +2654,9 @@ class RouterRegressionTests(unittest.TestCase):
                         models=[{"id": "claude-opus-5", "enabled": True}],
                     ),
                     self._claude_provider(
-                        "juno",
+                        "justdowork",
                         "http://127.0.0.1:1",
-                        prefix="juno.anthropic.",
+                        prefix="justdowork.anthropic.",
                         is_default=False,
                         models=models,
                     ),
@@ -2684,12 +2684,12 @@ class RouterRegressionTests(unittest.TestCase):
                         {
                             "id": "gpt-5.6-sol",
                             "enabled": True,
-                            "publish_as": "juno.anthropic.claude-opus-5",
+                            "publish_as": "justdowork.anthropic.claude-opus-5",
                         },
                         {
                             "id": "gpt-5.6-terra",
                             "enabled": True,
-                            "publish_as": "juno.anthropic.claude-opus-5",
+                            "publish_as": "justdowork.anthropic.claude-opus-5",
                         },
                     ]
                 )
@@ -2964,7 +2964,7 @@ class RegistryRecoveryRegressionTests(unittest.TestCase):
         self.assertTrue(claude.thinking_effort_levels("claude-opus-5"))
 
         default = provider_config(
-            "juno",
+            "justdowork",
             "https://a.invalid/v1",
             prefix="",
             is_default=True,
@@ -2981,7 +2981,7 @@ class RegistryRecoveryRegressionTests(unittest.TestCase):
         self.assertEqual(registry.selectable_slugs(reg), ["claude-opus-5"])
         self.assertEqual(
             registry.failover_chain(reg, "claude-opus-5", protocol="messages"),
-            [("juno", "claude-opus-5-thinking")],
+            [("justdowork", "claude-opus-5-thinking")],
         )
         # One model, one slug: the vendor id is no longer selectable, so nothing can arrive
         # under a name the app has no capability record for.
@@ -2997,7 +2997,7 @@ class RegistryRecoveryRegressionTests(unittest.TestCase):
             [
                 {
                     "name": "claude-opus-5",
-                    "labelOverride": "Juno · claude-opus-5-thinking",
+                    "labelOverride": "Justdowork · claude-opus-5-thinking",
                     "supports1m": True,
                 }
             ],
@@ -3017,9 +3017,9 @@ class RegistryRecoveryRegressionTests(unittest.TestCase):
         claimants or there is no way to tell which side to change.
         """
         dual = provider_config(
-            "provider_d",
+            "cicadas",
             "https://b.invalid/v1",
-            prefix="provider_d--",
+            prefix="cicadas--",
             is_default=False,
             protocols=("responses", "messages"),
             model_id="claude-opus-5-thinking",
@@ -3035,29 +3035,29 @@ class RegistryRecoveryRegressionTests(unittest.TestCase):
         # while retaining its own namespace. A bare alias would otherwise be indistinguishable
         # from the default account and could charge the wrong vendor.
         namespaced = provider_config(
-            "juno",
+            "justdowork",
             "https://a.invalid/v1",
-            prefix="juno.anthropic.",
+            prefix="justdowork.anthropic.",
             is_default=False,
             protocols=("messages",),
             model_id="claude-opus-5-thinking",
         )
         namespaced["workspace"] = "claude"
-        namespaced["models"][0]["publish_as"] = "juno.anthropic.claude-opus-5"
+        namespaced["models"][0]["publish_as"] = "justdowork.anthropic.claude-opus-5"
         cleaned = registry.validate_provider(
             deepcopy(namespaced), allow_missing_secret=True
         )
         self.assertEqual(
             registry.published_slug(cleaned, cleaned["models"][0]),
-            "juno.anthropic.claude-opus-5",
+            "justdowork.anthropic.claude-opus-5",
         )
         self.assertEqual(
             registry.failover_chain(
                 {"version": registry.REGISTRY_VERSION, "providers": [cleaned]},
-                "juno.anthropic.claude-opus-5",
+                "justdowork.anthropic.claude-opus-5",
                 protocol="messages",
             ),
-            [("juno", "claude-opus-5-thinking")],
+            [("justdowork", "claude-opus-5-thinking")],
         )
         bare_alias = deepcopy(namespaced)
         bare_alias["models"][0]["publish_as"] = "claude-opus-5"
@@ -3067,9 +3067,9 @@ class RegistryRecoveryRegressionTests(unittest.TestCase):
         for bad in ("has space", "slash/name", "semi;colon", "x" * 161):
             with self.subTest(publish_as=bad):
                 messages_only = provider_config(
-                    "kilo",
+                    "kktoken",
                     "https://c.invalid/v1",
-                    prefix="kilo.anthropic.",
+                    prefix="kktoken.anthropic.",
                     is_default=False,
                     protocols=("messages",),
                     model_id="claude-opus-5-thinking",
@@ -3079,7 +3079,7 @@ class RegistryRecoveryRegressionTests(unittest.TestCase):
                     registry.validate_provider(messages_only, allow_missing_secret=True)
 
         colliding = provider_config(
-            "juno",
+            "justdowork",
             "https://a.invalid/v1",
             prefix="",
             is_default=True,
@@ -3101,7 +3101,7 @@ class RegistryRecoveryRegressionTests(unittest.TestCase):
         self.assertEqual(
             message,
             "Duplicate selectable model slug: claude-opus-5 (claimed by "
-            "juno/claude-opus-5-thinking (publish_as) and juno/claude-opus-5)",
+            "justdowork/claude-opus-5-thinking (publish_as) and justdowork/claude-opus-5)",
         )
 
     def test_absolute_inference_endpoints_are_the_only_repair_candidates(self) -> None:
@@ -3492,6 +3492,7 @@ def new_provider_form(workspace: registry.Workspace) -> SimpleNamespace:
         config_tab=object(),
     )
     form._set_key_revealed = lambda _revealed: None
+    form._confirm_discarding_edits = lambda _action: True
     form._render_models = lambda: None
     form._set_editor_protected = lambda _protected: None
     # Saving now re-reads the provider off disk instead of trusting the editor's snapshot, so

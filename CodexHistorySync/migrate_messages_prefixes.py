@@ -3,8 +3,8 @@
 Claude Desktop decides whether a model gets a thinking-effort control by canonicalizing the
 model id and looking it up in a table compiled into the app.  Its canonicalizer strips a
 leading `<vendor>.anthropic.` -- the shape a Bedrock model id has -- but knows nothing about
-`vendor--`, so `tango--claude-opus-5` misses the table and the picker is not rendered, while
-`tango.anthropic.claude-opus-5` reduces to `claude-opus-5` and hits it.  There is no config
+`vendor--`, so `truesota--claude-opus-5` misses the table and the picker is not rendered, while
+`truesota.anthropic.claude-opus-5` reduces to `claude-opus-5` and hits it.  There is no config
 field for this: the 3P profile's per-model schema has no thinking key at all.
 
 Only the Claude workspace is migrated by default.  The Codex side keeps `vendor--` on purpose:

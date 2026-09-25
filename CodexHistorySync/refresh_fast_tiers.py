@@ -1,11 +1,10 @@
 """Refresh fast-tier capability for every enabled gpt-5.6 model and persist it to providers.json."""
 
 import sys
+from pathlib import Path
 
 sys.stdout.reconfigure(encoding="utf-8")
-import os.path  # noqa: E402 - keeps this script runnable from any checkout
-
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from copy import deepcopy  # noqa: E402
 

@@ -137,6 +137,10 @@ class HistoryModelGuardTests(unittest.TestCase):
                 roots[1]: "plus_provider",
                 roots[2]: "sota_provider",
             }
+            # The mutation coordinator reads archive state even when pair syncs
+            # are mocked. Give it isolated databases, not nonexistent paths.
+            for root in roots:
+                make_root(root, providers[root], None, include_thread=False)
             sync_calls: list[tuple[Path, Path, object]] = []
             verify_guards: list[object] = []
 
@@ -274,7 +278,7 @@ class HistoryModelGuardTests(unittest.TestCase):
             source = base / "source"
             target = base / "sota"
             make_root(source, "source_vendor", "gpt-5.6-sol")
-            make_root(target, "tango_relay", None, include_thread=False)
+            make_root(target, "true_sota", None, include_thread=False)
             write_registry(
                 target,
                 [
@@ -294,7 +298,7 @@ class HistoryModelGuardTests(unittest.TestCase):
                 target,
                 base / "backups",
                 "source_vendor",
-                "tango_relay",
+                "true_sota",
             )
             self.assertEqual(result["status"], "ok")
             self.assertEqual(result["unresolved_model_fields"], 0)
@@ -323,7 +327,7 @@ class HistoryModelGuardTests(unittest.TestCase):
             source = base / "source"
             target = base / "sota"
             make_root(source, "source_vendor", "gpt-5.6-sol")
-            make_root(target, "tango_relay", None, include_thread=False)
+            make_root(target, "true_sota", None, include_thread=False)
             write_registry(
                 target,
                 [
@@ -351,7 +355,7 @@ class HistoryModelGuardTests(unittest.TestCase):
                 target,
                 base / "backups",
                 "source_vendor",
-                "tango_relay",
+                "true_sota",
             )
 
             copied = list((target / "sessions").glob("*.jsonl"))

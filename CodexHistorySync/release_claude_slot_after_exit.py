@@ -1,6 +1,6 @@
 """Wait for Claude Desktop to exit, then hand the shared 3P config slot back.
 
-`appliedId` in Claude's config library is a single global slot that cc-switch, Foreign Vendor and
+`appliedId` in Claude's config library is a single global slot that cc-switch, APIKEY.FUN and
 codex-sota all write.  codex-sota takes it only for the duration of a Claude it launched itself
 (claude_desktop.claim_slot) and this watcher gives it back afterwards, so launching Claude from
 cc-switch keeps using cc-switch's own profile.

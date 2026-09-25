@@ -2,11 +2,15 @@ param(
     [switch]$NoGui,
     [switch]$AuditOnly,
     [switch]$WaitForExisting,
+    [switch]$DeferIfAppRunning,
+    [ValidateRange(0, 900)][int]$LockWaitSeconds = 0,
     [ValidateSet('Current', 'Plus', 'Cockpit', 'Sota', 'None')]
     [string]$RestartProfile = 'Current'
 )
 
 $ErrorActionPreference = 'Stop'
+try { [Console]::OutputEncoding = [Text.Encoding]::UTF8; $OutputEncoding = [Text.Encoding]::UTF8 } catch { }
+$env:PYTHONIOENCODING = 'utf-8'
 $installDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $scriptPath = Join-Path $installDir 'sync_codex_histories_three_way.py'
 $profileSwitcherPath = Join-Path $installDir 'Switch-CodexProfile.ps1'
@@ -25,12 +29,12 @@ $apiEnvironmentNames = @(
     'OPENAI_ORG_ID',
     'OPENAI_PROJECT_ID',
     'CODEX_ACCESS_TOKEN',
-    'CODEX_PROVIDER_A_API_KEY',
-    'CODEX_PROVIDER_B_API_KEY',
-    'CODEX_PROVIDER_C_API_KEY',
-    'CODEX_PROVIDER_D_API_KEY',
-    'CODEX_PROVIDER_E_API_KEY',
-    'CODEX_PROVIDER_F_API_KEY'
+    'CODEX_AGENTROUTER_API_KEY',
+    'CODEX_LINGZHAN_API_KEY',
+    'CODEX_AISHENJI_API_KEY',
+    'CODEX_CICADAS_API_KEY',
+    'CODEX_MAIXUN_API_KEY',
+    'CODEX_MIAOMIAOCODE_API_KEY'
 )
 $messagesPath = Join-Path $installDir 'messages.zh-CN.json'
 $messages = $null
@@ -53,15 +57,17 @@ $pythonCandidates += @(
         ForEach-Object { Join-Path $_.FullName 'python.exe' }
 )
 
-$python = $pythonCandidates |
-    Where-Object { $_ -and (Test-Path -LiteralPath $_) } |
-    Select-Object -First 1
-
-if (-not $python) {
-    $command = Get-Command python.exe -ErrorAction SilentlyContinue
-    if ($command) {
-        $python = $command.Source
+$pythonCandidates += Join-Path (Split-Path -Parent $PSScriptRoot) 'CodexSotaManager\.venv-build\Scripts\python.exe'
+$command = Get-Command python.exe -ErrorAction SilentlyContinue
+if ($command) { $pythonCandidates += $command.Source }
+$python = $null
+foreach ($candidate in @($pythonCandidates | Where-Object { $_ } | Select-Object -Unique)) {
+    if (-not (Test-Path -LiteralPath $candidate -PathType Leaf) -or $candidate -match '\\WindowsApps\\') { continue }
+    try {
+        $probe = @(& $candidate -I -S -B -c 'import sys; print(193731 if sys.version_info >= (3,11) else 0)' 2>$null)
+        if ($LASTEXITCODE -eq 0 -and $probe -contains '193731') { $python = $candidate; break }
     }
+    catch { continue }
 }
 
 function Show-SyncMessage {
@@ -290,8 +296,18 @@ try {
     if ($WaitForExisting) {
         $syncArguments += '--wait-for-existing'
     }
-    $raw = & $python $scriptPath @syncArguments 2>&1
-    $exitCode = $LASTEXITCODE
+    if ($DeferIfAppRunning) { $syncArguments += '--defer-if-app-running' }
+    if ($PSBoundParameters.ContainsKey('LockWaitSeconds') -or -not $WaitForExisting) {
+        $syncArguments += @('--lock-wait-seconds', $LockWaitSeconds.ToString())
+    }
+    # Native stderr is diagnostic data, not a PowerShell terminating exception.
+    $previousPreference = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $raw = @(& $python $scriptPath @syncArguments 2>&1)
+        $exitCode = $LASTEXITCODE
+    }
+    finally { $ErrorActionPreference = $previousPreference }
     $jsonLine = $raw | Select-Object -Last 1
     $result = $null
     try {
@@ -299,6 +315,14 @@ try {
     }
     catch {
         $result = $null
+    }
+
+    if ($result -and $result.status -eq 'deferred') {
+        # Busy/running is a normal coordination result. Preserve the core JSON
+        # instead of turning it into "sync failed" and a launch error dialog.
+        if ($NoGui) { Write-Output ($result | ConvertTo-Json -Depth 8 -Compress) }
+        else { Show-SyncMessage -Message 'History sync is deferred until Codex is safely closed and other synchronization has finished.' -Title 'Codex history sync deferred' -Icon 'Information' }
+        exit 0
     }
 
     if ($exitCode -ne 0 -or -not $result -or $result.status -ne 'ok') {
@@ -362,9 +386,9 @@ $($messages.success_intro)
 
 $($messages.cockpit): $cockpitMain $($messages.main_threads) + $cockpitAuxiliary $($messages.auxiliary_sessions) ($($messages.total_records) $cockpitCount)
 $($messages.plus): $plusMain $($messages.main_threads) + $plusAuxiliary $($messages.auxiliary_sessions) ($($messages.total_records) $plusCount)
-Tango Relay: $sotaMain $($messages.main_threads) + $sotaAuxiliary $($messages.auxiliary_sessions) ($($messages.total_records) $sotaCount)
-$($messages.searchable_index): $($messages.cockpit) $cockpitSidebarVisible/$cockpitMain; $($messages.plus) $plusSidebarVisible/$plusMain; Tango Relay $sotaSidebarVisible/$sotaMain
-$($messages.projects): $($messages.cockpit) $cockpitProjects ($cockpitProjectChats $($messages.project_chats)); $($messages.plus) $plusProjects ($plusProjectChats $($messages.project_chats)); Tango Relay $sotaProjects ($sotaProjectChats $($messages.project_chats))
+True SOTA: $sotaMain $($messages.main_threads) + $sotaAuxiliary $($messages.auxiliary_sessions) ($($messages.total_records) $sotaCount)
+$($messages.searchable_index): $($messages.cockpit) $cockpitSidebarVisible/$cockpitMain; $($messages.plus) $plusSidebarVisible/$plusMain; True SOTA $sotaSidebarVisible/$sotaMain
+$($messages.projects): $($messages.cockpit) $cockpitProjects ($cockpitProjectChats $($messages.project_chats)); $($messages.plus) $plusProjects ($plusProjectChats $($messages.project_chats)); True SOTA $sotaProjects ($sotaProjectChats $($messages.project_chats))
 $($messages.new_copies): $($result.new_files)
 $($messages.incremental_updates): $($result.updated_files)
 $($messages.conflict_copies): $($result.conflicts_preserved)
@@ -382,9 +406,9 @@ Codex history sync completed.
 
 Cockpit: $cockpitMain main chats + $cockpitAuxiliary auxiliary sessions ($cockpitCount local records)
 Plus: $plusMain main chats + $plusAuxiliary auxiliary sessions ($plusCount local records)
-Tango Relay: $sotaMain main chats + $sotaAuxiliary auxiliary sessions ($sotaCount local records)
-Searchable main chats: Cockpit $cockpitSidebarVisible/$cockpitMain; Plus $plusSidebarVisible/$plusMain; Tango Relay $sotaSidebarVisible/$sotaMain
-Projects: Cockpit $cockpitProjects ($cockpitProjectChats project chats); Plus $plusProjects ($plusProjectChats project chats); Tango Relay $sotaProjects ($sotaProjectChats project chats)
+True SOTA: $sotaMain main chats + $sotaAuxiliary auxiliary sessions ($sotaCount local records)
+Searchable main chats: Cockpit $cockpitSidebarVisible/$cockpitMain; Plus $plusSidebarVisible/$plusMain; True SOTA $sotaSidebarVisible/$sotaMain
+Projects: Cockpit $cockpitProjects ($cockpitProjectChats project chats); Plus $plusProjects ($plusProjectChats project chats); True SOTA $sotaProjects ($sotaProjectChats project chats)
 New copies: $($result.new_files)
 Incremental updates: $($result.updated_files)
 Conflict copies: $($result.conflicts_preserved)

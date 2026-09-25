@@ -64,7 +64,7 @@ class Workspace:
 
     @property
     def source_catalog_path(self) -> Path:
-        return self.root / "tango-relay-model-catalog.json"
+        return self.root / "true-sota-model-catalog.json"
 
     @property
     def secrets_root(self) -> Path:
@@ -123,7 +123,7 @@ REGISTRY_LOCK_PATH = CODEX.lock_path
 ROUTER_STARTER_PATH = CODEX.router_starter
 REGISTRY_VERSION = 1
 # Some gateways fingerprint the client and answer 401 "unauthorized client detected" to
-# anything that does not look like Codex — ProviderA rejected the manager's own
+# anything that does not look like Codex — AgentRouter rejected the manager's own
 # User-Agent while accepting the identical request from the app. Probes therefore
 # identify themselves the way the CLI does; provider extra_headers still override this.
 PROBE_USER_AGENT = "codex_cli_rs/0.144.1 (Windows 11.0.26200; x86_64) WindowsTerminal"
@@ -184,7 +184,7 @@ ID_PATTERN = re.compile(r"^[a-z][a-z0-9_]{1,39}$")
 # control by canonicalizing the id and looking the result up in a hardcoded table. Its
 # canonicalizer strips a leading `<label>.anthropic.` (the shape a Bedrock model id has) but
 # knows nothing about `vendor--`, so only the dotted form lets a slug like
-# `tango.anthropic.claude-opus-5` reach the table entry for `claude-opus-5`. The label is
+# `truesota.anthropic.claude-opus-5` reach the table entry for `claude-opus-5`. The label is
 # deliberately narrower than ID_PATTERN: Claude's own regex is `^(?:[a-z][a-z0-9-]*\.)?anthropic\.`,
 # which rejects underscores, hence the `_` -> `-` swap in derive_model_prefix.
 MESSAGES_PREFIX_SUFFIX = ".anthropic."
@@ -283,11 +283,11 @@ def allows_provider_publish_as(
     alias always has to stay inside the provider's own published namespace:
 
     * Claude Messages-only providers publish Claude-shaped names
-      (``juno.anthropic.claude-opus-5``) because Claude Desktop's capability lookup
+      (``justdowork.anthropic.claude-opus-5``) because Claude Desktop's capability lookup
       only recognises claude-* ids.  The one legacy default Messages profile may use a
       bare alias.
     * Codex Responses providers publish catalog-shaped names
-      (``sierra--gpt-5.6-sol``) because the Codex App reads its capability metadata from
+      (``seekai--gpt-5.6-sol``) because the Codex App reads its capability metadata from
       the generated catalog, whose templates are keyed on known model names -- an unknown
       id silently falls back to the default GPT template with the wrong reasoning levels.
 
@@ -447,7 +447,7 @@ def read_codex_auth_key(auth_path: Path = AUTH_PATH) -> str:
     auth = json.loads(auth_path.read_text(encoding="utf-8-sig"))
     key = auth.get("OPENAI_API_KEY")
     if auth.get("auth_mode") != "apikey" or not isinstance(key, str) or not key.strip():
-        raise RuntimeError("Tango Relay auth.json does not contain a usable API-key login")
+        raise RuntimeError("True SOTA auth.json does not contain a usable API-key login")
     return key.strip()
 
 
@@ -478,7 +478,7 @@ def provider_workspace(provider: dict[str, Any]) -> Workspace:
 def uses_responses_to_anthropic_messages(provider: dict[str, Any]) -> bool:
     """Return whether the one explicitly supported Codex provider uses the Messages adapter."""
     return (
-        str(provider.get("id") or "").lower() == "juno"
+        str(provider.get("id") or "").lower() == "justdowork"
         and provider.get("request_adapter") == RESPONSES_TO_ANTHROPIC_MESSAGES_ADAPTER
     )
 
@@ -687,6 +687,20 @@ def _http_json(
             body = json.loads(text) if text else None
         except json.JSONDecodeError:
             body = None
+        # Some gateways (notably Cloudflare/WAF layers) reject a model with an
+        # empty body. Preserve only non-sensitive response headers so the caller
+        # can distinguish an upstream rejection from a local transport failure.
+        if status >= 300 and body is None and not text.strip():
+            diagnostic_headers = (
+                ("Server", response.headers.get("Server")),
+                ("CF-RAY", response.headers.get("CF-RAY")),
+                ("X-Request-ID", response.headers.get("X-Request-ID")),
+                ("Content-Type", response.headers.get("Content-Type")),
+            )
+            details = [f"{name}={value.strip()}" for name, value in diagnostic_headers if value and value.strip()]
+            text = "上游返回空响应（未提供错误正文）"
+            if details:
+                text += "；" + "; ".join(details)
         return status, body, text[:4000]
 
 
@@ -1247,7 +1261,7 @@ def test_model(
             hint = response_shape_problem(None, text, protocol) or "上游返回了 HTML 网页"
             detail = f"HTTP {status}：{hint}"
         else:
-            detail = text[:1500]
+            detail = text[:1500] or f"HTTP {status}：上游返回空响应（未提供错误正文）"
         detail = _redact_text(detail, [redaction_key])
         return {"ok": False, "status": status, "url": url, "model": model, "detail": detail}
     shape_problem = response_shape_problem(body, text, protocol)
@@ -1868,7 +1882,7 @@ def build_model_catalog(
                 continue
             model_id = model_config["id"]
             # The alias decides which template the entry is built from.  Mapping a non-GPT
-            # model onto a known slug (e.g. claude-opus-5 -> sierra--gpt-5.6-sol) is exactly
+            # model onto a known slug (e.g. claude-opus-5 -> seekai--gpt-5.6-sol) is exactly
             # how it picks up correct capability metadata; an unknown id would otherwise
             # silently wear the default GPT template's reasoning levels.
             override = str(model_config.get("publish_as") or "").strip()

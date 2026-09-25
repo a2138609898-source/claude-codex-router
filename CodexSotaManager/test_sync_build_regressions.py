@@ -103,7 +103,7 @@ class SyncAndBuildRegressionTests(unittest.TestCase):
 
     @staticmethod
     def _make_rollback_root(root: Path, marker: str) -> None:
-        root.mkdir(parents=True)
+        SyncAndBuildRegressionTests._make_history_root(root, "test", ())
         connection = sqlite3.connect(root / "state_5.sqlite")
         connection.execute("CREATE TABLE marker (value TEXT)")
         connection.execute("INSERT INTO marker VALUES (?)", (marker,))
@@ -111,12 +111,11 @@ class SyncAndBuildRegressionTests(unittest.TestCase):
         connection.close()
         for directory in ("sessions", "archived_sessions"):
             target = root / directory
-            target.mkdir()
+            target.mkdir(exist_ok=True)
             (target / f"{directory}.jsonl").write_text(
                 marker + "\n", encoding="utf-8"
             )
-        (root / ".codex-global-state.json").write_text(marker, encoding="utf-8")
-        (root / "session_index.jsonl").write_text(marker, encoding="utf-8")
+        (root / ".codex-global-state.json").write_text(json.dumps({"marker": marker}), encoding="utf-8")
         (root / "config.toml").write_text("preserve-config", encoding="utf-8")
 
     @staticmethod
@@ -341,17 +340,18 @@ class SyncAndBuildRegressionTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "回滚不完整.*locked"):
                     claude._restore({path: None})
 
-    def test_post_exit_process_query_fails_closed_on_nonzero_tasklist(self) -> None:
-        completed = SimpleNamespace(returncode=1, stdout="", stderr="tasklist failed")
-        with mock.patch.object(post_exit.subprocess, "run", return_value=completed):
-            with self.assertRaisesRegex(RuntimeError, "tasklist"):
+    def test_post_exit_process_query_fails_closed_on_native_query_failure(self) -> None:
+        # Discovery is now WinAPI-based, not tasklist-based. Keep the important
+        # contract: an unknown process state must never mean safe-to-sync.
+        with mock.patch.object(post_exit, "app_running", side_effect=RuntimeError("native query failed")):
+            with self.assertRaisesRegex(RuntimeError, "native query"):
                 post_exit.chatgpt_processes_running()
 
-    def test_post_exit_process_query_fails_closed_on_spawn_error(self) -> None:
+    def test_post_exit_process_query_fails_closed_on_access_error(self) -> None:
         with mock.patch.object(
-            post_exit.subprocess, "run", side_effect=OSError("unavailable")
+            post_exit, "app_running", side_effect=OSError("access denied")
         ):
-            with self.assertRaisesRegex(RuntimeError, "无法查询"):
+            with self.assertRaisesRegex(OSError, "access denied"):
                 post_exit.chatgpt_processes_running()
 
     def test_post_exit_winapi_wait_declares_pointer_sized_signatures(self) -> None:
@@ -571,9 +571,13 @@ class SyncAndBuildRegressionTests(unittest.TestCase):
                 self.assertIn(
                     "[System.StringComparison]::OrdinalIgnoreCase", source
                 )
-                self.assertIn(
-                    "Refusing to stop unowned ChatGPT.exe process IDs", source
-                )
+                if launcher_path.name == "Switch-CodexProfile.ps1":
+                    self.assertIn("Refusing to stop unowned ChatGPT.exe process IDs", source)
+                else:
+                    # An unrelated ChatGPT app no longer blocks launching Codex.
+                    # Unknown Codex profile ownership still requires explicit restart.
+                    self.assertIn("existing Codex window could not be verified", source)
+                    self.assertIn("if (-not $Restart", source)
                 stop_start = source.index("function Stop-CodexApp")
                 stop_end = source.find("\nfunction ", stop_start + 1)
                 if stop_end < 0:
@@ -583,6 +587,10 @@ class SyncAndBuildRegressionTests(unittest.TestCase):
                     "$processes = @(Get-OwnedCodexAppProcesses)", stop_source
                 )
                 self.assertNotIn("Get-Process -Name 'ChatGPT'", stop_source)
+                if launcher_path.name == "Switch-CodexSota.ps1":
+                    self.assertIn("CloseMainWindow", stop_source)
+                    self.assertNotIn("Stop-ProcessTreeById", stop_source)
+                    self.assertNotIn("Stop-Process -", stop_source)
 
     def test_staged_build_swap_preserves_old_and_installs_new(self) -> None:
         powershell = shutil.which("powershell.exe") or shutil.which("powershell")
@@ -828,6 +836,12 @@ class SyncAndBuildRegressionTests(unittest.TestCase):
         spec = (MANAGER_ROOT / "codex-sota.spec").read_text(encoding="utf-8")
         self.assertIn("SPECPATH", spec)
 
+    def test_python_runtime_probe_avoids_windows_powershell_quote_loss(self) -> None:
+        script = (MANAGER_ROOT / "Run-ThreeRoundValidation.ps1").read_text(encoding="utf-8-sig")
+        self.assertIn("$candidate --version", script)
+        self.assertIn("[regex]::Match", script)
+        self.assertNotIn("-c 'import sys;", script)
+
     def test_validation_covers_sync_sources_and_launchers(self) -> None:
         script = (MANAGER_ROOT / "Run-ThreeRoundValidation.ps1").read_text(
             encoding="utf-8-sig"
@@ -869,23 +883,23 @@ class StalePinnedModelRepairTests(unittest.TestCase):
 
     def _fixture(self, root: Path, catalog_path: Path, model: str) -> None:
         (root / "config.toml").write_text(
-            'model_provider = "tango_relay"\n'
+            'model_provider = "true_sota"\n'
             f'model = "{model}"\n'
-            'review_model = "provider_a--gpt-5.6-terra"\n'
+            'review_model = "agentrouter--gpt-5.6-terra"\n'
             'cli_auth_credentials_store = "file"\n'
             'forced_login_method = "api"\n'
             f'model_catalog_json = "{catalog_path.as_posix()}"\n'
-            '\n[model_providers.tango_relay]\n'
+            '\n[model_providers.true_sota]\n'
             'base_url = "http://127.0.0.1:17895"\n'
             'wire_api = "responses"\n'
             'requires_openai_auth = true\n',
             encoding="utf-8",
         )
         slugs = [
-            "tango-relay--gpt-5.6-sol",
-            "tango-relay--gpt-6-astra",
-            "provider_a--gpt-5.6-sol",
-            "provider_a--gpt-5.6-terra",
+            "true-sota--gpt-5.6-sol",
+            "true-sota--gpt-6-astra",
+            "agentrouter--gpt-5.6-sol",
+            "agentrouter--gpt-5.6-terra",
         ]
         catalog_path.write_text(
             json.dumps({"models": [{"slug": slug} for slug in slugs]}),
@@ -896,7 +910,7 @@ class StalePinnedModelRepairTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             catalog_path = root / "sota-multi-vendor-model-catalog.json"
-            self._fixture(root, catalog_path, "golf--gpt-6-astra")
+            self._fixture(root, catalog_path, "mfsense--gpt-6-astra")
 
             valid, reason = profile_validator.validate_profile("Sota", root, catalog_path)
             self.assertFalse(valid)
@@ -904,7 +918,7 @@ class StalePinnedModelRepairTests(unittest.TestCase):
 
             report = profile_validator.repair_pinned_models(root, catalog_path)
             self.assertEqual(
-                report["repaired"]["model"]["to"], "tango-relay--gpt-5.6-sol"
+                report["repaired"]["model"]["to"], "true-sota--gpt-5.6-sol"
             )
             valid, reason = profile_validator.validate_profile("Sota", root, catalog_path)
             self.assertTrue(valid, reason)
@@ -913,20 +927,20 @@ class StalePinnedModelRepairTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             catalog_path = root / "sota-multi-vendor-model-catalog.json"
-            self._fixture(root, catalog_path, "tango-relay--old-name")
+            self._fixture(root, catalog_path, "true-sota--old-name")
 
             profile_validator.repair_pinned_models(root, catalog_path)
 
             config = (root / "config.toml").read_text(encoding="utf-8")
-            self.assertIn('model = "tango-relay--gpt-5.6-sol"', config)
+            self.assertIn('model = "true-sota--gpt-5.6-sol"', config)
             # The untouched review_model stays exactly as it was.
-            self.assertIn('review_model = "provider_a--gpt-5.6-terra"', config)
+            self.assertIn('review_model = "agentrouter--gpt-5.6-terra"', config)
 
     def test_a_healthy_config_is_left_alone(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             catalog_path = root / "sota-multi-vendor-model-catalog.json"
-            self._fixture(root, catalog_path, "tango-relay--gpt-6-astra")
+            self._fixture(root, catalog_path, "true-sota--gpt-6-astra")
             before = (root / "config.toml").read_text(encoding="utf-8")
 
             report = profile_validator.repair_pinned_models(root, catalog_path)

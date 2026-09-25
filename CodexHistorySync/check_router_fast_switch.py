@@ -16,9 +16,7 @@ import time
 from pathlib import Path
 
 sys.stdout.reconfigure(encoding="utf-8")
-import os.path  # noqa: E402 - keeps this script runnable from any checkout
-
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import codex_sota_router as R  # noqa: E402
 from sota_registry import AUTH_PATH, REGISTRY_PATH, published_slug  # noqa: E402
@@ -34,7 +32,7 @@ def registry_triples() -> list[tuple[str, str, str]]:
     """One (provider id, model id, slug) per prefixed provider in the live registry.
 
     The slug is the model's published slug -- normally prefix + model id, and not
-    id + "--" + model id, because a prefix is not always the id (xray_gateway is not).
+    id + "--" + model id, because a prefix is not always the id (xlinks_gateway is not).
     A model carrying `publish_as` answers under that instead, which is also what the router
     puts in forced_fast, so asking for prefix + id would force a slug nothing dispatches on.
     Such a model also shadows the sibling whose plain slug it borrowed: enabling that sibling

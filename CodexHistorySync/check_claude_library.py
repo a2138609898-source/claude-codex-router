@@ -14,9 +14,7 @@ from pathlib import Path
 from unittest import mock
 
 sys.stdout.reconfigure(encoding="utf-8")
-import os.path  # noqa: E402 - keeps this script runnable from any checkout
-
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import claude_desktop as cd  # noqa: E402
 
@@ -29,7 +27,7 @@ def build_library(root: Path) -> dict[str, bytes]:
     library.mkdir(parents=True)
     payloads = {}
     for entry_id, name, url in (
-        (FOREIGN_A, "Foreign Vendor", "https://fast.example.pro"),
+        (FOREIGN_A, "APIKEY.FUN", "https://fast.example.pro"),
         (FOREIGN_B, "CC Switch", "http://127.0.0.1:15721/claude-desktop"),
     ):
         body = {
@@ -49,7 +47,7 @@ def build_library(root: Path) -> dict[str, bytes]:
             {
                 "appliedId": FOREIGN_B,
                 "entries": [
-                    {"id": FOREIGN_A, "name": "Foreign Vendor"},
+                    {"id": FOREIGN_A, "name": "APIKEY.FUN"},
                     {"id": FOREIGN_B, "name": "CC Switch"},
                 ],
             },

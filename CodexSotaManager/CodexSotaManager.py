@@ -155,6 +155,7 @@ def codex_sota_invocation(command: Path) -> tuple[list[str], Path]:
             str(powershell),
             "-NoLogo",
             "-NoProfile",
+            "-NonInteractive",
             "-ExecutionPolicy",
             "Bypass",
             "-File",
@@ -166,6 +167,9 @@ def codex_sota_invocation(command: Path) -> tuple[list[str], Path]:
 CORE_ROOT = resolve_core_root()
 if str(CORE_ROOT) not in sys.path:
     sys.path.insert(0, str(CORE_ROOT))
+
+from codex_app_lifecycle import detect_codex_app_processes, inspect_codex_app_process  # noqa: E402
+from codex_launch_controller import LaunchAttempt, PHASE_LABELS  # noqa: E402
 
 from claude_desktop import (  # noqa: E402
     CLAUDE_3P_ROOT,
@@ -233,7 +237,6 @@ from sota_registry import (  # noqa: E402
 
 
 APP_NAME = "codex-sota"
-LAUNCH_TIMEOUT_SECONDS = 900
 LAUNCH_SLOW_HINT_SECONDS = 45
 LAUNCH_WINDOW_WAIT_SECONDS = 300
 LAUNCH_WINDOW_POLL_SECONDS = 3
@@ -904,12 +907,15 @@ def close_visible_process_windows(pids: set[int]) -> set[int]:
 
 
 def chatgpt_pids() -> set[int]:
-    return image_pids("ChatGPT.exe")
+    # The ordinary ChatGPT app shares an image name with Codex. Match the owned
+    # installation and process role, using native APIs instead of spawning tasklist.
+    return {item["pid"] for item in detect_codex_app_processes() if item["role"] == "desktop"}
 
 
 def chatgpt_window_present() -> bool:
-    """True once a ChatGPT.exe process owns a visible top-level window."""
-    return pids_own_visible_window(chatgpt_pids())
+    """Compatibility name: a verified Codex desktop process owns a visible window."""
+    return any(item["role"] == "desktop" and item.get("window_handle")
+               for item in detect_codex_app_processes())
 
 
 def claude_pids() -> set[int]:
@@ -1042,9 +1048,9 @@ class ModelMappingDialog(tk.Toplevel):
     the upstream still receives the real model id.  It exists for opposite reasons on the
     two sides: Claude Desktop only offers thinking controls and picker entries for
     claude-* ids it recognises, so a GPT model publishes under a Claude-shaped alias
-    (``juno.anthropic.claude-opus-5``); the Codex App reads capability metadata from
+    (``justdowork.anthropic.claude-opus-5``); the Codex App reads capability metadata from
     the generated catalog whose templates are keyed on known GPT slugs, so a non-GPT
-    model publishes under a catalog-shaped alias (``sierra--gpt-5.6-sol``) to get correct
+    model publishes under a catalog-shaped alias (``seekai--gpt-5.6-sol``) to get correct
     reasoning levels.  Either way the alias stays inside the provider's own namespace.
     Empty input clears the mapping.
     """
@@ -1232,6 +1238,7 @@ class CodexSotaApp(tk.Tk):
         self.workspace = CODEX
         self.workspace_var = tk.StringVar(value=CODEX.name)
         self._launch_phase = "正在启动 Codex"
+        self._codex_launch_job: LaunchAttempt | None = None
         self._protected = False
         self._id_touched = False
         self._prefix_touched = False
@@ -1392,6 +1399,10 @@ class CodexSotaApp(tk.Tk):
         ttk.Label(header, textvariable=self.header_status_var, style="Field.TLabel").pack(side="right", padx=(12, 0))
         self.launch_button = ttk.Button(header, text="启动 Codex", command=self._launch_codex)
         self.launch_button.pack(side="right")
+        self.restart_codex_button = ttk.Button(
+            header, text="重启 Codex", command=lambda: self._launch_codex(restart=True)
+        )
+        self.restart_codex_button.pack(side="right", padx=(0, 8))
         switcher = ttk.Frame(header, style="Surface.TFrame")
         switcher.pack(side="left", padx=(28, 0))
         for ws in (CODEX, CLAUDE):
@@ -1897,6 +1908,9 @@ class CodexSotaApp(tk.Tk):
             self.workspace_var.set(self.workspace.name)
             messagebox.showinfo("正在忙", "有任务在跑，等它结束再切换工作区。", parent=self)
             return
+        if not self._confirm_discarding_edits("切换工作区"):
+            self.workspace_var.set(self.workspace.name)
+            return
         self.workspace = wanted
         self.current_id = None
         self.loaded_provider = None
@@ -1906,6 +1920,7 @@ class CodexSotaApp(tk.Tk):
         # stray 保存并应用 would write that provider into the workspace it does not belong to.
         self._reset_editor()
         self.launch_button.configure(text="启动 Claude" if wanted is CLAUDE else "启动 Codex")
+        self.restart_codex_button.configure(state="disabled" if wanted is CLAUDE or self._busy else "normal")
         self._append_log(f"已切到「{wanted.label}」工作区：{wanted.root}")
         try:
             self._load_registry()
@@ -1966,6 +1981,12 @@ class CodexSotaApp(tk.Tk):
             self.provider_tree.focus(current)
             self.provider_tree.see(current)
             self._load_provider(current)
+        else:
+            self.current_id = None
+            self.loaded_provider = None
+            self.draft_models = []
+            self._reset_editor()
+            self._set_editor_protected(False)
         self._run_lint()
         self._refresh_claude_status()
 
@@ -2011,8 +2032,18 @@ class CodexSotaApp(tk.Tk):
                 self.provider_tree.selection_set(self.current_id)
             return
         selection = self.provider_tree.selection()
-        if selection:
-            self._load_provider(selection[0])
+        if not selection or selection[0] == self.current_id:
+            return
+        # Restore selection before opening a modal dialog: queued TreeviewSelect
+        # events must not re-enter the discard prompt or reload the same draft.
+        target = selection[0]
+        self.provider_tree.selection_remove(selection)
+        if self.current_id and self.provider_tree.exists(self.current_id):
+            self.provider_tree.selection_set(self.current_id)
+        if not self._confirm_discarding_edits("切换供应商"):
+            return
+        self._load_provider(target)
+        self.provider_tree.selection_set(target)
 
     def _load_provider(self, provider_id: str) -> None:
         try:
@@ -2048,6 +2079,7 @@ class CodexSotaApp(tk.Tk):
             provider.get("request_adapter")
             in {"responses_to_chat_completions", "messages_to_chat_completions"}
         )
+        self.headers_text.configure(state="normal")
         self.headers_text.delete("1.0", "end")
         self.headers_text.insert("1.0", json.dumps(provider.get("extra_headers") or {}, ensure_ascii=False, indent=2))
         self.draft_models = deepcopy(provider["models"])
@@ -2122,6 +2154,8 @@ class CodexSotaApp(tk.Tk):
 
     def _new_provider(self) -> None:
         if self._busy:
+            return
+        if not self._confirm_discarding_edits("新建供应商"):
             return
         self.current_id = None
         self.loaded_provider = None
@@ -2316,7 +2350,7 @@ class CodexSotaApp(tk.Tk):
         )
         # The bridge switch owns exactly the two Chat-Completions bridge values; which one
         # applies follows the workspace (Codex App speaks Responses, Claude Desktop speaks
-        # Messages).  juno's Messages translation is left untouched unless the box is
+        # Messages).  justdowork's Messages translation is left untouched unless the box is
         # ticked or unticked here.
         existing_adapter = str((existing or {}).get("request_adapter") or "").strip()
         bridge_values = {"responses_to_chat_completions", "messages_to_chat_completions"}
@@ -2671,20 +2705,8 @@ class CodexSotaApp(tk.Tk):
         def worker() -> dict[str, Any]:
             repair = auto_repair_active_inference_path(provider, key)
             persisted = False
-            # A newly drafted provider is not in the registry yet.  Avoid
-            # find_provider() here because it intentionally raises KeyError
-            # for that normal, unsaved form state.
-            provider_is_persisted = any(
-                str(entry.get("id")) == str(provider.get("id"))
-                for entry in self.registry.get("providers", [])
-                if isinstance(entry, dict)
-            )
-            if repair["changed"] and not provider.get("protected") and provider_is_persisted:
-                try:
-                    apply_provider(provider, restart=False, workspace=self.workspace)
-                    persisted = True
-                except Exception as error:
-                    repair["reason"] += f"（自动保存失败：{error}）"
+            # Testing uses the draft. Keep endpoint repairs in that draft too;
+            # applying it here would silently commit all unsaved form fields.
             outcome: list[dict[str, Any]] = []
             for model_id in targets:
                 result = test_model(provider, model_id, key, reasoning)
@@ -2721,7 +2743,12 @@ class CodexSotaApp(tk.Tk):
                 result = entry["test"]
                 model["last_test_status"] = "ready" if result["ok"] else "failed"
                 model["last_test_at"] = utc_now()
-                model["last_test_message"] = result.get("detail") or ("HTTP " + str(result.get("status")))
+                detail = result.get("detail") or result.get("error")
+                model["last_test_message"] = detail or (
+                    "HTTP " + str(result.get("status"))
+                    if result.get("status") is not None
+                    else "网络错误"
+                )
                 verdict = entry["tier"].get("verdict")
                 model["fast_tier_status"] = (
                     verdict if verdict in {"supported", "unsupported"} else "unknown"
@@ -2734,10 +2761,21 @@ class CodexSotaApp(tk.Tk):
                     ready += 1
                 if model["fast_tier_status"] == "supported":
                     accepts_fast += 1
+                if result["ok"]:
+                    tier_text = (
+                        "可用"
+                        if model["fast_tier_status"] == "supported"
+                        else "未确认"
+                    )
+                    suffix = f"，service_tier {tier_text}"
+                else:
+                    suffix = "，service_tier 未测试（基础模型请求失败）"
+                status_text = result.get("status") or "网络错误"
+                detail_text = f"：{detail[:240]}" if detail else ""
                 self._append_log(
-                    f"{provider['name']} / {model['id']}：{'可用' if result['ok'] else '失败'}"
-                    f"（{result.get('status') or '网络错误'}），service_tier "
-                    f"{'可用' if model['fast_tier_status'] == 'supported' else '未确认'}"
+                    f"{provider['name']} / {model['id']}："
+                    f"{'可用' if result['ok'] else '失败'}（{status_text}）"
+                    f"{suffix}{detail_text}"
                 )
             self._render_models()
             messagebox.showinfo(
@@ -2972,6 +3010,8 @@ class CodexSotaApp(tk.Tk):
     def _reload_current(self) -> None:
         if self._busy:
             return
+        if not self._confirm_discarding_edits("重新载入"):
+            return
         try:
             self._load_registry(self.current_id)
             self.status_var.set("已重新载入")
@@ -3051,19 +3091,23 @@ class CodexSotaApp(tk.Tk):
     def _update_health_metrics(self) -> None:
         self.after(100, self._run_audit)
 
-    def _launch_codex(self) -> None:
+    def _launch_codex(self, restart: bool = False) -> None:
         """The header button: each workspace launches its own app."""
         if self._busy:
             return
         if self.workspace is CLAUDE:
+            if restart:
+                return
             self._launch_claude()
             return
-        codex_sota_command = resolve_codex_sota_command()
-        if codex_sota_command is None:
+        # Desktop startup must not go through the CLI login wrapper: a hidden
+        # Read-Host/MessageBox there can hold the manager for fifteen minutes.
+        codex_sota_command = CORE_ROOT / "Switch-CodexSota.ps1"
+        if not codex_sota_command.is_file():
             messagebox.showerror(
                 "启动失败",
-                "找不到 codex-sota 启动命令。请把它加入 PATH，或设置 "
-                "CODEX_SOTA_COMMAND 指向实际的 .cmd/.bat/.ps1/.exe。",
+                f"找不到桌面启动脚本：{codex_sota_command}。\n"
+                "请恢复安装文件，或设置 CODEX_SOTA_CORE_ROOT 指向实际脚本目录。",
                 parent=self,
             )
             return
@@ -3071,7 +3115,7 @@ class CodexSotaApp(tk.Tk):
         if auth_problem:
             messagebox.showerror(
                 "启动失败",
-                "Tango Relay API key 不可用。这样启动的话，启动器会停在一个你看不见的"
+                "True SOTA API key 不可用。这样启动的话，启动器会停在一个你看不见的"
                 "输入提示上，永远不返回。\n\n"
                 f"{auth_problem}\n\n"
                 "请在 PowerShell 里运行 codex-sota，按提示粘贴 key，然后再回来启动。",
@@ -3079,52 +3123,56 @@ class CodexSotaApp(tk.Tk):
             )
             return
 
+        if restart and not messagebox.askyesno(
+            "重启 Codex App",
+            "将先请求 Codex 正常退出，再重新打开。请先确认正在进行的任务已完成。\n\n继续重启？",
+            parent=self,
+        ):
+            return
         invocation, command_cwd = codex_sota_invocation(codex_sota_command)
-        started = time.monotonic()
-        self._launch_phase = "正在运行 codex-sota"
+        # Normal desktop startup deliberately defers the three-way history sync
+        # to the quiet-exit watcher. Pass the guard explicitly so a future
+        # launcher default cannot turn this button into a blocking full sync (or
+        # start a second writer while the app is opening).
+        invocation.append("-SkipSync")
+        job = LaunchAttempt(invocation, command_cwd, CORE_ROOT,
+                            detect_codex_app_processes, restart=restart,
+                            inspect_process=inspect_codex_app_process)
+        self._codex_launch_job = job
+        self._launch_phase = "正在检查本地启动配置"
+        self._set_busy(True, self._launch_phase)
+        self._append_log(f"{'重启' if restart else '启动'}请求 {job.request_id}；日志：{job.log_path}")
+        self.after(0, lambda: self._poll_codex_launch(job))
 
-        def worker() -> dict[str, Any]:
-            # 输出走临时文件而不是管道：Start-SotaApp 用 UseShellExecute=$false 启动
-            # ChatGPT.exe，子孙进程会继承 std 句柄，管道要等到 Codex App 自己退出才 EOF。
-            with tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace") as sink:
-                try:
-                    completed = subprocess.run(
-                        invocation,
-                        cwd=str(command_cwd),
-                        stdin=subprocess.DEVNULL,
-                        stdout=sink,
-                        stderr=subprocess.STDOUT,
-                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                        timeout=LAUNCH_TIMEOUT_SECONDS,
-                    )
-                except subprocess.TimeoutExpired:
-                    raise RuntimeError(
-                        f"codex-sota 超过 {LAUNCH_TIMEOUT_SECONDS} 秒没有返回，已停止等待。"
-                        "Codex App 可能还在后台启动，检查一下任务管理器里的 ChatGPT.exe。"
-                    ) from None
-                sink.seek(0)
-                output = sink.read()
-            if completed.returncode != 0:
-                raise RuntimeError(
-                    f"codex-sota 退出码 {completed.returncode}：{first_meaningful_line(output)}"
-                )
-
-            self._launch_phase = "正在等待 Codex 窗口"
-            window_deadline = time.monotonic() + LAUNCH_WINDOW_WAIT_SECONDS
-            window_shown = False
-            while time.monotonic() < window_deadline:
-                if chatgpt_window_present():
-                    window_shown = True
-                    break
-                time.sleep(LAUNCH_WINDOW_POLL_SECONDS)
-            return {
-                "elapsed": time.monotonic() - started,
-                "window_shown": window_shown,
-                "vendors": read_router_vendor_health(self.workspace.log_path),
-            }
-
-        self._run_task("正在启动 Codex", worker, self._launch_finished)
-        self._tick_launch_status(started)
+    def _poll_codex_launch(self, job: LaunchAttempt) -> None:
+        if self._closing or self._codex_launch_job is not job:
+            return
+        try:
+            result = job.poll()
+        except Exception as error:
+            self._codex_launch_job = None
+            self._task_failed(f"{error}\n启动日志：{job.log_path}")
+            return
+        if result["status"] in {"starting", "deferred"}:
+            phase = PHASE_LABELS.get(result.get("phase", ""), "正在打开 Codex App")
+            if phase != self._launch_phase:
+                self._launch_phase = phase
+                self._append_log(phase)
+            label = f"{phase}（{int(result['elapsed'])} 秒）"
+            if result["elapsed"] >= LAUNCH_SLOW_HINT_SECONDS:
+                label += "；本次请求仍在跟踪，不会重复启动"
+            self.status_var.set(label)
+            self.after(500, lambda: self._poll_codex_launch(job))
+            return
+        self._codex_launch_job = None
+        if result["status"] == "error":
+            self._task_failed(f"{result.get('error', '启动未完成')}\n启动日志：{job.log_path}")
+            return
+        try:
+            result["vendors"] = read_router_vendor_health(self.workspace.log_path)
+            self._launch_finished(result)
+        finally:
+            self._set_busy(False, "就绪")
 
     def _launch_claude(self) -> None:
         """Publish the Claude profile, make sure its router is up, then activate the 3P app.
@@ -3261,19 +3309,10 @@ class CodexSotaApp(tk.Tk):
             self._append_log(f"Codex App 窗口已出现，共耗时 {waited} 秒。")
             self.header_status_var.set("Codex 运行中")
         else:
-            self._append_log(
-                f"codex-sota 成功返回（{waited} 秒，退出码 0），但 "
-                f"{LAUNCH_WINDOW_WAIT_SECONDS} 秒内没等到 Codex 窗口。"
-            )
             self.header_status_var.set("需要检查")
-            messagebox.showwarning(
-                "启动已完成，但窗口没出现",
-                f"codex-sota 本身跑完了（{waited} 秒，退出码 0），但等了 "
-                f"{LAUNCH_WINDOW_WAIT_SECONDS} 秒还没看到 Codex 窗口。\n\n"
-                "Codex App 冷启动本来就慢，可以再等等；如果始终不出现，"
-                "检查任务管理器里有没有 ChatGPT.exe。",
-                parent=self,
-            )
+            self._append_log(f"未确认 Codex 窗口；本次启动日志：{result.get('log_path', '')}")
+        for warning in result.get("warnings", []):
+            self._append_log("启动提示：" + str(warning))
         self._report_degraded_vendors(result["vendors"])
 
     def _tick_launch_status(self, started: float) -> None:
@@ -3282,7 +3321,7 @@ class CodexSotaApp(tk.Tk):
         waited = int(time.monotonic() - started)
         label = f"{self._launch_phase}（已等待 {waited} 秒）"
         if waited >= LAUNCH_SLOW_HINT_SECONDS:
-            label += "，冷启动通常需要 1-3 分钟，请勿重复点击"
+            label += "；正在跟踪同一次启动请求"
         self.status_var.set(label)
         self.after(1000, lambda: self._tick_launch_status(started))
 
@@ -3915,8 +3954,15 @@ class CodexSotaApp(tk.Tk):
 
     def _has_unsaved_changes(self) -> bool:
         """Whether the editor holds edits that a registry reload would silently throw away."""
+        if self.api_key_var.get().strip():
+            return True
         if not self.current_id:
-            return bool(self.name_var.get().strip() or self.base_url_var.get().strip())
+            return bool(
+                self.name_var.get().strip() or self.base_url_var.get().strip()
+                or self.id_var.get().strip() or self.prefix_var.get().strip()
+                or self.draft_models
+                or self.headers_text.get("1.0", "end").strip() not in {"", "{}"}
+            )
         try:
             saved = find_provider(self.registry, self.current_id)
         except KeyError:
@@ -3933,7 +3979,7 @@ class CodexSotaApp(tk.Tk):
             return True
         answer = messagebox.askyesnocancel(
             "编辑框里有未保存的改动",
-            f"{action}结束后会重新载入配置，编辑框里没保存的改动会丢掉。\n\n"
+            f"{action}会丢弃编辑框里尚未保存的改动。\n\n"
             "是＝先保存（保存完再点一次）\n否＝丢掉这些改动，继续\n取消＝什么都不做",
             parent=self,
         )
@@ -4242,6 +4288,9 @@ class CodexSotaApp(tk.Tk):
             self.claude_refresh_button,
         ):
             widget.configure(state=general_state)
+        restart_button = getattr(self, "restart_codex_button", None)
+        if restart_button is not None:
+            restart_button.configure(state="disabled" if busy or self.workspace is CLAUDE else "normal")
         if busy:
             self.provider_tree.state(["disabled"])
         else:
@@ -4257,6 +4306,44 @@ class CodexSotaApp(tk.Tk):
             self._show_error("无法打开", error)
 
     def _on_close(self) -> None:
+        job = getattr(self, "_codex_launch_job", None)
+        if job is not None and job.can_cancel_queued:
+            if not messagebox.askyesno(
+                "取消排队启动", "正在等待历史写入完成。取消本次启动请求并关闭管理器？不会关闭 Codex App。",
+                parent=self,
+            ):
+                return
+            if not self._confirm_discarding_edits("关闭窗口"):
+                return
+            job.cancel_queued()
+            self._codex_launch_job = None
+            self._busy = False
+            self._closing = True
+            self.api_key_var.set("")
+            self.destroy()
+            return
+        if job is not None:
+            if not messagebox.askyesno(
+                "停止跟踪并关闭管理器",
+                "启动请求仍在处理或核验。关闭管理器只停止界面跟踪，不会强杀启动器或 Codex，"
+                "已经发出的启动可能继续完成。\n\n"
+                f"本次启动日志：{job.log_path}\n\n确定关闭管理器？",
+                parent=self,
+            ):
+                return
+            if not self._confirm_discarding_edits("关闭窗口"):
+                return
+            job.detach()
+            self._codex_launch_job = None
+            self._closing = True
+            self.api_key_var.set("")
+            self.destroy()
+            return
+        if self._busy:
+            messagebox.showinfo("任务尚未完成", "请等当前操作结束再关闭，避免中断配置写入或启动流程。", parent=self)
+            return
+        if not self._confirm_discarding_edits("关闭窗口"):
+            return
         self._closing = True
         self.api_key_var.set("")
         self.destroy()

@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 from copy import deepcopy
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import io
 import json
 from pathlib import Path
 import sys
@@ -176,6 +177,71 @@ class ProbeTests(unittest.TestCase):
 class RouterTests(unittest.TestCase):
     def setUp(self) -> None:
         FakeUpstreamHandler.requests = []
+
+    def test_response_sse_uses_incomplete_terminal_for_max_output_tokens(self) -> None:
+        response = router.chat_message_to_response(
+            {
+                "id": "chatcmpl-length",
+                "choices": [{"message": {"content": "partial"}, "finish_reason": "length"}],
+                "usage": {"prompt_tokens": 3, "completion_tokens": 4},
+            },
+            "fixture-model",
+        )
+        stream = b"".join(router.response_to_sse(response)).decode("utf-8")
+        self.assertEqual(response["status"], "incomplete")
+        self.assertEqual(response["incomplete_details"]["reason"], "max_output_tokens")
+        self.assertIn("response.incomplete", stream)
+        self.assertNotIn("response.completed", stream)
+
+    def test_response_sse_keeps_completed_terminal_for_normal_finish(self) -> None:
+        response = router.chat_message_to_response(
+            {
+                "id": "chatcmpl-stop",
+                "choices": [{"message": {"content": "done"}, "finish_reason": "stop"}],
+            },
+            "fixture-model",
+        )
+        stream = b"".join(router.response_to_sse(response)).decode("utf-8")
+        self.assertEqual(response["status"], "completed")
+        self.assertIn("response.completed", stream)
+        self.assertNotIn("response.incomplete", stream)
+
+    def test_anthropic_stop_sequence_is_not_a_max_output_truncation(self) -> None:
+        response = router.anthropic_message_to_response(
+            {
+                "id": "msg-stop-sequence",
+                "model": "fixture-model",
+                "content": [{"type": "text", "text": "done"}],
+                "stop_reason": "stop_sequence",
+            },
+            "fixture-model",
+        )
+        self.assertEqual(response["status"], "completed")
+        self.assertNotIn("incomplete_details", response)
+
+        upstream = io.BytesIO(
+            b"event: message_start\n"
+            b'data: {"type":"message_start","message":{"id":"msg-stop-sequence","model":"fixture-model"}}\n\n'
+            b"event: message_delta\n"
+            b'data: {"type":"message_delta","delta":{"stop_reason":"stop_sequence"}}\n\n'
+            b"event: message_stop\n"
+            b'data: {"type":"message_stop"}\n\n'
+        )
+        stream = b"".join(router.anthropic_sse_to_responses(upstream, "fixture-model")).decode("utf-8")
+        self.assertIn("response.completed", stream)
+        self.assertNotIn("response.incomplete", stream)
+
+    def test_anthropic_max_tokens_is_an_incomplete_terminal(self) -> None:
+        response = router.anthropic_message_to_response(
+            {
+                "id": "msg-max-tokens",
+                "content": [{"type": "text", "text": "partial"}],
+                "stop_reason": "max_tokens",
+            },
+            "fixture-model",
+        )
+        self.assertEqual(response["status"], "incomplete")
+        self.assertEqual(response["incomplete_details"]["reason"], "max_output_tokens")
 
     def test_exact_route_prefix_stripping_and_accept_preservation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary, RunningServer(
@@ -420,8 +486,8 @@ class CatalogCapabilityTests(unittest.TestCase):
                 "version": 1,
                 "providers": [
                     {
-                        "id": "tango_relay",
-                        "name": "Tango Relay",
+                        "id": "true_sota",
+                        "name": "True SOTA",
                         "workspace": "codex",
                         "protocols": ["responses"],
                         "enabled": True,
@@ -434,7 +500,7 @@ class CatalogCapabilityTests(unittest.TestCase):
 
             self.assertEqual(
                 registry.selectable_slugs(raw_registry),
-                ["tango-relay--gpt-5.6-sol"],
+                ["true-sota--gpt-5.6-sol"],
             )
             registry.build_model_catalog(
                 registry=raw_registry,
@@ -444,7 +510,7 @@ class CatalogCapabilityTests(unittest.TestCase):
             catalog = json.loads(destination.read_text(encoding="utf-8"))
             self.assertEqual(
                 [model["slug"] for model in catalog["models"]],
-                ["tango-relay--gpt-5.6-sol"],
+                ["true-sota--gpt-5.6-sol"],
             )
 
     def test_namespaced_claude_publish_as_is_preserved_and_hashed(self) -> None:
@@ -461,8 +527,8 @@ class CatalogCapabilityTests(unittest.TestCase):
                 "version": 1,
                 "providers": [
                     {
-                        "id": "juno",
-                        "name": "Juno",
+                        "id": "justdowork",
+                        "name": "JustDoWork",
                         "base_url": "https://example.invalid",
                         "workspace": "claude",
                         "protocols": ["messages"],
@@ -473,14 +539,14 @@ class CatalogCapabilityTests(unittest.TestCase):
                             {
                                 "id": "claude-opus-5-thinking",
                                 "enabled": True,
-                                "publish_as": "juno.anthropic.claude-opus-5",
+                                "publish_as": "justdowork.anthropic.claude-opus-5",
                             }
                         ],
                     }
                 ],
             }
             canonical_registry = json.loads(json.dumps(raw_registry))
-            canonical_registry["providers"][0]["prefix"] = "juno.anthropic."
+            canonical_registry["providers"][0]["prefix"] = "justdowork.anthropic."
             expected_hash = registry.registry_digest(canonical_registry)
             result = registry.build_model_catalog(
                 registry=raw_registry,
@@ -492,7 +558,7 @@ class CatalogCapabilityTests(unittest.TestCase):
             self.assertEqual(catalog["registry_hash"], expected_hash)
             self.assertEqual(
                 [model["slug"] for model in catalog["models"]],
-                ["juno.anthropic.claude-opus-5"],
+                ["justdowork.anthropic.claude-opus-5"],
             )
 
     def test_raw_nondefault_claude_bare_alias_is_not_advertised(self) -> None:
@@ -509,14 +575,14 @@ class CatalogCapabilityTests(unittest.TestCase):
                 "version": 1,
                 "providers": [
                     {
-                        "id": "juno",
-                        "name": "Juno",
+                        "id": "justdowork",
+                        "name": "JustDoWork",
                         "base_url": "https://example.invalid",
                         "workspace": "claude",
                         "protocols": ["messages"],
                         "enabled": True,
                         "is_default": False,
-                        "prefix": "juno.anthropic.",
+                        "prefix": "justdowork.anthropic.",
                         "models": [
                             {
                                 "id": "claude-opus-5-thinking",
@@ -540,7 +606,7 @@ class CatalogCapabilityTests(unittest.TestCase):
             self.assertEqual(catalog["registry_hash"], expected_hash)
             self.assertEqual(
                 [model["slug"] for model in catalog["models"]],
-                ["juno.anthropic.claude-opus-5-thinking"],
+                ["justdowork.anthropic.claude-opus-5-thinking"],
             )
 
     def test_luna_does_not_inherit_sol_ultra_reasoning(self) -> None:

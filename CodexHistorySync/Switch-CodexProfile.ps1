@@ -34,12 +34,12 @@ $apiEnvironmentNames = @(
     'OPENAI_ORG_ID',
     'OPENAI_PROJECT_ID',
     'CODEX_ACCESS_TOKEN',
-    'CODEX_PROVIDER_A_API_KEY',
-    'CODEX_PROVIDER_B_API_KEY',
-    'CODEX_PROVIDER_C_API_KEY',
-    'CODEX_PROVIDER_D_API_KEY',
-    'CODEX_PROVIDER_E_API_KEY',
-    'CODEX_PROVIDER_F_API_KEY'
+    'CODEX_AGENTROUTER_API_KEY',
+    'CODEX_LINGZHAN_API_KEY',
+    'CODEX_AISHENJI_API_KEY',
+    'CODEX_CICADAS_API_KEY',
+    'CODEX_MAIXUN_API_KEY',
+    'CODEX_MIAOMIAOCODE_API_KEY'
 )
 
 function Show-ProfileMessage {
@@ -347,15 +347,24 @@ function Get-PythonExecutable {
         (Join-Path $env:LOCALAPPDATA 'Programs\Python\Python313\python.exe'),
         (Join-Path $env:LOCALAPPDATA 'Programs\Python\Python312\python.exe')
     )
-    $python = $candidates |
-        Where-Object { $_ -and (Test-Path -LiteralPath $_) } |
-        Select-Object -First 1
-    if ($python) {
-        return $python
-    }
+    # Any locally installed CPython, newest first -- see Switch-CodexSota.ps1 for why:
+    # PATH python.exe on Windows is usually the Microsoft Store stub, which starts, runs
+    # nothing, and exits 0, so a missing runtime python reads as an invalid profile.
+    $candidates += @(
+        Get-ChildItem -Path (Join-Path $env:LOCALAPPDATA 'Programs\Python') -Directory -Filter 'Python3*' -ErrorAction SilentlyContinue |
+            Sort-Object Name -Descending |
+            ForEach-Object { Join-Path $_.FullName 'python.exe' }
+    )
+    $candidates += Join-Path (Split-Path -Parent $PSScriptRoot) 'CodexSotaManager\.venv-build\Scripts\python.exe'
     $command = Get-Command python.exe -ErrorAction SilentlyContinue
-    if ($command) {
-        return $command.Source
+    if ($command) { $candidates += $command.Source }
+    foreach ($candidate in @($candidates | Where-Object { $_ } | Select-Object -Unique)) {
+        if (-not (Test-Path -LiteralPath $candidate -PathType Leaf) -or $candidate -match '\\WindowsApps\\') { continue }
+        try {
+            $probe = @(& $candidate -I -S -B -c 'import sys; print(193731 if sys.version_info >= (3,11) else 0)' 2>$null)
+            if ($LASTEXITCODE -eq 0 -and $probe -contains '193731') { return $candidate }
+        }
+        catch { continue }
     }
     return $null
 }
@@ -508,9 +517,11 @@ function Start-PostExitSyncWatcher {
         throw 'pythonw.exe was not found for post-exit history sync.'
     }
     Start-Process -FilePath $pythonw -ArgumentList @(
-        $postExitWatcherPath,
+        ('"' + $postExitWatcherPath + '"'),
         '--pid',
-        $AppProcessId.ToString()
+        $AppProcessId.ToString(),
+        '--app-executable', ('"' + (Get-Process -Id $AppProcessId -ErrorAction Stop).Path + '"'),
+        '--creation-ticks', (Get-Process -Id $AppProcessId -ErrorAction Stop).StartTime.ToUniversalTime().ToFileTimeUtc().ToString()
     ) -WorkingDirectory $installDir -WindowStyle Hidden | Out-Null
 }
 
@@ -866,7 +877,7 @@ else {
     ''
 }
 $serviceLine = ''
-$watcherLine = "`n关闭 $profileLabel App 后会自动再执行一次 Cockpit、GPT Plus 与 Tango Relay 三方同步。"
+$watcherLine = "`n关闭 $profileLabel App 后会自动再执行一次 Cockpit、GPT Plus 与 True SOTA 三方同步。"
 $messageIcon = 'Information'
 
 Show-ProfileMessage -Title "Codex 已切换到 $profileLabel" -Icon $messageIcon -Message @"

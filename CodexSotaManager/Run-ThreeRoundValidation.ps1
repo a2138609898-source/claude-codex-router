@@ -8,6 +8,7 @@ $managerRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $coreRoot = Join-Path (Split-Path -Parent $managerRoot) 'CodexHistorySync'
 $pythonCandidates = @(
     [Environment]::GetEnvironmentVariable('CODEX_PYTHON'),
+    (Join-Path $managerRoot '.venv-build\Scripts\python.exe'),
     (Join-Path $env:USERPROFILE '.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe')
 )
 # Any locally installed CPython, newest first.  The previous hard-coded 3.13/3.12 pair missed
@@ -18,15 +19,31 @@ $pythonCandidates += @(
         Sort-Object Name -Descending |
         ForEach-Object { Join-Path $_.FullName 'python.exe' }
 )
-$python = $pythonCandidates |
-    Where-Object { $_ -and (Test-Path -LiteralPath $_) } |
-    Select-Object -First 1
-if (-not $python) {
-    $pythonCommand = Get-Command python.exe -ErrorAction SilentlyContinue
-    if (-not $pythonCommand) {
-        throw 'Python runtime was not found.'
+$pythonCommand = Get-Command python.exe -ErrorAction SilentlyContinue
+if ($pythonCommand) {
+    $pythonCandidates += $pythonCommand.Source
+}
+$python = $null
+foreach ($candidate in @($pythonCandidates | Where-Object { $_ } | Select-Object -Unique)) {
+    if (-not (Test-Path -LiteralPath $candidate -PathType Leaf)) { continue }
+    if ($candidate -match '\\WindowsApps\\') { continue }
+    try {
+        $probe = & $candidate --version 2>&1
+        $probeExitCode = $LASTEXITCODE
+        $versionMatch = [regex]::Match(($probe -join ' '), 'Python\s+(\d+)\.(\d+)')
+        if ($probeExitCode -eq 0 -and $versionMatch.Success) {
+            $major = [int]$versionMatch.Groups[1].Value
+            $minor = [int]$versionMatch.Groups[2].Value
+            if ($major -eq 3 -and $minor -ge 11) {
+                $python = $candidate
+                break
+            }
+        }
     }
-    $python = $pythonCommand.Source
+    catch { continue }
+}
+if (-not $python) {
+    throw 'An executable Python 3.11 or newer runtime was not found.'
 }
 Write-Host ('Validation interpreter: ' + $python)
 
@@ -46,6 +63,7 @@ $pythonSources = @(
     (Join-Path $managerRoot 'test_sync_build_regressions.py')
 )
 $pythonSources += @(Get-ChildItem -LiteralPath $coreRoot -File -Filter '*.py' | Select-Object -ExpandProperty FullName)
+$pythonSources += @(Get-ChildItem -LiteralPath $managerRoot -File -Filter 'test_*.py' | Select-Object -ExpandProperty FullName)
 $pythonSources = @($pythonSources | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -Unique)
 Invoke-CheckedPython -Arguments (@('-m', 'py_compile') + $pythonSources)
 foreach ($script in @(Get-ChildItem -LiteralPath $coreRoot, $managerRoot -File -Filter '*.ps1')) {
@@ -56,10 +74,7 @@ Write-Host '[2/3] Isolated behavioral regression suite'
 Push-Location $managerRoot
 try {
     Invoke-CheckedPython -Arguments @(
-        '-m', 'unittest', '-v',
-        'test_codex_sota.py',
-        'test_codex_sota_regressions.py',
-        'test_sync_build_regressions.py'
+        '-B', '-m', 'unittest', 'discover', '-v', '-s', $managerRoot, '-p', 'test_*.py'
     )
 }
 finally {

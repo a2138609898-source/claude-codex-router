@@ -41,28 +41,27 @@ $logPath = Join-Path $sotaRoot 'log\sota-router.jsonl'
 $healthUri = 'http://127.0.0.1:' + $routerPort + '/healthz'
 
 function Get-PythonExecutable {
-    if ($PythonExecutableOverride) {
-        if (Test-Path -LiteralPath $PythonExecutableOverride) {
-            return [System.IO.Path]::GetFullPath($PythonExecutableOverride)
-        }
-        return $null
-    }
     $candidates = @(
+        $PythonExecutableOverride,
         $env:CODEX_PYTHON,
         (Join-Path $env:USERPROFILE '.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe'),
         (Join-Path $env:LOCALAPPDATA 'Programs\Python\Python313\python.exe'),
         (Join-Path $env:LOCALAPPDATA 'Programs\Python\Python312\python.exe'),
         (Join-Path $env:LOCALAPPDATA 'Programs\Python\Python311\python.exe')
     )
-    $python = $candidates |
-        Where-Object { $_ -and (Test-Path -LiteralPath $_) } |
-        Select-Object -First 1
-    if ($python) {
-        return $python
-    }
+    $candidates += @(Get-ChildItem -Path (Join-Path $env:LOCALAPPDATA 'Programs\Python') -Directory -Filter 'Python3*' -ErrorAction SilentlyContinue |
+        Sort-Object Name -Descending | ForEach-Object { Join-Path $_.FullName 'python.exe' })
+    $candidates += Join-Path (Split-Path -Parent $PSScriptRoot) 'CodexSotaManager\.venv-build\Scripts\python.exe'
     $command = Get-Command python.exe -ErrorAction SilentlyContinue
-    if ($command) {
-        return $command.Source
+    if ($command) { $candidates += $command.Source }
+    if ($PythonExecutableOverride) { $candidates = @($PythonExecutableOverride) }
+    foreach ($candidate in @($candidates | Where-Object { $_ } | Select-Object -Unique)) {
+        if (-not (Test-Path -LiteralPath $candidate -PathType Leaf) -or $candidate -match '\\WindowsApps\\') { continue }
+        try {
+            $probe = @(& $candidate -I -S -B -c 'import sys; print(193731 if sys.version_info >= (3,11) else 0)' 2>$null)
+            if ($LASTEXITCODE -eq 0 -and $probe -contains '193731') { return [IO.Path]::GetFullPath($candidate) }
+        }
+        catch { continue }
     }
     return $null
 }
@@ -184,7 +183,9 @@ function Stop-WorkspaceRouters {
 
 function Repair-RouterPidFile {
     if (Test-Path -LiteralPath $pidPath) {
-        return
+        $recordedPid = 0
+        if ([int]::TryParse((Get-Content -Raw -LiteralPath $pidPath).Trim(), [ref]$recordedPid) -and
+            (Test-WorkspaceRouterProcess -Process (Get-ProcessById -ProcessId $recordedPid))) { return }
     }
     foreach ($owner in @(Get-ListeningProcessIds)) {
         $process = Get-ProcessById -ProcessId ([int]$owner)
@@ -219,6 +220,19 @@ function Get-RouterHealth {
         return $null
     }
     return $null
+}
+
+$routerMutex = $null
+$routerMutexOwned = $false
+try {
+if (-not $AuditOnly) {
+    $routerMutex = [Threading.Mutex]::new($false, ('Local\CodexSotaRouter-' + $Workspace + '-' + $routerPort))
+    try { $routerMutexOwned = $routerMutex.WaitOne(15000) }
+    catch [Threading.AbandonedMutexException] { $routerMutexOwned = $true }
+    if (-not $routerMutexOwned) {
+        @{ status = 'deferred'; reason = 'router_operation_in_progress'; workspace = $Workspace } | ConvertTo-Json -Compress
+        exit 0
+    }
 }
 
 if ($Stop) {
@@ -291,13 +305,13 @@ if (-not (Test-Path -LiteralPath $pythonw)) {
     $pythonw = $python
 }
 $argumentList = @(
-    $routerScript,
+    ('"' + $routerScript + '"'),
     '--host', '127.0.0.1',
     '--port', $routerPort,
-    '--registry', $registryPath,
-    '--auth', $authPath,
-    '--pid-file', $pidPath,
-    '--log', $logPath
+    '--registry', ('"' + $registryPath + '"'),
+    '--auth', ('"' + $authPath + '"'),
+    '--pid-file', ('"' + $pidPath + '"'),
+    '--log', ('"' + $logPath + '"')
 )
 $startedProcess = Start-Process -FilePath $pythonw -ArgumentList $argumentList -WorkingDirectory $installRoot -WindowStyle Hidden -PassThru
 
@@ -320,3 +334,8 @@ $owners = @(Get-ListeningProcessIds)
 $ownerDetail = if ($owners.Count -gt 0) { " Listening PID(s): $($owners -join ', ')." } else { '' }
 $exitDetail = if ($startedProcess.HasExited) { " Router process exited with code $($startedProcess.ExitCode)." } else { '' }
 throw "Local SOTA router did not become healthy on 127.0.0.1:${routerPort}.$exitDetail$ownerDetail"
+}
+finally {
+    if ($routerMutexOwned) { $routerMutex.ReleaseMutex() }
+    if ($routerMutex) { $routerMutex.Dispose() }
+}

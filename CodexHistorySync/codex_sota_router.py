@@ -42,7 +42,7 @@ from sota_registry import (
 # 17 makes *all* billable generation requests single-shot. A third-party gateway may ignore an
 # Idempotency-Key, and separate vendors never share an idempotency ledger, so the key cannot be
 # treated as permission to replay a request that may already have been accepted and billed.
-ROUTER_VERSION = "17"
+ROUTER_VERSION = "18"
 HOP_BY_HOP_HEADERS = {
     "connection",
     "keep-alive",
@@ -89,7 +89,7 @@ INFERENCE_PATHS: dict[str, tuple[str, str]] = {
     "/v1/messages/count_tokens": ("messages", "/count_tokens"),
 }
 COUNT_TOKENS_PATHS = frozenset({"/messages/count_tokens", "/v1/messages/count_tokens"})
-# Responses compact is a distinct state-changing/metadata operation.  The juno adapter
+# Responses compact is a distinct state-changing/metadata operation.  The justdowork adapter
 # only translates ordinary Responses generations to Anthropic Messages; mapping compact onto
 # /v1/messages would silently turn a non-generation request into a billable generation.
 COMPACT_PATHS = frozenset({"/responses/compact", "/v1/responses/compact"})
@@ -191,12 +191,12 @@ USAGE_TAIL_BYTES = 64 * 1024
 # this it grows for the life of the install and every panel that tails it gets slower.
 LOG_MAX_BYTES = 8 * 1024 * 1024
 # This is deliberately a provider marker instead of a global protocol switch.  Codex still
-# talks Responses to the local router and keeps the normal `juno--...` model slugs; only
+# talks Responses to the local router and keeps the normal `justdowork--...` model slugs; only
 # that provider's outbound request is translated to the Anthropic Messages API.
-JUNO_ADAPTER = "responses_to_anthropic_messages"
+JUSTDOWORK_ADAPTER = "responses_to_anthropic_messages"
 CHAT_COMPLETIONS_ADAPTER = "responses_to_chat_completions"
 MESSAGES_TO_CHAT_COMPLETIONS_ADAPTER = "messages_to_chat_completions"
-JUNO_CODEX_USER_AGENT = (
+JUSTDOWORK_CODEX_USER_AGENT = (
     "codex_cli_rs/0.144.1 (Windows 11.0.26200; x86_64) WindowsTerminal"
 )
 
@@ -214,10 +214,10 @@ REASONING_EFFORT_BUDGETS = {
 }
 
 
-def is_juno_adapter(provider: dict[str, Any]) -> bool:
+def is_justdowork_adapter(provider: dict[str, Any]) -> bool:
     return (
-        str(provider.get("id") or "").lower() == "juno"
-        and provider.get("request_adapter") == JUNO_ADAPTER
+        str(provider.get("id") or "").lower() == "justdowork"
+        and provider.get("request_adapter") == JUSTDOWORK_ADAPTER
     )
 
 
@@ -443,7 +443,7 @@ def _response_tools(payload: dict[str, Any]) -> list[Any]:
     ``additional_tools``.  They are not placed in the top-level Responses ``tools``
     field, so an adapter that only reads ``payload["tools"]`` silently gives an
     Anthropic provider no tools at all.  Keep this normalization local to the
-    juno conversion path; other providers continue to receive the original
+    justdowork conversion path; other providers continue to receive the original
     payload unchanged.
     """
     result = list(payload.get("tools") or []) if isinstance(payload.get("tools"), list) else []
@@ -1073,10 +1073,20 @@ def _response_usage(usage: Any) -> dict[str, int]:
 _CHAT_STOP_REASONS_TO_ANTHROPIC = {
     "stop": "end_turn",
     "length": "max_tokens",
+    # Several OpenAI-compatible gateways use the Responses spelling even on
+    # their Chat Completions endpoint. Treat both as the same output limit.
+    "max_tokens": "max_tokens",
+    "max_output_tokens": "max_tokens",
     "tool_calls": "tool_use",
     "function_call": "tool_use",
     "content_filter": "end_turn",
 }
+
+# ``stop_sequence`` is a normal, successful Anthropic termination. Only an
+# explicit output-budget exhaustion is an incomplete Responses result; marking
+# stop_sequence incomplete is what made Codex report a false
+# ``max_output_tokens``/stream-disconnected error.
+OUTPUT_LIMIT_STOP_REASONS = frozenset({"length", "max_tokens", "max_output_tokens"})
 
 
 def chat_completion_to_anthropic_message(
@@ -1131,7 +1141,7 @@ def chat_completion_to_anthropic_message(
     # would silently never run the tool.
     has_tool_use = any(block.get("type") == "tool_use" for block in content)
     stop_reason = _CHAT_STOP_REASONS_TO_ANTHROPIC.get(
-        str(choice.get("finish_reason") or ""), "end_turn"
+        str(choice.get("finish_reason") or "").strip().lower(), "end_turn"
     )
     if has_tool_use:
         stop_reason = "tool_use"
@@ -1160,7 +1170,7 @@ def chat_message_to_response(
     choices = completion.get("choices") if isinstance(completion.get("choices"), list) else []
     choice = choices[0] if choices and isinstance(choices[0], dict) else {}
     message = choice.get("message") if isinstance(choice.get("message"), dict) else {}
-    finish_reason = str(choice.get("finish_reason") or "")
+    finish_reason = str(choice.get("finish_reason") or "").strip().lower()
     response_id = "resp_" + str(
         completion.get("id") or int(time.time() * 1000)
     ).removeprefix("chatcmpl-")
@@ -1234,7 +1244,7 @@ def chat_message_to_response(
         output.append(item)
 
     usage = _response_usage(completion.get("usage"))
-    status = "incomplete" if finish_reason == "length" else "completed"
+    status = "incomplete" if finish_reason in OUTPUT_LIMIT_STOP_REASONS else "completed"
     result: dict[str, Any] = {
         "id": response_id,
         "object": "response",
@@ -1341,8 +1351,8 @@ def anthropic_message_to_response(
                 output_item
             )
     usage = _response_usage(message.get("usage"))
-    stop_reason = message.get("stop_reason")
-    status = "incomplete" if stop_reason in {"max_tokens", "stop_sequence"} else "completed"
+    stop_reason = str(message.get("stop_reason") or "").strip().lower()
+    status = "incomplete" if stop_reason in OUTPUT_LIMIT_STOP_REASONS else "completed"
     result: dict[str, Any] = {
         "id": response_id,
         "object": "response",
@@ -1421,7 +1431,14 @@ def _sse_frame(
 
 
 def response_to_sse(response: dict[str, Any]) -> list[bytes]:
-    """Turn a completed response into a valid Responses event sequence."""
+    """Turn a translated response into a valid Responses event sequence.
+
+    ``response.completed`` is not a generic end marker: Responses clients use
+    ``response.incomplete`` for a response that reached ``max_output_tokens``
+    and ``response.failed`` for a terminal failure.  Emitting ``completed``
+    with ``status=incomplete`` leaves Codex thinking the stream disconnected
+    before its terminal event arrived.
+    """
     events: list[bytes] = []
     response_id = str(response.get("id") or "resp_local")
     created = dict(response)
@@ -1591,10 +1608,14 @@ def response_to_sse(response: dict[str, Any]) -> list[bytes]:
                 response_id,
             )
         )
+    terminal_event = {
+        "incomplete": "response.incomplete",
+        "failed": "response.failed",
+    }.get(str(response.get("status") or ""), "response.completed")
     events.append(
         _sse_frame(
-            "response.completed",
-            {"type": "response.completed", "response": response},
+            terminal_event,
+            {"type": terminal_event, "response": response},
             response_id,
         )
     )
@@ -1654,8 +1675,9 @@ def chat_sse_to_anthropic_sse(
         )
 
     with upstream:
+        reader = BoundedSSEReader(upstream)
         while True:
-            line = upstream.readline()
+            line = reader.readline()
             if not line:
                 break
             decoded = line.decode("utf-8", "replace").rstrip("\r\n")
@@ -1666,7 +1688,7 @@ def chat_sse_to_anthropic_sse(
                 continue
             if raw_payload == "[DONE]":
                 saw_completion = True
-                continue
+                break
             try:
                 data = json.loads(raw_payload)
             except (ValueError, TypeError):
@@ -1681,7 +1703,7 @@ def chat_sse_to_anthropic_sse(
             if not choices:
                 continue
             choice = choices[0] if isinstance(choices[0], dict) else {}
-            finish = str(choice.get("finish_reason") or "")
+            finish = str(choice.get("finish_reason") or "").strip().lower()
             if finish:
                 saw_completion = True
                 stop_reason = _CHAT_STOP_REASONS_TO_ANTHROPIC.get(finish, "end_turn")
@@ -1863,6 +1885,7 @@ def chat_sse_to_responses(
     created_sent = False
     completed_sent = False
     saw_completion = False
+    finish_reason = ""
     # Tool calls stream as indexed fragments; the wire format gives the id and the name in
     # the first fragment of each index and argument fragments after it.
     tool_items: dict[int, dict[str, Any]] = {}
@@ -1969,24 +1992,29 @@ def chat_sse_to_responses(
         clean_output = [
             {k: v for k, v in item.items() if not k.startswith("_")} for item in output
         ]
+        status = "incomplete" if finish_reason in OUTPUT_LIMIT_STOP_REASONS else "completed"
         response = {
             "id": response_id, "object": "response", "created_at": int(time.time()),
-            "model": response_model, "status": "completed", "output": clean_output,
+            "model": response_model, "status": status, "output": clean_output,
             "parallel_tool_calls": True, "tool_choice": "auto",
             "output_text": "".join(text_buffers.values()),
             "usage": _response_usage(usage),
         }
+        if status == "incomplete":
+            response["incomplete_details"] = {"reason": "max_output_tokens"}
+        terminal_event = "response.incomplete" if status == "incomplete" else "response.completed"
         return _sse_frame(
-            "response.completed",
-            {"type": "response.completed", "response": response},
+            terminal_event,
+            {"type": terminal_event, "response": response},
             response_id,
         )
 
     event_name = ""
     data_lines: list[str] = []
     with upstream:
+        reader = BoundedSSEReader(upstream)
         while True:
-            line = upstream.readline()
+            line = reader.readline()
             if not line:
                 if data_lines:
                     line = b"\n"
@@ -2006,7 +2034,7 @@ def chat_sse_to_responses(
             data_lines, event_name = [], ""
             if raw_payload.strip() == "[DONE]":
                 saw_completion = True
-                continue
+                break
             try:
                 data = json.loads(raw_payload)
             except (ValueError, TypeError):
@@ -2023,6 +2051,7 @@ def chat_sse_to_responses(
             choice = choices[0] if isinstance(choices[0], dict) else {}
             if choice.get("finish_reason"):
                 saw_completion = True
+                finish_reason = str(choice.get("finish_reason")).strip().lower()
             delta = choice.get("delta") if isinstance(choice.get("delta"), dict) else {}
             reasoning_text = delta.get("reasoning_content")
             if not (isinstance(reasoning_text, str) and reasoning_text):
@@ -2291,6 +2320,7 @@ def anthropic_sse_to_responses(
     # upstream ends means the stream was truncated, and the end-of-stream path below must
     # say so instead of synthesising a completed event over a half-answer.
     saw_message_stop = False
+    stop_reason = ""
 
     def ensure_created() -> bytes:
         nonlocal created_sent
@@ -2313,23 +2343,28 @@ def anthropic_sse_to_responses(
         if completed_sent:
             return b""
         completed_sent = True
+        status = "incomplete" if stop_reason in OUTPUT_LIMIT_STOP_REASONS else "completed"
         response = {
             "id": response_id, "object": "response", "created_at": int(time.time()),
-            "model": response_model, "status": "completed", "output": output,
+            "model": response_model, "status": status, "output": output,
             "parallel_tool_calls": True, "tool_choice": "auto", "output_text": "".join(text_buffers.values()),
             "usage": _response_usage(usage),
         }
+        if status == "incomplete":
+            response["incomplete_details"] = {"reason": "max_output_tokens"}
+        terminal_event = "response.incomplete" if status == "incomplete" else "response.completed"
         return _sse_frame(
-            "response.completed",
-            {"type": "response.completed", "response": response},
+            terminal_event,
+            {"type": terminal_event, "response": response},
             response_id,
         )
 
     event_name = ""
     data_lines: list[str] = []
     with upstream:
+        reader = BoundedSSEReader(upstream)
         while True:
-            line = upstream.readline()
+            line = reader.readline()
             if not line:
                 if data_lines:
                     line = b"\n"
@@ -2350,8 +2385,11 @@ def anthropic_sse_to_responses(
             except (ValueError, TypeError):
                 data_lines, event_name = [], ""
                 continue
-            data_lines, event_name = [], ""
+            if not isinstance(data, dict):
+                data_lines, event_name = [], ""
+                continue
             kind = str(data.get("type") or event_name)
+            data_lines, event_name = [], ""
             if kind == "message_start":
                 message = data.get("message") if isinstance(data.get("message"), dict) else {}
                 response_id = "resp_" + str(message.get("id") or response_id.replace("resp_", ""))
@@ -2654,12 +2692,16 @@ def anthropic_sse_to_responses(
                         response_id,
                     )
             elif kind == "message_delta":
+                delta = data.get("delta") if isinstance(data.get("delta"), dict) else {}
+                if delta.get("stop_reason"):
+                    stop_reason = str(delta.get("stop_reason")).strip().lower()
                 usage.update(data.get("usage") or {})
             elif kind == "message_stop":
                 saw_message_stop = True
                 final = finish()
                 if final:
                     yield final
+                break
             elif kind == "error":
                 yield _sse_frame(
                     "error",
@@ -2801,6 +2843,89 @@ class RoutingSnapshot:
 
 class UpstreamReadError(RuntimeError):
     """The upstream stopped producing a body after its response had started."""
+
+
+class SSELimitError(UpstreamReadError):
+    """An upstream event exceeded the limit; replaying it cannot repair it."""
+
+
+class BoundedSSEReader:
+    """Bound allocation before reading, including events spread over many lines."""
+
+    def __init__(self, upstream: Any) -> None:
+        self.upstream = upstream
+        self.event_bytes = 0
+
+    def readline(self) -> bytes:
+        remaining = MAX_REQUEST_BODY_BYTES - self.event_bytes
+        line = self.upstream.readline(remaining + 1)
+        if len(line) > remaining:
+            raise SSELimitError("SSE event exceeded the router limit")
+        self.event_bytes = self.event_bytes + len(line) if line.rstrip(b"\r\n") else 0
+        return line
+
+
+def append_usage_tail(tail: deque, size: int, chunk: bytes) -> int:
+    """Retain only a bounded suffix, accounting for deque's automatic eviction."""
+    if tail.maxlen is not None and len(tail) == tail.maxlen:
+        size -= len(tail.popleft())
+    chunk = chunk[-USAGE_TAIL_BYTES:]
+    tail.append(chunk)
+    size += len(chunk)
+    while size > USAGE_TAIL_BYTES:
+        excess = size - USAGE_TAIL_BYTES
+        first = tail.popleft()
+        size -= len(first)
+        if len(first) > excess:
+            tail.appendleft(first[excess:])
+            size += len(first) - excess
+    return size
+
+
+class SSEProgress:
+    """Inspect complete SSE frames, never words appearing inside generated text."""
+
+    def __init__(self) -> None:
+        self.event = ""
+        self.data: list[bytes] = []
+        self.size = 0
+        self.terminal = ""
+        self.state_seen = False
+        self.response_id = ""
+
+    def feed(self, line: bytes) -> None:
+        value = line.rstrip(b"\r\n")
+        if value:
+            if value.startswith(b"event:"):
+                self.event = value[6:].strip().decode("utf-8", "replace")
+            elif value.startswith(b"data:"):
+                self.size += len(value)
+                if self.size > MAX_REQUEST_BODY_BYTES:
+                    raise ValueError("SSE event exceeded the router limit")
+                self.data.append(value[5:].lstrip(b" "))
+            return
+        raw = b"\n".join(self.data)
+        event = self.event
+        self.event, self.data, self.size = "", [], 0
+        if not raw:
+            return
+        if raw.strip() == b"[DONE]":
+            self.terminal = "[DONE]"
+            return
+        try:
+            payload = json.loads(raw)
+        except (ValueError, UnicodeError):
+            return
+        if not isinstance(payload, dict):
+            return
+        kind = str(payload.get("type") or event)
+        if kind.startswith(("response.", "content_block")) or kind in {"message_start", "message_delta", "error"}:
+            self.state_seen = True
+        response = payload.get("response")
+        if isinstance(response, dict) and isinstance(response.get("id"), str):
+            self.response_id = response["id"]
+        if kind in {"response.completed", "response.failed", "response.incomplete", "message_stop", "error"}:
+            self.terminal = kind
 
 
 class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -3384,7 +3509,7 @@ class SotaRouterHandler(BaseHTTPRequestHandler):
                 payload = {
                     "type": "response.failed",
                     "response": {
-                        "id": "resp_failed_" + str(int(time.time() * 1000)),
+                        "id": getattr(self, "_stream_response_id", "") or "resp_failed_" + str(int(time.time() * 1000)),
                         "object": "response",
                         "created_at": int(time.time()),
                         "status": "failed",
@@ -3857,7 +3982,7 @@ class SotaRouterHandler(BaseHTTPRequestHandler):
         if clean_path in COMPACT_PATHS:
             primary_provider = routing.providers.get(candidates[0][0]) if candidates else None
             if primary_provider is not None and (
-                is_juno_adapter(primary_provider)
+                is_justdowork_adapter(primary_provider)
                 or is_chat_completions_adapter(primary_provider)
             ):
                 # There is no semantics-preserving Responses -> Messages mapping for compact.
@@ -3867,7 +3992,7 @@ class SotaRouterHandler(BaseHTTPRequestHandler):
                     {
                         "error": {
                             "message": (
-                                "Responses compact is not supported by the juno "
+                                "Responses compact is not supported by the justdowork "
                                 "Messages adapter"
                             ),
                             "type": "unsupported_adapter_operation",
@@ -3929,7 +4054,7 @@ class SotaRouterHandler(BaseHTTPRequestHandler):
                 )
                 continue
             body = outgoing_body
-            adapter = is_juno_adapter(provider)
+            adapter = is_justdowork_adapter(provider)
             if counting_tokens and (
                 adapter
                 or is_chat_completions_adapter(provider)
@@ -3961,7 +4086,7 @@ class SotaRouterHandler(BaseHTTPRequestHandler):
                         400,
                         {
                             "error": {
-                                "message": f"Could not translate Responses request for juno: {error}",
+                                "message": f"Could not translate Responses request for justdowork: {error}",
                                 "type": "request_translation_error",
                             }
                         },
@@ -4089,7 +4214,7 @@ class SotaRouterHandler(BaseHTTPRequestHandler):
             except (BrokenPipeError, ConnectionResetError):
                 pass
 
-    def _relay_juno(
+    def _relay_justdowork(
         self,
         upstream: Any,
         vendor: str,
@@ -4101,7 +4226,7 @@ class SotaRouterHandler(BaseHTTPRequestHandler):
         tool_kinds: dict[str, str] | None = None,
         is_final_attempt: bool = True,
     ) -> bool:
-        """Convert one juno Messages response back to the Responses wire shape.
+        """Convert one justdowork Messages response back to the Responses wire shape.
 
         Returns True when the stream died before a single frame was written -- the caller
         may then retry the same vendor invisibly.  Response headers are held back until
@@ -4131,10 +4256,7 @@ class SotaRouterHandler(BaseHTTPRequestHandler):
             frames_written += 1
             if len(head) < USAGE_HEAD_BYTES:
                 head.extend(chunk[: USAGE_HEAD_BYTES - len(head)])
-            tail.append(chunk)
-            tail_bytes += len(chunk)
-            while tail_bytes > USAGE_TAIL_BYTES and len(tail) > 1:
-                tail_bytes -= len(tail.popleft())
+            tail_bytes = append_usage_tail(tail, tail_bytes, chunk)
 
         try:
             with upstream:
@@ -4212,6 +4334,7 @@ class SotaRouterHandler(BaseHTTPRequestHandler):
             if (
                 frames_written == 0
                 and not is_final_attempt
+                and not isinstance(error, SSELimitError)
                 and (time.monotonic() - started) < STREAM_RETRY_EARLY_WINDOW
             ):
                 # Nothing reached the client: hand the attempt back for an invisible retry.
@@ -4310,10 +4433,7 @@ class SotaRouterHandler(BaseHTTPRequestHandler):
             frames_written += 1
             if len(head) < USAGE_HEAD_BYTES:
                 head.extend(chunk[: USAGE_HEAD_BYTES - len(head)])
-            tail.append(chunk)
-            tail_bytes += len(chunk)
-            while tail_bytes > USAGE_TAIL_BYTES and len(tail) > 1:
-                tail_bytes -= len(tail.popleft())
+            tail_bytes = append_usage_tail(tail, tail_bytes, chunk)
 
         try:
             with upstream:
@@ -4381,6 +4501,7 @@ class SotaRouterHandler(BaseHTTPRequestHandler):
             if (
                 frames_written == 0
                 and not is_final_attempt
+                and not isinstance(error, SSELimitError)
                 and (time.monotonic() - started) < STREAM_RETRY_EARLY_WINDOW
             ):
                 self.close_connection = True
@@ -4473,10 +4594,7 @@ class SotaRouterHandler(BaseHTTPRequestHandler):
             frames_written += 1
             if len(head) < USAGE_HEAD_BYTES:
                 head.extend(chunk[: USAGE_HEAD_BYTES - len(head)])
-            tail.append(chunk)
-            tail_bytes += len(chunk)
-            while tail_bytes > USAGE_TAIL_BYTES and len(tail) > 1:
-                tail_bytes -= len(tail.popleft())
+            tail_bytes = append_usage_tail(tail, tail_bytes, chunk)
 
         try:
             with upstream:
@@ -4556,6 +4674,7 @@ class SotaRouterHandler(BaseHTTPRequestHandler):
             if (
                 frames_written == 0
                 and not is_final_attempt
+                and not isinstance(error, SSELimitError)
                 and (time.monotonic() - started) < STREAM_RETRY_EARLY_WINDOW
             ):
                 self.close_connection = True
@@ -4650,8 +4769,8 @@ class SotaRouterHandler(BaseHTTPRequestHandler):
                 tool_kinds,
                 is_final_attempt=is_final_attempt,
             )
-        if provider is not None and is_juno_adapter(provider) and 200 <= status < 300:
-            return self._relay_juno(
+        if provider is not None and is_justdowork_adapter(provider) and 200 <= status < 300:
+            return self._relay_justdowork(
                 upstream,
                 vendor,
                 status,
@@ -4672,7 +4791,7 @@ class SotaRouterHandler(BaseHTTPRequestHandler):
         tail_bytes = 0
         saw_completion = False
         state_seen = False
-        carry = b""
+        progress = SSEProgress()
 
         def send_headers_once() -> None:
             nonlocal headers_sent
@@ -4708,7 +4827,7 @@ class SotaRouterHandler(BaseHTTPRequestHandler):
                         # Without the nonlocal declarations these assignments would create
                         # shadowing locals inside this closure and every completed stream
                         # would be misread as truncated.
-                        nonlocal saw_completion, state_seen, carry, head, tail_bytes
+                        nonlocal head, tail_bytes
                         # Hold the response line back until real content exists, so a
                         # stream that dies before any event can still be retried or
                         # answered with JSON without a half-open SSE response.
@@ -4717,31 +4836,15 @@ class SotaRouterHandler(BaseHTTPRequestHandler):
                         self.wfile.flush()
                         if len(head) < USAGE_HEAD_BYTES:
                             head += chunk[: USAGE_HEAD_BYTES - len(head)]
-                        tail.append(chunk)
-                        tail_bytes += len(chunk)
-                        while tail_bytes > USAGE_TAIL_BYTES and len(tail) > 1:
-                            tail_bytes -= len(tail.popleft())
-                        if not (saw_completion and state_seen):
-                            probe = carry + chunk
-                            if not saw_completion and any(
-                                marker in probe
-                                for marker in (
-                                    b"response.completed",
-                                    b"message_stop",
-                                    b"[DONE]",
-                                )
-                            ):
-                                saw_completion = True
-                            if not state_seen and any(
-                                marker in probe for marker in STREAM_STATE_MARKERS
-                            ):
-                                state_seen = True
-                            carry = probe[-1024:]
+                        tail_bytes = append_usage_tail(tail, tail_bytes, chunk)
 
                     if upstream_is_sse:
+                        reader = BoundedSSEReader(upstream)
                         while True:
                             try:
-                                line = upstream.readline()
+                                line = reader.readline()
+                            except SSELimitError:
+                                raise
                             except Exception as error:  # noqa: BLE001 - classify source
                                 raise UpstreamReadError(
                                     f"{type(error).__name__}: {error}"
@@ -4749,6 +4852,17 @@ class SotaRouterHandler(BaseHTTPRequestHandler):
                             if not line:
                                 break
                             feed(line)
+                            progress.feed(line)
+                            state_seen = progress.state_seen
+                            self._stream_response_id = progress.response_id
+                            if progress.terminal:
+                                saw_completion = True
+                                if progress.terminal in {"response.failed", "error"}:
+                                    status = 502
+                                    relay_error = "upstream terminal event: " + progress.terminal
+                                # An SSE terminal frame ends the turn, even when the
+                                # upstream leaves its HTTP connection open indefinitely.
+                                break
                     else:
                         while True:
                             try:
@@ -4762,6 +4876,10 @@ class SotaRouterHandler(BaseHTTPRequestHandler):
                             feed(chunk)
                     send_headers_once()
                     if upstream_is_sse and not saw_completion:
+                        if progress.data or progress.event:
+                            # Partial event bytes already reached the client; replay is visible.
+                            state_seen = True
+                            self.wfile.write(b"\n\n")
                         # A gateway that closes the connection mid-stream does it *cleanly*
                         # at the TCP level half the time, which used to look exactly like a
                         # normal end: the client silently lost the rest of the answer and
@@ -4802,6 +4920,7 @@ class SotaRouterHandler(BaseHTTPRequestHandler):
             if not state_seen and not headers_sent and not self._relay_headers_sent:
                 if (
                     not is_final_attempt
+                    and not isinstance(error, SSELimitError)
                     and (time.monotonic() - started) < STREAM_RETRY_EARLY_WINDOW
                 ):
                     self.close_connection = True
@@ -4837,6 +4956,12 @@ class SotaRouterHandler(BaseHTTPRequestHandler):
                 # The stream already started, so a raw close is all the client would see.
                 # One official terminal event lets the turn fail cleanly with the actual
                 # reason, in the client's own protocol.
+                # Discard any unterminated upstream data line before adding our
+                # terminal frame; otherwise the client parses both as one event.
+                try:
+                    self.wfile.write(b"\n\n")
+                except CLIENT_GONE_ERRORS:
+                    pass
                 self._write_stream_error_frame(
                     friendly_upstream_error(relay_error, vendor),
                     protocol=self._client_protocol(),
@@ -4974,7 +5099,7 @@ class SotaRouterHandler(BaseHTTPRequestHandler):
             }
             headers.update(auth_headers(provider, key, include_probe_defaults=False))
             headers["Accept-Encoding"] = "identity"
-            adapter = is_juno_adapter(provider)
+            adapter = is_justdowork_adapter(provider)
             # Cloudflare in front of these gateways bans unknown client signatures (error
             # 1010 browser_signature_banned), and it is not one vendor: the request log has
             # shown it from a dozen different gateways. A forwarded Python-urllib or curl
@@ -4982,7 +5107,7 @@ class SotaRouterHandler(BaseHTTPRequestHandler):
             # CLI signature the vendors document -- the real apps behind this router send
             # it themselves, and nothing downstream needs the caller's original UA.
             headers.setdefault("Accept", "application/json")
-            headers["User-Agent"] = JUNO_CODEX_USER_AGENT
+            headers["User-Agent"] = JUSTDOWORK_CODEX_USER_AGENT
             headers["originator"] = "codex_cli_rs"
             # Forwarding is a denylist, so a client that sent anthropic-version keeps its own
             # value whatever the casing; only a caller that omitted one gets the default, and
