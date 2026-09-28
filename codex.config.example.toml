@@ -1,0 +1,67 @@
+# =============================================================================
+# codex.config.example.toml — Codex CLI / Codex App 侧的可移植配置参考
+# =============================================================================
+# 这是一个「注释版参考」，不是「拷过去就能跑」的文件。真实的 config.toml 由
+# 本项目的工具链（Switch-CodexSota.ps1 / 管理器 / profile 校验器）生成、校验和
+# 自愈（见 docs/CONFIG.md 里的 model pin 修复），所以正常部署不需要手写它。
+#
+# 它在这里回答一个 README 里点名、但仓库里没有示例的问题：providers.example.json
+# 是 Claude/Messages 模板，不能当 Codex 配置用——那 Codex 侧到底长什么样？
+#
+# 关键设计：Codex 只认一个网关地址，所以这里把它指向【本机 SOTA 路由器】，
+# 由路由器再按 providers.json（管理器维护、DPAPI 存密钥）分发给各上游供应商。
+# 因此本文件【不】列出任何真实供应商、密钥或 per-vendor 直连块——那些是路由器的事。
+#
+# 可移植性：不要照抄绝对路径。默认 workspace 根目录是 %USERPROFILE%\.codex-sota，
+# 换机器/换目录用环境变量 CODEX_SOTA_CODEX_ROOT 覆盖（见 README「可移植部署变量」）。
+# 端口默认 17895（Claude workspace 是 17994），可用 Start-CodexSotaRouter.ps1
+# 的 -RouterPortOverride 改。
+# =============================================================================
+
+# --- 上游选择：始终走本机路由器 -------------------------------------------------
+model_provider = "true_sota"
+
+# 对外可选的 slug（catalog 里的 published_slug，形如 <prefix>--<id>）。
+# 占位示例，请换成你自己 catalog 里真实存在的一项；启动前校验器会检查它在不在 catalog 中。
+model = "vendor-a--your-model-id"
+review_model = "vendor-a--your-review-model-id"
+model_reasoning_effort = "high"
+
+# 路由器生成给 Codex App 读的模型目录。相对你的 workspace 根目录，别写死用户名。
+model_catalog_json = "${USERPROFILE}/.codex-sota/sota-multi-vendor-model-catalog.json"
+
+# 用文件里的凭据、强制 API 登录、不在上游留存响应——单机自用的稳妥默认值。
+cli_auth_credentials_store = "file"
+forced_login_method = "api"
+disable_response_storage = true
+network_access = "enabled"
+service_tier = "default"
+
+# --- 本机 SOTA 路由器（唯一需要的 provider 块） --------------------------------
+# 这是固定的集成点：环回地址上的网关，由 codex_sota_router.py 提供。
+# 上游供应商、密钥、失败切换全部在 providers.json 里配（用管理器加），不在这里。
+[model_providers.true_sota]
+name = "SOTA Multi-Vendor Router"
+base_url = "http://127.0.0.1:17895"
+wire_api = "responses"
+requires_openai_auth = true
+
+[features]
+goals = true
+js_repl = false
+
+[desktop]
+enabled-reasoning-efforts = ["low", "medium", "high", "xhigh", "max", "ultra"]
+show-context-window-usage = true
+
+[windows]
+sandbox = "elevated"
+
+# =============================================================================
+# 不要放进这里、也不要提交到版本库的东西：
+#   - [projects.'...'] 的 trust_level 条目：那是你本机每个项目路径的信任状态，纯机器本地。
+#   - 真实上游 [model_providers.<vendor>] 直连块、密钥、token 命令、真实 base_url。
+#   - [marketplaces]/[plugins]/[mcp_servers] 里指向 AppData、WindowsApps、带版本号哈希
+#     的绝对路径——换台机器全都不成立。
+# 需要多上游时用管理器写 providers.json；密钥走 DPAPI（*.dpapi），不手写。
+# =============================================================================
