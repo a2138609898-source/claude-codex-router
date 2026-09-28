@@ -16,10 +16,18 @@ $scriptPath = Join-Path $installDir 'sync_codex_histories_three_way.py'
 $profileSwitcherPath = Join-Path $installDir 'Switch-CodexProfile.ps1'
 $sotaSwitcherPath = Join-Path $installDir 'Switch-CodexSota.ps1'
 $activeProfilePath = Join-Path $installDir 'active-profile.json'
+function Resolve-ConfiguredRoot {
+    param([string]$EnvironmentName, [string]$DefaultName)
+    $configured = [Environment]::GetEnvironmentVariable($EnvironmentName)
+    if (-not [string]::IsNullOrWhiteSpace($configured)) {
+        return [System.IO.Path]::GetFullPath([Environment]::ExpandEnvironmentVariables($configured))
+    }
+    return [System.IO.Path]::GetFullPath((Join-Path $env:USERPROFILE $DefaultName))
+}
 $profileRoots = @{
-    Plus = Join-Path $env:USERPROFILE '.codex-plus'
-    Cockpit = Join-Path $env:USERPROFILE '.codex-personal'
-    Sota = Join-Path $env:USERPROFILE '.codex-sota'
+    Plus = Resolve-ConfiguredRoot 'CODEX_SOTA_PLUS_ROOT' '.codex-plus'
+    Cockpit = Resolve-ConfiguredRoot 'CODEX_SOTA_COCKPIT_ROOT' '.codex-personal'
+    Sota = Resolve-ConfiguredRoot 'CODEX_SOTA_CODEX_ROOT' '.codex-sota'
 }
 $apiEnvironmentNames = @(
     'OPENAI_API_KEY',
@@ -43,6 +51,7 @@ if (Test-Path -LiteralPath $messagesPath) {
 }
 
 $pythonCandidates = @(
+    [Environment]::GetEnvironmentVariable('CODEX_SOTA_PYTHON'),
     [Environment]::GetEnvironmentVariable('CODEX_PYTHON'),
     (Join-Path $env:USERPROFILE '.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe')
 )
@@ -92,6 +101,16 @@ function Show-SyncMessage {
 }
 
 function Get-CodexAppExecutable {
+    $configured = [Environment]::GetEnvironmentVariable('CODEX_APP_EXE')
+    if (-not [string]::IsNullOrWhiteSpace($configured)) {
+        $configured = [Environment]::ExpandEnvironmentVariables($configured)
+        if ($configured -notmatch '^(?:[A-Za-z]:[\\/]|\\\\[^\\]+\\[^\\]+)' -or [IO.Path]::GetFileName($configured) -notin @('ChatGPT.exe', 'Codex.exe')) {
+            throw 'CODEX_APP_EXE must be an absolute path to ChatGPT.exe or Codex.exe.'
+        }
+        $configured = [System.IO.Path]::GetFullPath($configured)
+        if (Test-Path -LiteralPath $configured -PathType Leaf) { return $configured }
+        throw 'CODEX_APP_EXE must point to an existing Codex App executable.'
+    }
     $package = Get-AppxPackage -Name 'OpenAI.Codex' -ErrorAction SilentlyContinue |
         Sort-Object Version -Descending |
         Select-Object -First 1

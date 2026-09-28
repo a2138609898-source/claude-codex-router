@@ -9,6 +9,7 @@ import ctypes
 from ctypes import wintypes
 from datetime import datetime, timezone
 import json
+import ntpath
 import os
 from pathlib import Path
 import re
@@ -77,6 +78,15 @@ def lifecycle_lock(wait_timeout: float = 0.0) -> FileLock:
 
 def _role_for_path(executable: str) -> str | None:
     normalized = executable.replace("/", "\\").lower()
+    configured = str(os.environ.get("CODEX_APP_EXE") or "").strip()
+    if configured:
+        configured = ntpath.normcase(ntpath.normpath(os.path.expandvars(configured)))
+        candidate = ntpath.normcase(ntpath.normpath(executable))
+        if candidate == configured:
+            return "desktop"
+        resources = ntpath.dirname(configured) + "\\resources\\"
+        if candidate.startswith(resources) and ntpath.basename(candidate) == "codex.exe":
+            return "app_server"
     if re.search(r"\\windowsapps\\openai\.codex_[^\\]+\\app\\(?:chatgpt|codex)\.exe$", normalized):
         return "desktop"
     if re.search(r"\\appdata\\local\\openai\\codexclibundled\\(?:[^\\]+\\)*codex\.exe$", normalized):

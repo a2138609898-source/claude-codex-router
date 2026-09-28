@@ -1,0 +1,2 @@
+# Optional build-time dependency. Runtime scripts use only the Python standard library.
+pyinstaller>=6.10,<7

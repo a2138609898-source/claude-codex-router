@@ -165,6 +165,10 @@ def codex_sota_invocation(command: Path) -> tuple[list[str], Path]:
 
 
 CORE_ROOT = resolve_core_root()
+# Keep the registry and every helper script on the same installation root.  This is especially
+# important for PyInstaller builds, where the source module is bundled but PowerShell helpers are
+# unpacked as data files under the resolved application directory.
+os.environ.setdefault("CODEX_SOTA_CORE_ROOT", str(CORE_ROOT))
 if str(CORE_ROOT) not in sys.path:
     sys.path.insert(0, str(CORE_ROOT))
 

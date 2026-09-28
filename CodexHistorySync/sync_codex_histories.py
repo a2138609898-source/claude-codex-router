@@ -37,8 +37,17 @@ if os.name == "nt":
 
 APP_NAME = "CodexHistorySync"
 INSTALL_DIR = Path(__file__).resolve().parent
-DEFAULT_LEFT = Path.home() / ".codex-personal"
-DEFAULT_RIGHT = Path.home() / ".codex-plus"
+
+
+def configured_root(env_name: str, default_name: str) -> Path:
+    value = str(os.environ.get(env_name) or "").strip()
+    if value:
+        return Path(os.path.expandvars(value)).expanduser().resolve()
+    return Path.home() / default_name
+
+
+DEFAULT_LEFT = configured_root("CODEX_SOTA_COCKPIT_ROOT", ".codex-personal")
+DEFAULT_RIGHT = configured_root("CODEX_SOTA_PLUS_ROOT", ".codex-plus")
 DEFAULT_BACKUP_BASE = INSTALL_DIR / "backups"
 LOG_DIR = INSTALL_DIR / "logs"
 LOCK_PATH = INSTALL_DIR / "sync.lock"
@@ -3769,6 +3778,7 @@ def run_sync(
     model_guards = build_model_guard_contexts(roots, model_guard_roots)
 
     backup_base.mkdir(parents=True, exist_ok=True)
+    (INSTALL_DIR / "work").mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="codex-history-sync-", dir=INSTALL_DIR / "work") as raw_temp:
         temp_dir = Path(raw_temp)
         backup_dir = create_backup(roots, backup_base, temp_dir)

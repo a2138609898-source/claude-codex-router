@@ -11,6 +11,14 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+function Resolve-ConfiguredRoot {
+    param([string]$EnvironmentName, [string]$DefaultName)
+    $configured = [Environment]::GetEnvironmentVariable($EnvironmentName)
+    if (-not [string]::IsNullOrWhiteSpace($configured)) {
+        return [System.IO.Path]::GetFullPath([Environment]::ExpandEnvironmentVariables($configured))
+    }
+    return [System.IO.Path]::GetFullPath((Join-Path $env:USERPROFILE $DefaultName))
+}
 $launchClock = [System.Diagnostics.Stopwatch]::StartNew()
 if (-not $LaunchRequestId) { $LaunchRequestId = [guid]::NewGuid().ToString('N') }
 if ($LaunchRequestId -notmatch '^[a-zA-Z0-9_-]{1,80}$') { throw 'Invalid launch request id.' }
@@ -43,9 +51,9 @@ catch {
     # of PYTHONIOENCODING below, which is the side that matters for captured output.
 }
 $env:PYTHONIOENCODING = 'utf-8'
-$sotaRoot = Join-Path $env:USERPROFILE '.codex-sota'
-$cockpitRoot = Join-Path $env:USERPROFILE '.codex-personal'
-$plusRoot = Join-Path $env:USERPROFILE '.codex-plus'
+$sotaRoot = Resolve-ConfiguredRoot 'CODEX_SOTA_CODEX_ROOT' '.codex-sota'
+$cockpitRoot = Resolve-ConfiguredRoot 'CODEX_SOTA_COCKPIT_ROOT' '.codex-personal'
+$plusRoot = Resolve-ConfiguredRoot 'CODEX_SOTA_PLUS_ROOT' '.codex-plus'
 $configPath = Join-Path $sotaRoot 'config.toml'
 $authPath = Join-Path $sotaRoot 'auth.json'
 $registryPath = Join-Path $sotaRoot 'providers.json'
@@ -147,6 +155,19 @@ function Invoke-WithComRetry {
 function Get-CodexAppExecutable {
     if ($script:resolvedAppExecutable -and (Test-Path -LiteralPath $script:resolvedAppExecutable)) {
         return $script:resolvedAppExecutable
+    }
+    $configured = [Environment]::GetEnvironmentVariable('CODEX_APP_EXE')
+    if (-not [string]::IsNullOrWhiteSpace($configured)) {
+        $configured = [Environment]::ExpandEnvironmentVariables($configured)
+        if ($configured -notmatch '^(?:[A-Za-z]:[\\/]|\\\\[^\\]+\\[^\\]+)' -or [IO.Path]::GetFileName($configured) -notin @('ChatGPT.exe', 'Codex.exe')) {
+            throw 'CODEX_APP_EXE must be an absolute path to ChatGPT.exe or Codex.exe.'
+        }
+        $configured = [System.IO.Path]::GetFullPath($configured)
+        if (Test-Path -LiteralPath $configured -PathType Leaf) {
+            $script:resolvedAppExecutable = $configured
+            return $configured
+        }
+        throw 'CODEX_APP_EXE must point to an existing Codex App executable.'
     }
     $package = Invoke-WithComRetry -Action {
         Get-AppxPackage -Name 'OpenAI.Codex' -ErrorAction Stop |
@@ -416,6 +437,7 @@ function Repair-ModelCatalog {
 function Get-PythonExecutable {
     if ($script:resolvedPythonExecutable) { return $script:resolvedPythonExecutable }
     $candidates = @(
+        [Environment]::GetEnvironmentVariable('CODEX_SOTA_PYTHON'),
         [Environment]::GetEnvironmentVariable('CODEX_PYTHON'),
         (Join-Path $env:USERPROFILE '.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe'),
         (Join-Path $env:LOCALAPPDATA 'Programs\Python\Python313\python.exe'),

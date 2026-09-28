@@ -1,12 +1,12 @@
 # claude-codex-router（codex-sota）
 
-一个 Windows 本地推理路由器：在 `127.0.0.1` 上开一个环回网关，前面接 Claude Desktop 和
-Codex CLI/App，后面接若干家 OpenAI / Anthropic 兼容的中转供应商，再配一个 Tkinter 管理器负责
-增删供应商、存密钥、切档、看用量。
+一个可移植的 Windows 本地推理路由器：在 `127.0.0.1` 上开一个环回网关，前面接 Claude Desktop
+和 Codex CLI/App，后面接若干家 OpenAI / Anthropic 兼容的中转供应商，再配一个 Tkinter 管理器负责
+增删供应商、存密钥、切档、看用量。仓库不包含任何个人账号、密钥、聊天记录或运行状态。
 
-这是个人自用工具，不是产品。它只在 Windows 上跑，用到 DPAPI、`msvcrt` 文件锁和 Win32 进程 API，
-没打算跨平台。放上来是因为里面有几个坑（Claude Desktop 的能力表怎么被模型名影响、staged 构建
-怎么换、`/healthz` 为什么看不见代码改动）值得留个记录。
+项目当前支持 Windows 10/11、PowerShell 5.1 或 PowerShell 7、CPython 3.11+。它使用 Windows DPAPI、
+`msvcrt` 文件锁和 Win32 进程 API，因此不是跨平台项目；但源码目录可以放在任意路径，部署路径、Python
+解释器、Codex App 和各个 profile 根目录都可以通过环境变量覆盖。
 
 ## 它解决什么问题
 
@@ -111,34 +111,56 @@ mtime/size），每次请求前比一下，变了就重建路由表。改完 `pr
 
 ## 安装与运行
 
-需要 Windows 和 **CPython 3.11**（`.venv-build` 就是 3.11.0，`codex-sota.spec` 按它打包）。
-注意 PATH 上的 `python` 在 Windows 上很可能是 Microsoft Store 的占位符，什么都不会跑；用真实
-解释器的完整路径。
+1. 安装 CPython 3.11 或更新版本、PowerShell 和 Codex App。源码运行不需要第三方运行时依赖；构建
+   管理器才需要 PyInstaller。
+2. 将仓库解压或克隆到任意不含个人数据的目录。不要把仓库放进 `.codex-*` profile 根目录。
+3. 在仓库根目录执行 `powershell -NoProfile -ExecutionPolicy Bypass -File .\setup.ps1 -SkipBuildTools`。
+   它检查 Python 并生成被 Git 忽略的 `.runtime\codex-sota.env.ps1`，不会改用户 profile。
+4. 按 `env.example.ps1` 的说明调整需要覆盖的绝对路径，然后在当前 PowerShell 会话中执行
+   `. .\.runtime\codex-sota.env.ps1`。环境文件不随仓库迁移到别人的电脑。
+5. 首次启动管理器，选择对应的 Codex/Claude 工作区，添加自己的供应商和密钥，参考
+   [配置说明](docs/CONFIG.md)。`providers.example.json` 是 Claude/Messages 示例，不可原样用作 Codex 配置。
 
-**运行时没有第三方依赖。** 全树唯一的非标准库 import 是 `cryptography`，只在
-`sota_registry.py` 里那两个 TLS 证书函数内部延迟导入，并且 `ImportError` 有兜底。不用可选的 TLS
-监听端口就不需要装任何东西。
-
-从源码起管理器：
+源码启动管理器：
 
 ```
-<python311>\python.exe CodexSotaManager\CodexSotaManager.py
+& $env:CODEX_SOTA_PYTHON -B .\CodexSotaManager\CodexSotaManager.py
 ```
 
-单独起路由器（一般由管理器或启动脚本调用）：
+单独启动路由器：
 
 ```
 powershell -NoProfile -ExecutionPolicy Bypass -File CodexHistorySync\Start-CodexSotaRouter.ps1
 ```
 
+如果系统有多个 Python，请设置 `CODEX_SOTA_PYTHON` 或 `CODEX_PYTHON` 为解释器的完整路径。脚本会
+拒绝 Microsoft Store 的 `WindowsApps` 占位符，并在版本低于 3.11 时给出明确错误。
+
+### 可移植部署变量
+
+| 变量 | 用途 | 默认值 |
+| --- | --- | --- |
+| `CODEX_SOTA_CORE_ROOT` | 启动脚本和共享 Python 模块目录 | 当前 `CodexHistorySync` 目录 |
+| `CODEX_SOTA_CODEX_ROOT` | Codex workspace 根目录 | `%USERPROFILE%\.codex-sota` |
+| `CODEX_SOTA_CLAUDE_ROOT` | Claude workspace 根目录 | `%USERPROFILE%\.claude-sota` |
+| `CODEX_SOTA_COCKPIT_ROOT` | Cockpit profile 根目录 | `%USERPROFILE%\.codex-personal` |
+| `CODEX_SOTA_PLUS_ROOT` | Plus profile 根目录 | `%USERPROFILE%\.codex-plus` |
+| `CODEX_APP_EXE` | `ChatGPT.exe` / `Codex.exe` 的完整绝对路径 | 自动探测 AppX |
+| `CODEX_COCKPIT_TOOLS_EXE` | Cockpit Tools 可执行文件 | `%LOCALAPPDATA%\Cockpit Tools\cockpit-tools.exe` |
+| `CODEX_COCKPIT_API_PORT` | Cockpit Tools 本地 API 端口 | `56319` |
+
+端口也可以通过启动脚本的 `-RouterPortOverride` 覆盖；默认 Codex/Claude 端口分别是 `17895` 和
+`17994`。所有覆盖都是当前进程级设置，不会写入系统环境变量。
+
 ## 配置
 
-`providers.example.json` 是模板，字段逐个解释在 [docs/CONFIG.md](docs/CONFIG.md)。
+`providers.example.json` 是 Claude/Messages 模板，字段逐个解释在 [docs/CONFIG.md](docs/CONFIG.md)。
 
-**真实配置不在仓库里。** 它住在 `%USERPROFILE%\.claude-sota\providers.json`（Claude workspace，
-Codex workspace 有自己的根目录），API key 根本不写在这个文件里——它们是旁边的 `*.dpapi` 文件，
+**真实配置不在仓库里。** 它住在 workspace 根目录的 `providers.json`（默认是
+`%USERPROFILE%\.claude-sota\providers.json` 或 `%USERPROFILE%\.codex-sota\providers.json`），API key
+根本不写在这个文件里——它们是旁边的 `*.dpapi` 文件，
 用 Windows DPAPI 按用户+机器加密，换个账号或换台机器都解不开。仓库的 `.gitignore` 里也拦了
-`providers.json` 和 `*.dpapi`，算第二道防线。
+`providers.json`、`auth.json`、配置 TOML、数据库、session JSONL 和 `*.dpapi`，算第二道防线。
 
 ## 测试
 
@@ -154,12 +176,16 @@ cd CodexSotaManager
 **独立自检脚本（CodexHistorySync/`check_*.py`）**，每个直接 `python <脚本>` 跑，自己打中文分节标题、
 末尾输出 `合计 N/M 项通过`，全过退 0 否则退 1。适合手工排查单个子系统。
 
-**`Run-ThreeRoundValidation.ps1`** 是三轮合一的准入闸：第一轮 `py_compile` 全树 `.py` 并用
+**`Run-ThreeRoundValidation.ps1`** 是三轮合一的准入闸：第一轮只读解析全树 `.py`（不生成字节码缓存）并用
 `[scriptblock]::Create` 解析全树 `.ps1`；第二轮跑完整 `unittest`；第三轮带
 `CODEX_SOTA_ARTIFACT_ROOT` 再跑一遍打包产物相关的子集。加 `-SkipArtifact` 可以跳过对已打包
 产物的依赖。细节见 [docs/DEVELOPING.md](docs/DEVELOPING.md)。
 
 ## 打包
+
+需要构建时执行 `.\setup.ps1` 安装 `.runtime\.venv-build` 中的构建依赖，再执行
+`powershell -NoProfile -ExecutionPolicy Bypass -File .\CodexSotaManager\Build-Staged.ps1`。
+自定义构建环境可通过 `-PythonExecutable` 或 `CODEX_SOTA_BUILD_PYTHON` 指定。源码运行无需打包。
 
 PyInstaller 走 `codex-sota.spec`（onedir、`console=False`、图标内嵌）。发布不是原地覆盖：
 `Build-Staged.ps1` 先打到 `dist-staging` 并跑完三轮验证，`Apply-StagedBuild.ps1` 再把旧的

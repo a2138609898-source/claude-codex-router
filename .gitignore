@@ -6,7 +6,15 @@
 providers.json
 providers.json.*
 *.providers.json
+auth.json
+*.dpapi
+config.toml
+sota-multi-vendor-model-catalog.json
+true-sota-model-catalog.json
 .claude-sota/
+.codex-sota/
+.codex-plus/
+.codex-personal/
 claude-slot-claim.json
 claude-library.lock
 secrets/
@@ -26,6 +34,19 @@ work/
 backups/
 logs/
 *.log
+*.jsonl
+session_index.jsonl
+.codex-global-state.json
+*.sqlite
+*.sqlite3
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite3-wal
+*.sqlite3-shm
+*.db
+*.db-wal
+*.db-shm
+codex-sota.env.ps1
 
 # ---------------------------------------------------------------------------
 # 构建产物
@@ -33,10 +54,13 @@ logs/
 dist/
 dist-staging/
 dist-staging.previous-*/
+dist-candidate-*/
+build-candidate-*/
 codex-sota.old-*/
 build/
 .venv/
 .venv-build/
+.runtime/
 __pycache__/
 *.py[cod]
 *$py.class

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 import json
 from pathlib import Path
 import re
@@ -37,7 +38,25 @@ from test_codex_sota_regressions import (  # noqa: E402
 )
 
 
+@contextmanager
+def isolated_history_sync_runtime():
+    with tempfile.TemporaryDirectory(prefix="codex-history-test-") as temporary:
+        install_dir = Path(temporary)
+        (install_dir / "work").mkdir()
+        with mock.patch.multiple(
+            three_way.core,
+            INSTALL_DIR=install_dir,
+            LOG_DIR=install_dir / "logs",
+            LOCK_PATH=install_dir / "sync.lock",
+            LAST_RESULT_PATH=install_dir / "last-result.json",
+        ):
+            yield install_dir
+
+
 class SyncAndBuildRegressionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.enterContext(isolated_history_sync_runtime())
+
     @staticmethod
     def _make_history_root(
         root: Path,
@@ -590,7 +609,28 @@ class SyncAndBuildRegressionTests(unittest.TestCase):
                 if launcher_path.name == "Switch-CodexSota.ps1":
                     self.assertIn("CloseMainWindow", stop_source)
                     self.assertNotIn("Stop-ProcessTreeById", stop_source)
-                    self.assertNotIn("Stop-Process -", stop_source)
+                    force_hidden = re.search(
+                        r"if \(\$ForceHidden\) \{(?P<body>.*?)\n    \}",
+                        stop_source,
+                        re.DOTALL,
+                    )
+                    self.assertIsNotNone(force_hidden)
+                    hidden_body = force_hidden.group("body")
+                    self.assertRegex(
+                        hidden_body,
+                        r"foreach \(\$process in \$remaining \| Where-Object "
+                        r"\{ \$_\.MainWindowHandle -eq 0 \}\) \{\s*"
+                        r"try \{ Stop-Process -Id \$process\.Id -Force -ErrorAction Stop \}",
+                    )
+                    self.assertEqual(stop_source.count("Stop-Process "), 1)
+                    self.assertIn(
+                        "$remaining = @(Get-OwnedCodexAppProcesses)",
+                        stop_source[:force_hidden.start()],
+                    )
+                    self.assertIn(
+                        "It was not force-terminated",
+                        stop_source[force_hidden.end():],
+                    )
 
     def test_staged_build_swap_preserves_old_and_installs_new(self) -> None:
         powershell = shutil.which("powershell.exe") or shutil.which("powershell")
@@ -835,6 +875,28 @@ class SyncAndBuildRegressionTests(unittest.TestCase):
             self.assertNotIn(r"D:\CodexCLI", text, str(path))
         spec = (MANAGER_ROOT / "codex-sota.spec").read_text(encoding="utf-8")
         self.assertIn("SPECPATH", spec)
+
+    def test_registry_roots_accept_deployment_environment_overrides(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with mock.patch.dict(
+                registry.os.environ,
+                {
+                    "CODEX_SOTA_CORE_ROOT": str(root / "core"),
+                    "CODEX_SOTA_CODEX_ROOT": str(root / "codex"),
+                    "CODEX_SOTA_CLAUDE_ROOT": str(root / "claude"),
+                },
+                clear=False,
+            ):
+                self.assertEqual(registry._resolve_install_root(), (root / "core").resolve())
+                self.assertEqual(
+                    registry._resolve_workspace_root("CODEX_SOTA_CODEX_ROOT", ".codex-sota"),
+                    (root / "codex").resolve(),
+                )
+                self.assertEqual(
+                    registry._resolve_workspace_root("CODEX_SOTA_CLAUDE_ROOT", ".claude-sota"),
+                    (root / "claude").resolve(),
+                )
 
     def test_python_runtime_probe_avoids_windows_powershell_quote_loss(self) -> None:
         script = (MANAGER_ROOT / "Run-ThreeRoundValidation.ps1").read_text(encoding="utf-8-sig")

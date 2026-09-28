@@ -1,10 +1,15 @@
 param(
-    [switch]$SkipPreflight
+    [switch]$SkipPreflight,
+    [string]$PythonExecutable = $env:CODEX_SOTA_BUILD_PYTHON
 )
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
-$pyinstaller = Join-Path $root '.venv-build\Scripts\pyinstaller.exe'
+$buildCandidates = if ($PythonExecutable) { @($PythonExecutable) } else {
+    @((Join-Path (Split-Path -Parent $root) '.runtime\.venv-build\Scripts\python.exe'),
+      (Join-Path $root '.venv-build\Scripts\python.exe'))
+}
+$buildPython = $buildCandidates | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
 $validation = Join-Path $root 'Run-ThreeRoundValidation.ps1'
 $candidateRoot = Join-Path $root ('dist-candidate-' + [guid]::NewGuid().ToString('N'))
 $workRoot = Join-Path $root ('build-candidate-' + [guid]::NewGuid().ToString('N'))
@@ -12,8 +17,8 @@ $candidateApp = Join-Path $candidateRoot 'codex-sota'
 $stagedRoot = Join-Path $root 'dist-staging'
 $stagedApp = Join-Path $stagedRoot 'codex-sota'
 
-if (-not (Test-Path -LiteralPath $pyinstaller)) {
-    throw "PyInstaller was not found: $pyinstaller"
+if (-not $buildPython) {
+    throw 'Build Python was not found. Run setup.ps1 or pass -PythonExecutable pointing to a Python with requirements-build.txt installed.'
 }
 if (-not $SkipPreflight) {
     & $validation -SkipArtifact
@@ -23,7 +28,7 @@ if (-not $SkipPreflight) {
 }
 
 try {
-    & $pyinstaller --noconfirm --clean --distpath $candidateRoot --workpath $workRoot (Join-Path $root 'codex-sota.spec')
+    & $buildPython -B -m PyInstaller --noconfirm --clean --distpath $candidateRoot --workpath $workRoot (Join-Path $root 'codex-sota.spec')
     if ($LASTEXITCODE -ne 0) {
         throw "PyInstaller failed with exit code $LASTEXITCODE."
     }

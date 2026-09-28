@@ -26,7 +26,27 @@ import urllib.request
 from uuid import uuid4
 
 
-INSTALL_ROOT = Path.home() / "Documents" / "Codex" / "CodexHistorySync"
+def _resolve_configured_path(value: str) -> Path:
+    """Expand an environment/user path without depending on this checkout's location."""
+    return Path(os.path.expandvars(value)).expanduser().resolve()
+
+
+def _resolve_install_root() -> Path:
+    """Locate helper scripts beside this module, with an explicit deployment override."""
+    configured = str(os.environ.get("CODEX_SOTA_CORE_ROOT") or "").strip()
+    if configured:
+        return _resolve_configured_path(configured)
+    return Path(__file__).resolve().parent
+
+
+def _resolve_workspace_root(env_name: str, default_name: str) -> Path:
+    configured = str(os.environ.get(env_name) or "").strip()
+    if configured:
+        return _resolve_configured_path(configured)
+    return Path.home() / default_name
+
+
+INSTALL_ROOT = _resolve_install_root()
 
 
 @dataclass(frozen=True)
@@ -94,7 +114,7 @@ class Workspace:
 CODEX = Workspace(
     name="codex",
     label="Codex App",
-    root=Path.home() / ".codex-sota",
+    root=_resolve_workspace_root("CODEX_SOTA_CODEX_ROOT", ".codex-sota"),
     router_port=17895,
     router_starter=INSTALL_ROOT / "Start-CodexSotaRouter.ps1",
     protocol="responses",
@@ -102,7 +122,7 @@ CODEX = Workspace(
 CLAUDE = Workspace(
     name="claude",
     label="Claude Desktop",
-    root=Path.home() / ".claude-sota",
+    root=_resolve_workspace_root("CODEX_SOTA_CLAUDE_ROOT", ".claude-sota"),
     router_port=17994,
     router_starter=INSTALL_ROOT / "Start-ClaudeSotaRouter.ps1",
     protocol="messages",

@@ -9,6 +9,14 @@
 )
 
 $ErrorActionPreference = 'Stop'
+function Resolve-ConfiguredRoot {
+    param([string]$EnvironmentName, [string]$DefaultName)
+    $configured = [Environment]::GetEnvironmentVariable($EnvironmentName)
+    if (-not [string]::IsNullOrWhiteSpace($configured)) {
+        return [System.IO.Path]::GetFullPath([Environment]::ExpandEnvironmentVariables($configured))
+    }
+    return [System.IO.Path]::GetFullPath((Join-Path $env:USERPROFILE $DefaultName))
+}
 $installDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $runnerPath = Join-Path $installDir 'Run-CodexHistorySync.ps1'
 $syncCorePath = Join-Path $installDir 'sync_codex_histories.py'
@@ -16,12 +24,24 @@ $lastResultPath = Join-Path $installDir 'last-result.json'
 $postExitWatcherPath = Join-Path $installDir 'sync_after_codex_exit.py'
 $configValidatorPath = Join-Path $installDir 'validate_codex_profile.py'
 $activeProfilePath = Join-Path $installDir 'active-profile.json'
-$canonicalCockpitRoot = Join-Path $env:USERPROFILE '.codex-personal'
-$canonicalPlusRoot = Join-Path $env:USERPROFILE '.codex-plus'
-$canonicalSotaRoot = Join-Path $env:USERPROFILE '.codex-sota'
-$legacyPlusRoot = Join-Path $env:USERPROFILE '.codex-plus-legacy'
-$cockpitToolsExecutable = Join-Path $env:LOCALAPPDATA 'Cockpit Tools\cockpit-tools.exe'
+$canonicalCockpitRoot = Resolve-ConfiguredRoot 'CODEX_SOTA_COCKPIT_ROOT' '.codex-personal'
+$canonicalPlusRoot = Resolve-ConfiguredRoot 'CODEX_SOTA_PLUS_ROOT' '.codex-plus'
+$canonicalSotaRoot = Resolve-ConfiguredRoot 'CODEX_SOTA_CODEX_ROOT' '.codex-sota'
+$legacyPlusRoot = Resolve-ConfiguredRoot 'CODEX_SOTA_LEGACY_PLUS_ROOT' '.codex-plus-legacy'
+$cockpitToolsExecutable = [Environment]::GetEnvironmentVariable('CODEX_COCKPIT_TOOLS_EXE')
+if ([string]::IsNullOrWhiteSpace($cockpitToolsExecutable)) {
+    $cockpitToolsExecutable = Join-Path $env:LOCALAPPDATA 'Cockpit Tools\cockpit-tools.exe'
+}
+$cockpitToolsExecutable = [IO.Path]::GetFullPath([Environment]::ExpandEnvironmentVariables($cockpitToolsExecutable))
 $cockpitServicePort = 56319
+$configuredCockpitPort = [Environment]::GetEnvironmentVariable('CODEX_COCKPIT_API_PORT')
+if (-not [string]::IsNullOrWhiteSpace($configuredCockpitPort)) {
+    $parsedCockpitPort = 0
+    if (-not [int]::TryParse($configuredCockpitPort, [ref]$parsedCockpitPort) -or $parsedCockpitPort -lt 1 -or $parsedCockpitPort -gt 65535) {
+        throw 'CODEX_COCKPIT_API_PORT must be an integer from 1 to 65535.'
+    }
+    $cockpitServicePort = $parsedCockpitPort
+}
 $profileRoots = @{
     Plus = $canonicalPlusRoot
     Cockpit = $canonicalCockpitRoot
@@ -66,6 +86,16 @@ function Show-ProfileMessage {
 }
 
 function Get-CodexAppExecutable {
+    $configured = [Environment]::GetEnvironmentVariable('CODEX_APP_EXE')
+    if (-not [string]::IsNullOrWhiteSpace($configured)) {
+        $configured = [Environment]::ExpandEnvironmentVariables($configured)
+        if ($configured -notmatch '^(?:[A-Za-z]:[\\/]|\\\\[^\\]+\\[^\\]+)' -or [IO.Path]::GetFileName($configured) -notin @('ChatGPT.exe', 'Codex.exe')) {
+            throw 'CODEX_APP_EXE must be an absolute path to ChatGPT.exe or Codex.exe.'
+        }
+        $configured = [System.IO.Path]::GetFullPath($configured)
+        if (Test-Path -LiteralPath $configured -PathType Leaf) { return $configured }
+        throw 'CODEX_APP_EXE must point to an existing Codex App executable.'
+    }
     $package = Get-AppxPackage -Name 'OpenAI.Codex' -ErrorAction SilentlyContinue |
         Sort-Object Version -Descending |
         Select-Object -First 1
@@ -342,6 +372,7 @@ function Ensure-CockpitApiService {
 
 function Get-PythonExecutable {
     $candidates = @(
+        [Environment]::GetEnvironmentVariable('CODEX_SOTA_PYTHON'),
         [Environment]::GetEnvironmentVariable('CODEX_PYTHON'),
         (Join-Path $env:USERPROFILE '.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe'),
         (Join-Path $env:LOCALAPPDATA 'Programs\Python\Python313\python.exe'),

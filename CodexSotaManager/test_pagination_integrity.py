@@ -10,9 +10,13 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'CodexHistorySync'))
 import sync_codex_histories as core
+from test_sync_build_regressions import isolated_history_sync_runtime
 
 
 class PaginationIntegrityTests(unittest.TestCase):
+    def setUp(self):
+        self.enterContext(isolated_history_sync_runtime())
+
     owner = '00000000-0000-4000-8000-000000000001'
     page = '00000000-0000-4000-8000-000000000002'
     clone = '00000000-0000-4000-8000-000000000003'

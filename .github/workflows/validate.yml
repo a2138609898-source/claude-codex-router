@@ -1,0 +1,44 @@
+name: validate
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Parse Python sources
+        shell: pwsh
+        run: |
+          $files = Get-ChildItem CodexHistorySync,CodexSotaManager -Recurse -File -Filter '*.py'
+          python -B -c "import ast, pathlib, sys; [ast.parse(p.read_text(encoding='utf-8-sig'), filename=str(p)) for p in map(pathlib.Path, sys.argv[1:])]" ($files.FullName)
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Parse PowerShell sources
+        shell: pwsh
+        run: |
+          $errors = @()
+          $files = Get-ChildItem CodexHistorySync,CodexSotaManager -Recurse -File -Filter '*.ps1'
+          $files += Get-Item setup.ps1,env.example.ps1
+          foreach ($file in $files) {
+            $tokens = $null
+            $parseErrors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($file.FullName, [ref]$tokens, [ref]$parseErrors) | Out-Null
+            $errors += $parseErrors
+          }
+          if ($errors.Count) { $errors | Format-List; exit 1 }
+      - name: Run regression tests
+        shell: pwsh
+        run: |
+          python -B -m unittest discover -v -s CodexSotaManager -p 'test_*.py'
+          exit $LASTEXITCODE

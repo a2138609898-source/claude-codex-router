@@ -28,9 +28,18 @@ import sync_codex_histories as core
 
 
 INSTALL_DIR = Path(__file__).resolve().parent
-DEFAULT_COCKPIT_ROOT = Path.home() / ".codex-personal"
-DEFAULT_PLUS_ROOT = Path.home() / ".codex-plus"
-DEFAULT_SOTA_ROOT = Path.home() / ".codex-sota"
+
+
+def configured_root(env_name: str, default_name: str) -> Path:
+    value = str(os.environ.get(env_name) or "").strip()
+    if value:
+        return Path(os.path.expandvars(value)).expanduser().resolve()
+    return Path.home() / default_name
+
+
+DEFAULT_COCKPIT_ROOT = configured_root("CODEX_SOTA_COCKPIT_ROOT", ".codex-personal")
+DEFAULT_PLUS_ROOT = configured_root("CODEX_SOTA_PLUS_ROOT", ".codex-plus")
+DEFAULT_SOTA_ROOT = configured_root("CODEX_SOTA_CODEX_ROOT", ".codex-sota")
 DEFAULT_BACKUP_BASE = INSTALL_DIR / "backups" / "three-way"
 COCKPIT_PROVIDER = "codex_local_access"
 PLUS_PROVIDER = "openai"

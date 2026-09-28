@@ -17,15 +17,23 @@ $ErrorActionPreference = 'Stop'
 $OutputEncoding = [System.Text.Encoding]::UTF8
 # One script serves both config roots so the start/stop/health logic cannot drift between
 # them; Start-ClaudeSotaRouter.ps1 is a shim that passes -Workspace claude.
+function Resolve-ConfiguredRoot {
+    param([string]$EnvironmentName, [string]$DefaultName)
+    $configured = [Environment]::GetEnvironmentVariable($EnvironmentName)
+    if (-not [string]::IsNullOrWhiteSpace($configured)) {
+        return [System.IO.Path]::GetFullPath([Environment]::ExpandEnvironmentVariables($configured))
+    }
+    return [System.IO.Path]::GetFullPath((Join-Path $env:USERPROFILE $DefaultName))
+}
 $workspaceSettings = @{
-    codex  = @{ Root = '.codex-sota';  Port = 17895 }
-    claude = @{ Root = '.claude-sota'; Port = 17994 }
+    codex  = @{ Root = (Resolve-ConfiguredRoot 'CODEX_SOTA_CODEX_ROOT' '.codex-sota'); Port = 17895 }
+    claude = @{ Root = (Resolve-ConfiguredRoot 'CODEX_SOTA_CLAUDE_ROOT' '.claude-sota'); Port = 17994 }
 }
 $selected = $workspaceSettings[$Workspace]
 $sotaRoot = if ($SotaRootOverride) {
     [System.IO.Path]::GetFullPath($SotaRootOverride)
 } else {
-    Join-Path $env:USERPROFILE $selected.Root
+    $selected.Root
 }
 $routerPort = if ($RouterPortOverride -gt 0) { $RouterPortOverride } else { [int]$selected.Port }
 $installRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -42,6 +50,7 @@ $healthUri = 'http://127.0.0.1:' + $routerPort + '/healthz'
 
 function Get-PythonExecutable {
     $candidates = @(
+        $env:CODEX_SOTA_PYTHON,
         $PythonExecutableOverride,
         $env:CODEX_PYTHON,
         (Join-Path $env:USERPROFILE '.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe'),

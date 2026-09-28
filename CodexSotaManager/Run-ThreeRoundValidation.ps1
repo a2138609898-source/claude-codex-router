@@ -7,7 +7,9 @@ $ErrorActionPreference = 'Stop'
 $managerRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $coreRoot = Join-Path (Split-Path -Parent $managerRoot) 'CodexHistorySync'
 $pythonCandidates = @(
+    [Environment]::GetEnvironmentVariable('CODEX_SOTA_PYTHON'),
     [Environment]::GetEnvironmentVariable('CODEX_PYTHON'),
+    (Join-Path (Split-Path -Parent $managerRoot) '.runtime\.venv-build\Scripts\python.exe'),
     (Join-Path $managerRoot '.venv-build\Scripts\python.exe'),
     (Join-Path $env:USERPROFILE '.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe')
 )
@@ -65,7 +67,7 @@ $pythonSources = @(
 $pythonSources += @(Get-ChildItem -LiteralPath $coreRoot -File -Filter '*.py' | Select-Object -ExpandProperty FullName)
 $pythonSources += @(Get-ChildItem -LiteralPath $managerRoot -File -Filter 'test_*.py' | Select-Object -ExpandProperty FullName)
 $pythonSources = @($pythonSources | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -Unique)
-Invoke-CheckedPython -Arguments (@('-m', 'py_compile') + $pythonSources)
+Invoke-CheckedPython -Arguments (@('-B', '-c', 'import ast,pathlib,sys; [ast.parse(pathlib.Path(p).read_bytes(), filename=p) for p in sys.argv[1:]]') + $pythonSources)
 foreach ($script in @(Get-ChildItem -LiteralPath $coreRoot, $managerRoot -File -Filter '*.ps1')) {
     $null = [scriptblock]::Create((Get-Content -Raw -LiteralPath $script.FullName))
 }

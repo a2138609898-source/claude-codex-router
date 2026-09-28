@@ -5,7 +5,12 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$sotaRoot = Join-Path $env:USERPROFILE '.codex-sota'
+$configuredRoot = [Environment]::GetEnvironmentVariable('CODEX_SOTA_CODEX_ROOT')
+$sotaRoot = if ([string]::IsNullOrWhiteSpace($configuredRoot)) {
+    Join-Path $env:USERPROFILE '.codex-sota'
+} else {
+    [IO.Path]::GetFullPath([Environment]::ExpandEnvironmentVariables($configuredRoot))
+}
 $authPath = Join-Path $sotaRoot 'auth.json'
 $apiEnvironmentNames = @(
     'OPENAI_API_KEY',

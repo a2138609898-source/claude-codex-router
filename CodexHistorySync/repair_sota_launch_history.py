@@ -26,8 +26,20 @@ import uuid
 
 
 INSTALL_DIR = Path(__file__).resolve().parent
-DEFAULT_ROOTS = tuple(Path.home() / name for name in (
-    ".codex-personal", ".codex-plus", ".codex-sota"))
+
+
+def configured_root(env_name: str, default_name: str) -> Path:
+    value = str(os.environ.get(env_name) or "").strip()
+    if value:
+        return Path(os.path.expandvars(value)).expanduser().resolve()
+    return Path.home() / default_name
+
+
+DEFAULT_ROOTS = (
+    configured_root("CODEX_SOTA_COCKPIT_ROOT", ".codex-personal"),
+    configured_root("CODEX_SOTA_PLUS_ROOT", ".codex-plus"),
+    configured_root("CODEX_SOTA_CODEX_ROOT", ".codex-sota"),
+)
 STORAGE = ("sessions", "archived_sessions")
 CONFLICT_SUFFIX = "\uff08\u540c\u6b65\u51b2\u7a81\u526f\u672c\uff09"
 UUID_PATTERN = (r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"

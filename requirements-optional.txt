@@ -1,0 +1,2 @@
+# Optional dependency for the TLS certificate helper APIs.
+cryptography>=42,<47

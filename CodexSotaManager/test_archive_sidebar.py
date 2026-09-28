@@ -18,9 +18,13 @@ def database(path):
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "CodexHistorySync"))
 import sync_codex_histories as sync
 import sync_codex_histories_three_way as three_way
+from test_sync_build_regressions import isolated_history_sync_runtime
 
 
 class ArchiveSidebarTests(unittest.TestCase):
+    def setUp(self):
+        self.enterContext(isolated_history_sync_runtime())
+
     def test_remove_archived_nested_project_and_atom_projections(self):
         state = {
             "thread-project-assignments": {"archived": {"projectId": "project"}, "active": {}},

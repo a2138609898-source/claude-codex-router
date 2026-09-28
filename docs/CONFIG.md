@@ -15,10 +15,13 @@
 | `<root>\<secret_file>` | DPAPI 加密后的 API key，一家一个文件 |
 | `<root>\sota-multi-vendor-model-catalog.json` | 生成给 Codex App 读的模型目录（Claude workspace 不生成） |
 
-Claude workspace 的 root 是 `%USERPROFILE%\.claude-sota`。**API key 不在 `providers.json` 里**，
-配置里只有文件名（`secret_file`）和熵（`entropy`）；真正的密文是旁边那个 `*.dpapi`，用 Windows
-DPAPI 按「当前用户 + 当前机器」加密，拷到别处解不开。所以就算这份 JSON 泄了也拿不到 key——但它仍然
-含有各家的 base_url 和供应商 id，所以照样不该进版本库。
+Claude workspace 的默认 root 是 `%USERPROFILE%\.claude-sota`，Codex workspace 的默认 root 是
+`%USERPROFILE%\.codex-sota`。部署到其他电脑或自定义目录时，使用 `CODEX_SOTA_CLAUDE_ROOT` 和
+`CODEX_SOTA_CODEX_ROOT` 覆盖默认值；同步脚本还支持 `CODEX_SOTA_COCKPIT_ROOT` 和
+`CODEX_SOTA_PLUS_ROOT`。**API key 不在 `providers.json` 里**，配置里只有文件名（`secret_file`）和熵
+（`entropy`）；真正的密文是旁边那个 `*.dpapi`，用 Windows DPAPI 按「当前用户 + 当前机器」加密，
+拷到别处解不开。所以就算这份 JSON 泄了也拿不到 key——但它仍然含有各家的 base_url 和供应商 id，
+所以照样不该进版本库。
 
 ## 顶层字段
 
@@ -143,7 +146,6 @@ curl.exe http://127.0.0.1:<port>/healthz
 
 ## 模板
 
-`providers.example.json` 在仓库根目录，可以直接拷成 `%USERPROFILE%\.claude-sota\providers.json`
-再改。它有意做成两家：Claude 的旧版 Messages-only 默认家保留空前缀，另一家使用
+`providers.example.json` 在仓库根目录，可以拷到任意 workspace 根目录的 `providers.json` 再改。它有意做成两家：Claude 的旧版 Messages-only 默认家保留空前缀，另一家使用
 `alt-relay.anthropic.` 命名空间；其它 workspace 应始终使用非空前缀。
 拷过去之后还要用管理器存一次 API key，`*.dpapi` 文件不能手写。

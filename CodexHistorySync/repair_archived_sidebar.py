@@ -122,6 +122,17 @@ def repair_local_thread_catalog(
     return removed
 
 
+def configured_profiles():
+    return tuple(
+        (name, core.configured_root(variable, name))
+        for name, variable in (
+            (".codex-personal", "CODEX_SOTA_COCKPIT_ROOT"),
+            (".codex-plus", "CODEX_SOTA_PLUS_ROOT"),
+            (".codex-sota", "CODEX_SOTA_CODEX_ROOT"),
+        )
+    )
+
+
 def main():
     if app_running():
         raise RuntimeError("Codex App must be fully closed before archived sidebar repair")
@@ -129,8 +140,9 @@ def main():
     backup = Path(__file__).resolve().parent / "backups" / (
         "archive-cache-repair-" + datetime.now().strftime("%Y%m%d-%H%M%S-%f")
     )
-    for name in (".codex-personal", ".codex-plus", ".codex-sota"):
-        root = Path.home() / name
+    for name, root in configured_profiles():
+        if not (root / "state_5.sqlite").is_file():
+            continue
         with sqlite3.connect((root / "state_5.sqlite").as_uri() + "?mode=ro", uri=True) as db:
             archived = {str(row[0]) for row in db.execute("SELECT id FROM threads WHERE archived = 1")}
         if name == ".codex-sota":
@@ -154,6 +166,8 @@ def main():
             print(f"{name}/state_5.sqlite: detached {detached} archived thread(s) from sidebar sections")
         for filename in (".codex-global-state.json", "session_index.jsonl"):
             path = root / filename
+            if not path.is_file():
+                continue
             original = path.read_bytes()
             if filename.endswith(".jsonl"):
                 lines = original.decode("utf-8").splitlines(keepends=True)
