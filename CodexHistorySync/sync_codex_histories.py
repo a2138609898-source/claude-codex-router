@@ -261,7 +261,7 @@ def load_model_guard_context(root: Path) -> ModelGuardContext:
     registry is therefore treated as read-only routing data: a model can only be
     qualified when exactly one enabled Codex/Responses provider exposes that model.
     The provider id stored in a rollout is only an app/router identity (for example
-    ``true_sota``), not proof of which upstream account served the turn.
+    ``tango_relay``), not proof of which upstream account served the turn.
     """
     root = root.resolve()
     registry_path = root / MODEL_REGISTRY_NAME
@@ -328,7 +328,7 @@ def load_model_guard_context(root: Path) -> ModelGuardContext:
         if not provider.enabled:
             continue
         prefix = provider.prefix
-        # Old registries (including the original true_sota entry) legitimately have an
+        # Old registries (including the original tango_relay entry) legitimately have an
         # empty prefix on disk.  The shared registry validator derives the same namespace
         # in memory; mirror that rule here so a uniquely identifiable legacy model can be
         # repaired without ever guessing the default provider.

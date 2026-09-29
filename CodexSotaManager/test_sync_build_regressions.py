@@ -945,23 +945,23 @@ class StalePinnedModelRepairTests(unittest.TestCase):
 
     def _fixture(self, root: Path, catalog_path: Path, model: str) -> None:
         (root / "config.toml").write_text(
-            'model_provider = "true_sota"\n'
+            'model_provider = "tango_relay"\n'
             f'model = "{model}"\n'
-            'review_model = "agentrouter--gpt-5.6-terra"\n'
+            'review_model = "provider_a--gpt-5.6-terra"\n'
             'cli_auth_credentials_store = "file"\n'
             'forced_login_method = "api"\n'
             f'model_catalog_json = "{catalog_path.as_posix()}"\n'
-            '\n[model_providers.true_sota]\n'
+            '\n[model_providers.tango_relay]\n'
             'base_url = "http://127.0.0.1:17895"\n'
             'wire_api = "responses"\n'
             'requires_openai_auth = true\n',
             encoding="utf-8",
         )
         slugs = [
-            "true-sota--gpt-5.6-sol",
-            "true-sota--gpt-6-astra",
-            "agentrouter--gpt-5.6-sol",
-            "agentrouter--gpt-5.6-terra",
+            "tango-relay--gpt-5.6-sol",
+            "tango-relay--gpt-6-astra",
+            "provider_a--gpt-5.6-sol",
+            "provider_a--gpt-5.6-terra",
         ]
         catalog_path.write_text(
             json.dumps({"models": [{"slug": slug} for slug in slugs]}),
@@ -972,7 +972,7 @@ class StalePinnedModelRepairTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             catalog_path = root / "sota-multi-vendor-model-catalog.json"
-            self._fixture(root, catalog_path, "mfsense--gpt-6-astra")
+            self._fixture(root, catalog_path, "golf--gpt-6-astra")
 
             valid, reason = profile_validator.validate_profile("Sota", root, catalog_path)
             self.assertFalse(valid)
@@ -980,7 +980,7 @@ class StalePinnedModelRepairTests(unittest.TestCase):
 
             report = profile_validator.repair_pinned_models(root, catalog_path)
             self.assertEqual(
-                report["repaired"]["model"]["to"], "true-sota--gpt-5.6-sol"
+                report["repaired"]["model"]["to"], "tango-relay--gpt-5.6-sol"
             )
             valid, reason = profile_validator.validate_profile("Sota", root, catalog_path)
             self.assertTrue(valid, reason)
@@ -989,20 +989,20 @@ class StalePinnedModelRepairTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             catalog_path = root / "sota-multi-vendor-model-catalog.json"
-            self._fixture(root, catalog_path, "true-sota--old-name")
+            self._fixture(root, catalog_path, "tango-relay--old-name")
 
             profile_validator.repair_pinned_models(root, catalog_path)
 
             config = (root / "config.toml").read_text(encoding="utf-8")
-            self.assertIn('model = "true-sota--gpt-5.6-sol"', config)
+            self.assertIn('model = "tango-relay--gpt-5.6-sol"', config)
             # The untouched review_model stays exactly as it was.
-            self.assertIn('review_model = "agentrouter--gpt-5.6-terra"', config)
+            self.assertIn('review_model = "provider_a--gpt-5.6-terra"', config)
 
     def test_a_healthy_config_is_left_alone(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             catalog_path = root / "sota-multi-vendor-model-catalog.json"
-            self._fixture(root, catalog_path, "true-sota--gpt-6-astra")
+            self._fixture(root, catalog_path, "tango-relay--gpt-6-astra")
             before = (root / "config.toml").read_text(encoding="utf-8")
 
             report = profile_validator.repair_pinned_models(root, catalog_path)

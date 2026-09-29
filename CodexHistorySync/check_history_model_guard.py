@@ -278,7 +278,7 @@ class HistoryModelGuardTests(unittest.TestCase):
             source = base / "source"
             target = base / "sota"
             make_root(source, "source_vendor", "gpt-5.6-sol")
-            make_root(target, "true_sota", None, include_thread=False)
+            make_root(target, "tango_relay", None, include_thread=False)
             write_registry(
                 target,
                 [
@@ -298,7 +298,7 @@ class HistoryModelGuardTests(unittest.TestCase):
                 target,
                 base / "backups",
                 "source_vendor",
-                "true_sota",
+                "tango_relay",
             )
             self.assertEqual(result["status"], "ok")
             self.assertEqual(result["unresolved_model_fields"], 0)
@@ -327,7 +327,7 @@ class HistoryModelGuardTests(unittest.TestCase):
             source = base / "source"
             target = base / "sota"
             make_root(source, "source_vendor", "gpt-5.6-sol")
-            make_root(target, "true_sota", None, include_thread=False)
+            make_root(target, "tango_relay", None, include_thread=False)
             write_registry(
                 target,
                 [
@@ -355,7 +355,7 @@ class HistoryModelGuardTests(unittest.TestCase):
                 target,
                 base / "backups",
                 "source_vendor",
-                "true_sota",
+                "tango_relay",
             )
 
             copied = list((target / "sessions").glob("*.jsonl"))

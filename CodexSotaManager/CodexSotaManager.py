@@ -1052,9 +1052,9 @@ class ModelMappingDialog(tk.Toplevel):
     the upstream still receives the real model id.  It exists for opposite reasons on the
     two sides: Claude Desktop only offers thinking controls and picker entries for
     claude-* ids it recognises, so a GPT model publishes under a Claude-shaped alias
-    (``justdowork.anthropic.claude-opus-5``); the Codex App reads capability metadata from
+    (``juno.anthropic.claude-opus-5``); the Codex App reads capability metadata from
     the generated catalog whose templates are keyed on known GPT slugs, so a non-GPT
-    model publishes under a catalog-shaped alias (``seekai--gpt-5.6-sol``) to get correct
+    model publishes under a catalog-shaped alias (``sierra--gpt-5.6-sol``) to get correct
     reasoning levels.  Either way the alias stays inside the provider's own namespace.
     Empty input clears the mapping.
     """
@@ -2354,7 +2354,7 @@ class CodexSotaApp(tk.Tk):
         )
         # The bridge switch owns exactly the two Chat-Completions bridge values; which one
         # applies follows the workspace (Codex App speaks Responses, Claude Desktop speaks
-        # Messages).  justdowork's Messages translation is left untouched unless the box is
+        # Messages).  juno's Messages translation is left untouched unless the box is
         # ticked or unticked here.
         existing_adapter = str((existing or {}).get("request_adapter") or "").strip()
         bridge_values = {"responses_to_chat_completions", "messages_to_chat_completions"}
@@ -3119,7 +3119,7 @@ class CodexSotaApp(tk.Tk):
         if auth_problem:
             messagebox.showerror(
                 "启动失败",
-                "True SOTA API key 不可用。这样启动的话，启动器会停在一个你看不见的"
+                "Tango Relay API key 不可用。这样启动的话，启动器会停在一个你看不见的"
                 "输入提示上，永远不返回。\n\n"
                 f"{auth_problem}\n\n"
                 "请在 PowerShell 里运行 codex-sota，按提示粘贴 key，然后再回来启动。",

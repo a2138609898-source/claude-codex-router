@@ -27,7 +27,7 @@ def build_library(root: Path) -> dict[str, bytes]:
     library.mkdir(parents=True)
     payloads = {}
     for entry_id, name, url in (
-        (FOREIGN_A, "APIKEY.FUN", "https://fast.example.pro"),
+        (FOREIGN_A, "Foreign Vendor", "https://fast.example.pro"),
         (FOREIGN_B, "CC Switch", "http://127.0.0.1:15721/claude-desktop"),
     ):
         body = {
@@ -47,7 +47,7 @@ def build_library(root: Path) -> dict[str, bytes]:
             {
                 "appliedId": FOREIGN_B,
                 "entries": [
-                    {"id": FOREIGN_A, "name": "APIKEY.FUN"},
+                    {"id": FOREIGN_A, "name": "Foreign Vendor"},
                     {"id": FOREIGN_B, "name": "CC Switch"},
                 ],
             },
@@ -69,8 +69,8 @@ def point_module_at(root: Path) -> None:
 
 
 MODELS = [
-    {"name": "jw--claude-opus-5", "labelOverride": "JustWoker · claude-opus-5"},
-    {"name": "jw--claude-sonnet-5", "labelOverride": "JustWoker · claude-sonnet-5"},
+    {"name": "jade--claude-opus-5", "labelOverride": "Jade · claude-opus-5"},
+    {"name": "jade--claude-sonnet-5", "labelOverride": "Jade · claude-sonnet-5"},
 ]
 
 if __name__ == "__main__":
@@ -145,7 +145,7 @@ if __name__ == "__main__":
         check(f"{entry_id[:8]}… 未被修改", before == after)
 
     print("\n=== 4) 重复写入应更新同一个档，不新增 ===")
-    cd.write_profile(MODELS + [{"name": "jw--extra", "labelOverride": "x"}], "http://127.0.0.1:17895")
+    cd.write_profile(MODELS + [{"name": "jade--extra", "labelOverride": "x"}], "http://127.0.0.1:17895")
     st = cd.library_status()
     again = json.loads((root / "configLibrary" / f"{cd.SOTA_ENTRY_ID}.json").read_text(encoding="utf-8"))
     check("还是 3 个档，模型数已更新",

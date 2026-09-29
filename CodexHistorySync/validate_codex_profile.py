@@ -189,7 +189,7 @@ def validate_profile(profile: str, root: Path, catalog: Path | None) -> tuple[bo
         return True, "ok"
 
     if profile == "Sota":
-        if data.get("model_provider") != "true_sota":
+        if data.get("model_provider") != "tango_relay":
             return False, "model_provider_mismatch"
         if catalog is None or not _same_path(data.get("model_catalog_json"), catalog, root):
             return False, "model_catalog_mismatch"
@@ -209,7 +209,7 @@ def validate_profile(profile: str, root: Path, catalog: Path | None) -> tuple[bo
                 return False, f"{field}_unqualified"
             if slug not in slugs:
                 return False, f"{field}_not_in_catalog"
-        provider = _provider(data, "true_sota")
+        provider = _provider(data, "tango_relay")
         if provider.get("base_url") != "http://127.0.0.1:17895":
             return False, "base_url_mismatch"
         if provider.get("wire_api") != "responses":

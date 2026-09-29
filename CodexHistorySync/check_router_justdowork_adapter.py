@@ -1,8 +1,8 @@
-"""Offline end-to-end checks for the justdowork Responses -> Messages adapter.
+"""Offline end-to-end checks for the juno Responses -> Messages adapter.
 
 The fake upstream speaks Anthropic Messages on a loopback port.  A shadow SOTA router uses a
 throwaway registry and auth file, so this check never touches the live listener, credentials, or
-the real justdowork endpoint.
+the real juno endpoint.
 """
 
 from __future__ import annotations
@@ -27,7 +27,7 @@ from fixture_ports import reserve_port, serve_on_free_port  # noqa: E402
 from sota_registry import registry_digest, load_registry  # noqa: E402
 
 
-MODEL = "justdowork--gpt-5.6-sol"
+MODEL = "juno--gpt-5.6-sol"
 UPSTREAM_MODEL = "gpt-5.6-sol"
 TOOL = {
     "type": "namespace",
@@ -160,8 +160,8 @@ def write_registry(path: Path, upstream_port: int) -> None:
         "version": 1,
         "providers": [
             {
-                "id": "justdowork",
-                "name": "justdowork fixture",
+                "id": "juno",
+                "name": "juno fixture",
                 "workspace": "codex",
                 "enabled": True,
                 "protected": False,
@@ -169,7 +169,7 @@ def write_registry(path: Path, upstream_port: int) -> None:
                 "allow_failover": False,
                 "auth_type": "codex_auth",
                 "base_url": f"http://127.0.0.1:{upstream_port}",
-                "prefix": "justdowork--",
+                "prefix": "juno--",
                 "models_path": "/v1/models",
                 "responses_path": "/responses",
                 "messages_path": "/v1/messages",

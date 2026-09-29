@@ -89,7 +89,7 @@ INFERENCE_PATHS: dict[str, tuple[str, str]] = {
     "/v1/messages/count_tokens": ("messages", "/count_tokens"),
 }
 COUNT_TOKENS_PATHS = frozenset({"/messages/count_tokens", "/v1/messages/count_tokens"})
-# Responses compact is a distinct state-changing/metadata operation.  The justdowork adapter
+# Responses compact is a distinct state-changing/metadata operation.  The juno adapter
 # only translates ordinary Responses generations to Anthropic Messages; mapping compact onto
 # /v1/messages would silently turn a non-generation request into a billable generation.
 COMPACT_PATHS = frozenset({"/responses/compact", "/v1/responses/compact"})
@@ -191,12 +191,12 @@ USAGE_TAIL_BYTES = 64 * 1024
 # this it grows for the life of the install and every panel that tails it gets slower.
 LOG_MAX_BYTES = 8 * 1024 * 1024
 # This is deliberately a provider marker instead of a global protocol switch.  Codex still
-# talks Responses to the local router and keeps the normal `justdowork--...` model slugs; only
+# talks Responses to the local router and keeps the normal `juno--...` model slugs; only
 # that provider's outbound request is translated to the Anthropic Messages API.
-JUSTDOWORK_ADAPTER = "responses_to_anthropic_messages"
+JUNO_ADAPTER = "responses_to_anthropic_messages"
 CHAT_COMPLETIONS_ADAPTER = "responses_to_chat_completions"
 MESSAGES_TO_CHAT_COMPLETIONS_ADAPTER = "messages_to_chat_completions"
-JUSTDOWORK_CODEX_USER_AGENT = (
+JUNO_CODEX_USER_AGENT = (
     "codex_cli_rs/0.144.1 (Windows 11.0.26200; x86_64) WindowsTerminal"
 )
 
@@ -214,10 +214,10 @@ REASONING_EFFORT_BUDGETS = {
 }
 
 
-def is_justdowork_adapter(provider: dict[str, Any]) -> bool:
+def is_juno_adapter(provider: dict[str, Any]) -> bool:
     return (
-        str(provider.get("id") or "").lower() == "justdowork"
-        and provider.get("request_adapter") == JUSTDOWORK_ADAPTER
+        str(provider.get("id") or "").lower() == "juno"
+        and provider.get("request_adapter") == JUNO_ADAPTER
     )
 
 
@@ -443,7 +443,7 @@ def _response_tools(payload: dict[str, Any]) -> list[Any]:
     ``additional_tools``.  They are not placed in the top-level Responses ``tools``
     field, so an adapter that only reads ``payload["tools"]`` silently gives an
     Anthropic provider no tools at all.  Keep this normalization local to the
-    justdowork conversion path; other providers continue to receive the original
+    juno conversion path; other providers continue to receive the original
     payload unchanged.
     """
     result = list(payload.get("tools") or []) if isinstance(payload.get("tools"), list) else []
@@ -3982,7 +3982,7 @@ class SotaRouterHandler(BaseHTTPRequestHandler):
         if clean_path in COMPACT_PATHS:
             primary_provider = routing.providers.get(candidates[0][0]) if candidates else None
             if primary_provider is not None and (
-                is_justdowork_adapter(primary_provider)
+                is_juno_adapter(primary_provider)
                 or is_chat_completions_adapter(primary_provider)
             ):
                 # There is no semantics-preserving Responses -> Messages mapping for compact.
@@ -3992,7 +3992,7 @@ class SotaRouterHandler(BaseHTTPRequestHandler):
                     {
                         "error": {
                             "message": (
-                                "Responses compact is not supported by the justdowork "
+                                "Responses compact is not supported by the juno "
                                 "Messages adapter"
                             ),
                             "type": "unsupported_adapter_operation",
@@ -4054,7 +4054,7 @@ class SotaRouterHandler(BaseHTTPRequestHandler):
                 )
                 continue
             body = outgoing_body
-            adapter = is_justdowork_adapter(provider)
+            adapter = is_juno_adapter(provider)
             if counting_tokens and (
                 adapter
                 or is_chat_completions_adapter(provider)
@@ -4086,7 +4086,7 @@ class SotaRouterHandler(BaseHTTPRequestHandler):
                         400,
                         {
                             "error": {
-                                "message": f"Could not translate Responses request for justdowork: {error}",
+                                "message": f"Could not translate Responses request for juno: {error}",
                                 "type": "request_translation_error",
                             }
                         },
@@ -4214,7 +4214,7 @@ class SotaRouterHandler(BaseHTTPRequestHandler):
             except (BrokenPipeError, ConnectionResetError):
                 pass
 
-    def _relay_justdowork(
+    def _relay_juno(
         self,
         upstream: Any,
         vendor: str,
@@ -4226,7 +4226,7 @@ class SotaRouterHandler(BaseHTTPRequestHandler):
         tool_kinds: dict[str, str] | None = None,
         is_final_attempt: bool = True,
     ) -> bool:
-        """Convert one justdowork Messages response back to the Responses wire shape.
+        """Convert one juno Messages response back to the Responses wire shape.
 
         Returns True when the stream died before a single frame was written -- the caller
         may then retry the same vendor invisibly.  Response headers are held back until
@@ -4769,8 +4769,8 @@ class SotaRouterHandler(BaseHTTPRequestHandler):
                 tool_kinds,
                 is_final_attempt=is_final_attempt,
             )
-        if provider is not None and is_justdowork_adapter(provider) and 200 <= status < 300:
-            return self._relay_justdowork(
+        if provider is not None and is_juno_adapter(provider) and 200 <= status < 300:
+            return self._relay_juno(
                 upstream,
                 vendor,
                 status,
@@ -5099,7 +5099,7 @@ class SotaRouterHandler(BaseHTTPRequestHandler):
             }
             headers.update(auth_headers(provider, key, include_probe_defaults=False))
             headers["Accept-Encoding"] = "identity"
-            adapter = is_justdowork_adapter(provider)
+            adapter = is_juno_adapter(provider)
             # Cloudflare in front of these gateways bans unknown client signatures (error
             # 1010 browser_signature_banned), and it is not one vendor: the request log has
             # shown it from a dozen different gateways. A forwarded Python-urllib or curl
@@ -5107,7 +5107,7 @@ class SotaRouterHandler(BaseHTTPRequestHandler):
             # CLI signature the vendors document -- the real apps behind this router send
             # it themselves, and nothing downstream needs the caller's original UA.
             headers.setdefault("Accept", "application/json")
-            headers["User-Agent"] = JUSTDOWORK_CODEX_USER_AGENT
+            headers["User-Agent"] = JUNO_CODEX_USER_AGENT
             headers["originator"] = "codex_cli_rs"
             # Forwarding is a denylist, so a client that sent anthropic-version keeps its own
             # value whatever the casing; only a caller that omitted one gets the default, and

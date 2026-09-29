@@ -24,10 +24,10 @@ class ConfigurationReviewTests(unittest.TestCase):
             catalog.parent.mkdir()
             catalog.write_text(json.dumps({"models": [{"slug": "vendor--model"}]}))
             config = (
-                'model_provider = "true_sota"\nmodel = "vendor--model"\n'
+                'model_provider = "tango_relay"\nmodel = "vendor--model"\n'
                 'cli_auth_credentials_store = "file"\nforced_login_method = "api"\n'
                 'model_catalog_json = "catalogs/models.json"\n'
-                '[model_providers.true_sota]\n'
+                '[model_providers.tango_relay]\n'
                 'base_url = "http://127.0.0.1:17895"\n'
                 'wire_api = "responses"\nrequires_openai_auth = true\n'
             )

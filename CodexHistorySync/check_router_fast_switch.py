@@ -32,7 +32,7 @@ def registry_triples() -> list[tuple[str, str, str]]:
     """One (provider id, model id, slug) per prefixed provider in the live registry.
 
     The slug is the model's published slug -- normally prefix + model id, and not
-    id + "--" + model id, because a prefix is not always the id (xlinks_gateway is not).
+    id + "--" + model id, because a prefix is not always the id (xray_gateway is not).
     A model carrying `publish_as` answers under that instead, which is also what the router
     puts in forced_fast, so asking for prefix + id would force a slug nothing dispatches on.
     Such a model also shadows the sibling whose plain slug it borrowed: enabling that sibling

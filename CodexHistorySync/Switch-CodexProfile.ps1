@@ -54,12 +54,12 @@ $apiEnvironmentNames = @(
     'OPENAI_ORG_ID',
     'OPENAI_PROJECT_ID',
     'CODEX_ACCESS_TOKEN',
-    'CODEX_AGENTROUTER_API_KEY',
-    'CODEX_LINGZHAN_API_KEY',
-    'CODEX_AISHENJI_API_KEY',
-    'CODEX_CICADAS_API_KEY',
-    'CODEX_MAIXUN_API_KEY',
-    'CODEX_MIAOMIAOCODE_API_KEY'
+    'CODEX_PROVIDER_A_API_KEY',
+    'CODEX_PROVIDER_B_API_KEY',
+    'CODEX_PROVIDER_C_API_KEY',
+    'CODEX_PROVIDER_D_API_KEY',
+    'CODEX_PROVIDER_E_API_KEY',
+    'CODEX_PROVIDER_F_API_KEY'
 )
 
 function Show-ProfileMessage {
@@ -908,7 +908,7 @@ else {
     ''
 }
 $serviceLine = ''
-$watcherLine = "`n关闭 $profileLabel App 后会自动再执行一次 Cockpit、GPT Plus 与 True SOTA 三方同步。"
+$watcherLine = "`n关闭 $profileLabel App 后会自动再执行一次 Cockpit、GPT Plus 与 Tango Relay 三方同步。"
 $messageIcon = 'Information'
 
 Show-ProfileMessage -Title "Codex 已切换到 $profileLabel" -Icon $messageIcon -Message @"

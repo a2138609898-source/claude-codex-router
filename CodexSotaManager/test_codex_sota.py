@@ -486,8 +486,8 @@ class CatalogCapabilityTests(unittest.TestCase):
                 "version": 1,
                 "providers": [
                     {
-                        "id": "true_sota",
-                        "name": "True SOTA",
+                        "id": "tango_relay",
+                        "name": "Tango Relay",
                         "workspace": "codex",
                         "protocols": ["responses"],
                         "enabled": True,
@@ -500,7 +500,7 @@ class CatalogCapabilityTests(unittest.TestCase):
 
             self.assertEqual(
                 registry.selectable_slugs(raw_registry),
-                ["true-sota--gpt-5.6-sol"],
+                ["tango-relay--gpt-5.6-sol"],
             )
             registry.build_model_catalog(
                 registry=raw_registry,
@@ -510,7 +510,7 @@ class CatalogCapabilityTests(unittest.TestCase):
             catalog = json.loads(destination.read_text(encoding="utf-8"))
             self.assertEqual(
                 [model["slug"] for model in catalog["models"]],
-                ["true-sota--gpt-5.6-sol"],
+                ["tango-relay--gpt-5.6-sol"],
             )
 
     def test_namespaced_claude_publish_as_is_preserved_and_hashed(self) -> None:
@@ -527,8 +527,8 @@ class CatalogCapabilityTests(unittest.TestCase):
                 "version": 1,
                 "providers": [
                     {
-                        "id": "justdowork",
-                        "name": "JustDoWork",
+                        "id": "juno",
+                        "name": "Juno",
                         "base_url": "https://example.invalid",
                         "workspace": "claude",
                         "protocols": ["messages"],
@@ -539,14 +539,14 @@ class CatalogCapabilityTests(unittest.TestCase):
                             {
                                 "id": "claude-opus-5-thinking",
                                 "enabled": True,
-                                "publish_as": "justdowork.anthropic.claude-opus-5",
+                                "publish_as": "juno.anthropic.claude-opus-5",
                             }
                         ],
                     }
                 ],
             }
             canonical_registry = json.loads(json.dumps(raw_registry))
-            canonical_registry["providers"][0]["prefix"] = "justdowork.anthropic."
+            canonical_registry["providers"][0]["prefix"] = "juno.anthropic."
             expected_hash = registry.registry_digest(canonical_registry)
             result = registry.build_model_catalog(
                 registry=raw_registry,
@@ -558,7 +558,7 @@ class CatalogCapabilityTests(unittest.TestCase):
             self.assertEqual(catalog["registry_hash"], expected_hash)
             self.assertEqual(
                 [model["slug"] for model in catalog["models"]],
-                ["justdowork.anthropic.claude-opus-5"],
+                ["juno.anthropic.claude-opus-5"],
             )
 
     def test_raw_nondefault_claude_bare_alias_is_not_advertised(self) -> None:
@@ -575,14 +575,14 @@ class CatalogCapabilityTests(unittest.TestCase):
                 "version": 1,
                 "providers": [
                     {
-                        "id": "justdowork",
-                        "name": "JustDoWork",
+                        "id": "juno",
+                        "name": "Juno",
                         "base_url": "https://example.invalid",
                         "workspace": "claude",
                         "protocols": ["messages"],
                         "enabled": True,
                         "is_default": False,
-                        "prefix": "justdowork.anthropic.",
+                        "prefix": "juno.anthropic.",
                         "models": [
                             {
                                 "id": "claude-opus-5-thinking",
@@ -606,7 +606,7 @@ class CatalogCapabilityTests(unittest.TestCase):
             self.assertEqual(catalog["registry_hash"], expected_hash)
             self.assertEqual(
                 [model["slug"] for model in catalog["models"]],
-                ["justdowork.anthropic.claude-opus-5-thinking"],
+                ["juno.anthropic.claude-opus-5-thinking"],
             )
 
     def test_luna_does_not_inherit_sol_ultra_reasoning(self) -> None:

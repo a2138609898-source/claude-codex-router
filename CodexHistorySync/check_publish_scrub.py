@@ -40,8 +40,8 @@ VENDOR_SUBSTRINGS = [
     _j("miao", "miao"),
     _j("just", "woker"),
 ]
-# 真实中转域名，同样片段拼接。true-sota.com 是上游域名，和本机路由器 provider
-# 名 "true_sota"（127.0.0.1）无关，所以只拦带 .com 的域名形式。
+# 真实中转域名，同样片段拼接。tango-relay.com 是上游域名，和本机路由器 provider
+# 名 "tango_relay"（127.0.0.1）无关，所以只拦带 .com 的域名形式。
 VENDOR_DOMAINS = [
     _j(VENDOR_SUBSTRINGS[0], ".org"),
     _j(VENDOR_SUBSTRINGS[1], "ai", ".top"),

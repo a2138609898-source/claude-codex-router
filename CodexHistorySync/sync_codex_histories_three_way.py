@@ -43,7 +43,7 @@ DEFAULT_SOTA_ROOT = configured_root("CODEX_SOTA_CODEX_ROOT", ".codex-sota")
 DEFAULT_BACKUP_BASE = INSTALL_DIR / "backups" / "three-way"
 COCKPIT_PROVIDER = "codex_local_access"
 PLUS_PROVIDER = "openai"
-SOTA_PROVIDER = "true_sota"
+SOTA_PROVIDER = "tango_relay"
 MAX_THREE_WAY_BACKUPS = 10
 # How many runs keep their outer-snapshot undo image.  Raise it to be able to undo an older
 # sync; each extra run costs a full second copy of every session tree it touched.
@@ -913,7 +913,7 @@ def reusable_result_matches_request(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Synchronize Cockpit, Plus, and True SOTA Codex histories."
+        description="Synchronize Cockpit, Plus, and Tango Relay Codex histories."
     )
     parser.add_argument("--cockpit-root", type=Path, default=DEFAULT_COCKPIT_ROOT)
     parser.add_argument("--plus-root", type=Path, default=DEFAULT_PLUS_ROOT)

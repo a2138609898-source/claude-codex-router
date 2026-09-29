@@ -37,12 +37,12 @@ $apiEnvironmentNames = @(
     'OPENAI_ORG_ID',
     'OPENAI_PROJECT_ID',
     'CODEX_ACCESS_TOKEN',
-    'CODEX_AGENTROUTER_API_KEY',
-    'CODEX_LINGZHAN_API_KEY',
-    'CODEX_AISHENJI_API_KEY',
-    'CODEX_CICADAS_API_KEY',
-    'CODEX_MAIXUN_API_KEY',
-    'CODEX_MIAOMIAOCODE_API_KEY'
+    'CODEX_PROVIDER_A_API_KEY',
+    'CODEX_PROVIDER_B_API_KEY',
+    'CODEX_PROVIDER_C_API_KEY',
+    'CODEX_PROVIDER_D_API_KEY',
+    'CODEX_PROVIDER_E_API_KEY',
+    'CODEX_PROVIDER_F_API_KEY'
 )
 $messagesPath = Join-Path $installDir 'messages.zh-CN.json'
 $messages = $null
@@ -405,9 +405,9 @@ $($messages.success_intro)
 
 $($messages.cockpit): $cockpitMain $($messages.main_threads) + $cockpitAuxiliary $($messages.auxiliary_sessions) ($($messages.total_records) $cockpitCount)
 $($messages.plus): $plusMain $($messages.main_threads) + $plusAuxiliary $($messages.auxiliary_sessions) ($($messages.total_records) $plusCount)
-True SOTA: $sotaMain $($messages.main_threads) + $sotaAuxiliary $($messages.auxiliary_sessions) ($($messages.total_records) $sotaCount)
-$($messages.searchable_index): $($messages.cockpit) $cockpitSidebarVisible/$cockpitMain; $($messages.plus) $plusSidebarVisible/$plusMain; True SOTA $sotaSidebarVisible/$sotaMain
-$($messages.projects): $($messages.cockpit) $cockpitProjects ($cockpitProjectChats $($messages.project_chats)); $($messages.plus) $plusProjects ($plusProjectChats $($messages.project_chats)); True SOTA $sotaProjects ($sotaProjectChats $($messages.project_chats))
+Tango Relay: $sotaMain $($messages.main_threads) + $sotaAuxiliary $($messages.auxiliary_sessions) ($($messages.total_records) $sotaCount)
+$($messages.searchable_index): $($messages.cockpit) $cockpitSidebarVisible/$cockpitMain; $($messages.plus) $plusSidebarVisible/$plusMain; Tango Relay $sotaSidebarVisible/$sotaMain
+$($messages.projects): $($messages.cockpit) $cockpitProjects ($cockpitProjectChats $($messages.project_chats)); $($messages.plus) $plusProjects ($plusProjectChats $($messages.project_chats)); Tango Relay $sotaProjects ($sotaProjectChats $($messages.project_chats))
 $($messages.new_copies): $($result.new_files)
 $($messages.incremental_updates): $($result.updated_files)
 $($messages.conflict_copies): $($result.conflicts_preserved)
@@ -425,9 +425,9 @@ Codex history sync completed.
 
 Cockpit: $cockpitMain main chats + $cockpitAuxiliary auxiliary sessions ($cockpitCount local records)
 Plus: $plusMain main chats + $plusAuxiliary auxiliary sessions ($plusCount local records)
-True SOTA: $sotaMain main chats + $sotaAuxiliary auxiliary sessions ($sotaCount local records)
-Searchable main chats: Cockpit $cockpitSidebarVisible/$cockpitMain; Plus $plusSidebarVisible/$plusMain; True SOTA $sotaSidebarVisible/$sotaMain
-Projects: Cockpit $cockpitProjects ($cockpitProjectChats project chats); Plus $plusProjects ($plusProjectChats project chats); True SOTA $sotaProjects ($sotaProjectChats project chats)
+Tango Relay: $sotaMain main chats + $sotaAuxiliary auxiliary sessions ($sotaCount local records)
+Searchable main chats: Cockpit $cockpitSidebarVisible/$cockpitMain; Plus $plusSidebarVisible/$plusMain; Tango Relay $sotaSidebarVisible/$sotaMain
+Projects: Cockpit $cockpitProjects ($cockpitProjectChats project chats); Plus $plusProjects ($plusProjectChats project chats); Tango Relay $sotaProjects ($sotaProjectChats project chats)
 New copies: $($result.new_files)
 Incremental updates: $($result.updated_files)
 Conflict copies: $($result.conflicts_preserved)
