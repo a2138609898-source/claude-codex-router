@@ -9,14 +9,17 @@ $ErrorActionPreference = 'Stop'
 # goes out as GBK bytes and crashes the capturing reader.
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 $OutputEncoding = [System.Text.Encoding]::UTF8
-$root = Split-Path -Parent $MyInvocation.MyCommand.Path
-$live = Join-Path $root 'dist\codex-sota'
-$staged = Join-Path $root 'dist-staging\codex-sota'
+$root = [IO.Path]::GetFullPath((Split-Path -Parent $MyInvocation.MyCommand.Path))
+. (Join-Path $root 'Artifact-Integrity.ps1')
+$live = Assert-ScopedArtifactPath (Join-Path $root 'dist\codex-sota') $root
+$staged = Assert-ScopedArtifactPath (Join-Path $root 'dist-staging\codex-sota') $root
+$verificationReport = Assert-ScopedArtifactPath (Join-Path $root 'dist-staging\codex-sota-verification.json') $root
 $log = Join-Path $root 'apply-staged-build.log'
 
 function Note([string]$text) {
     $line = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') + '  ' + $text
     try {
+        $null = Assert-ScopedArtifactPath $log $root
         Add-Content -LiteralPath $log -Value $line -Encoding UTF8 -ErrorAction Stop
     }
     catch {
@@ -32,6 +35,7 @@ function Remove-EmptyDirectory([string]$path) {
         }
         $children = @(Get-ChildItem -LiteralPath $path -Force -ErrorAction Stop)
         if ($children.Count -eq 0) {
+            $null = Assert-ScopedArtifactPath $path $root
             Remove-Item -LiteralPath $path -Force -ErrorAction Stop
         }
     }
@@ -54,10 +58,15 @@ function Invoke-Swap {
     $liveRetired = $false
     $incomingPrepared = $false
     try {
+        $null = Assert-ScopedArtifactPath $incoming $root
+        $null = Assert-ScopedArtifactPath $retired $root
+        $expectedFiles = Read-ArtifactVerification $verificationReport $staged (Split-Path -Parent $root)
+        $validatedFiles = Assert-ArtifactBundle $staged $expectedFiles
         New-Item -ItemType Directory -Path $distRoot -Force | Out-Null
         # Prepare the incoming tree first so a bad staged directory cannot disturb live.
         Move-Item -LiteralPath $staged -Destination $incoming -ErrorAction Stop
         $incomingPrepared = $true
+        $null = Assert-ArtifactBundle $incoming $validatedFiles
         if (Test-Path -LiteralPath $live) {
             Move-Item -LiteralPath $live -Destination $retired -ErrorAction Stop
             $liveRetired = $true
@@ -106,6 +115,7 @@ function Invoke-Swap {
             Sort-Object Name -Descending |
             Select-Object -Skip 2)
         foreach ($stale in $staleRollbacks) {
+            $null = Assert-ScopedArtifactPath $stale.FullName $distRoot
             Remove-Item -LiteralPath $stale.FullName -Recurse -Force -ErrorAction Stop
         }
     }

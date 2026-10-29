@@ -53,6 +53,7 @@ function Get-PythonExecutable {
         $env:CODEX_SOTA_PYTHON,
         $PythonExecutableOverride,
         $env:CODEX_PYTHON,
+        (Join-Path (Split-Path -Parent (Split-Path -Parent $PSScriptRoot)) 'codex-sota-runtime.exe'),
         (Join-Path $env:USERPROFILE '.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe'),
         (Join-Path $env:LOCALAPPDATA 'Programs\Python\Python313\python.exe'),
         (Join-Path $env:LOCALAPPDATA 'Programs\Python\Python312\python.exe'),
@@ -94,7 +95,7 @@ function Test-WorkspaceRouterProcess {
     if (-not $imageName) {
         $imageName = [string]$Process.Name
     }
-    if ($imageName -notmatch '^pythonw?(\.exe)?$') {
+    if ($imageName -notmatch '^(?:pythonw?|codex-sota-runtime)(\.exe)?$') {
         return $false
     }
     $commandLine = [string]$Process.CommandLine
@@ -244,7 +245,7 @@ if (-not $AuditOnly) {
     }
 }
 
-if ($Stop) {
+if ($Stop -and -not $AuditOnly) {
     $stopResult = Stop-WorkspaceRouters
     [ordered]@{
         status = if ($stopResult.Conflicts.Count -gt 0) { 'blocked' } else { 'stopped' }
@@ -259,7 +260,9 @@ $python = Get-PythonExecutable
 if (-not $python) {
     throw 'Python runtime was not found for the local SOTA router.'
 }
-foreach ($path in @($routerScript, $registryPath, $authPath)) {
+# DPAPI-only workspaces do not need a Codex login file. The router's check
+# validates whichever credential source each enabled provider actually uses.
+foreach ($path in @($routerScript, $registryPath)) {
     if (-not (Test-Path -LiteralPath $path)) {
         throw "SOTA router dependency is missing: $path"
     }

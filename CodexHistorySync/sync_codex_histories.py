@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import contextvars
 import dataclasses
 import datetime as dt
 import hashlib
@@ -26,6 +27,7 @@ import sqlite3
 import sys
 import tempfile
 import time
+import tomllib
 import traceback
 import uuid
 from typing import Any, Callable, Iterable
@@ -44,6 +46,24 @@ def configured_root(env_name: str, default_name: str) -> Path:
     if value:
         return Path(os.path.expandvars(value)).expanduser().resolve()
     return Path.home() / default_name
+
+
+def configured_model_provider(root: Path, fallback: str) -> str:
+    """Use the destination's own provider identity without copying its settings."""
+    path = root / "config.toml"
+    try:
+        with path.open("rb") as handle:
+            config = tomllib.load(handle)
+    except FileNotFoundError:
+        return fallback
+    except (OSError, ValueError) as error:
+        raise SyncError(f"Cannot read the destination's provider identity: {path}") from error
+    provider = config.get("model_provider")
+    if provider is None or provider == "":
+        return fallback
+    if not isinstance(provider, str) or not provider.strip():
+        raise SyncError(f"Invalid destination model_provider: {path}")
+    return provider.strip()
 
 
 DEFAULT_LEFT = configured_root("CODEX_SOTA_COCKPIT_ROOT", ".codex-personal")
@@ -177,6 +197,8 @@ class RootSnapshot:
     spawn_edges: list[dict[str, Any]]
     global_state: dict[str, Any]
     session_index: dict[str, dict[str, Any]]
+    reference_tables: dict[str, list[dict[str, Any]]] = dataclasses.field(default_factory=dict)
+    reference_columns: dict[str, list[str]] = dataclasses.field(default_factory=dict)
 
 
 @dataclasses.dataclass
@@ -212,6 +234,7 @@ class ModelGuardContext:
         default_factory=dict
     )
     registry_error: str | None = None
+    registered_slug_models: dict[str, str] = dataclasses.field(default_factory=dict)
     normalized_fields: int = 0
     unresolved_fields: int = 0
     unresolved_reasons: dict[str, int] = dataclasses.field(default_factory=dict)
@@ -252,6 +275,115 @@ class SyncError(RuntimeError):
 
 class SyncBusy(SyncError):
     """A concurrent sync owns the lock; this is not a history failure."""
+
+
+# History scans can touch tens of thousands of JSONL records.  Keep the lifecycle
+# callback cheap and centralized so callers can request a safe yield without
+# threading a callback through every pure parser.  The callback itself owns the
+# process/lease inspection; this layer only rate-limits repeated checks and can
+# suspend them while a transaction is being rolled back.
+_HISTORY_CHECK_INTERVAL = 0.25
+
+
+@dataclasses.dataclass
+class HistoryWork:
+    checkpoint: Callable[[], None] | None = None
+    before_write: Callable[[], None] | None = None
+    rollback_available: bool = False
+    managed_roots: tuple[Path, ...] = ()
+    mutation_started: bool = False
+    mutated_paths: set[Path] = dataclasses.field(default_factory=set)
+    suspended: int = 0
+    last_check: float = 0.0
+    model_indexes: dict[str, Any] = dataclasses.field(default_factory=dict)
+    indexed_slots: int = 0
+    indexed_bytes: int = 0
+
+
+_HISTORY_WORK: contextvars.ContextVar[HistoryWork | None] = contextvars.ContextVar(
+    "codex_history_work", default=None
+)
+
+
+@contextlib.contextmanager
+def history_checkpoint_scope(callback: Callable[[], None] | None,
+                             before_write: Callable[[], None] | None = None,
+                             *, rollback_available: bool = False,
+                             managed_roots: Iterable[Path] = ()):
+    """Install a run-scoped safe-yield callback for filesystem work."""
+    work = HistoryWork(callback, before_write or callback, rollback_available,
+                       tuple(Path(root).resolve() for root in managed_roots))
+    token = _HISTORY_WORK.set(work)
+    try:
+        yield work
+    finally:
+        _HISTORY_WORK.reset(token)
+
+
+@contextlib.contextmanager
+def suspend_history_checkpoints():
+    """Suppress callbacks while restoring a failed transaction."""
+    work = _HISTORY_WORK.get()
+    if work is not None:
+        work.suspended += 1
+    try:
+        yield
+    finally:
+        if work is not None:
+            work.suspended -= 1
+
+
+def history_checkpoint(*, force: bool = False) -> None:
+    """Yield to launch coordination at bounded intervals during large scans."""
+    work = _HISTORY_WORK.get()
+    if work is None or work.checkpoint is None or work.suspended:
+        return
+    # The standalone pairwise engine has only pass backups, not a full
+    # transactional image.  Once it writes, finish under the existing leases
+    # instead of yielding a half-synchronized profile to a launcher.
+    if work.mutation_started and not work.rollback_available:
+        return
+    now = time.monotonic()
+    if force or now - work.last_check >= _HISTORY_CHECK_INTERVAL:
+        work.checkpoint()
+        work.last_check = now
+
+
+def before_history_mutation(path: Path | str) -> None:
+    """Check the full lifecycle guard before a live write, then record it."""
+    work = _HISTORY_WORK.get()
+    if work is None or work.suspended:
+        return
+    lexical = canonical_storage_path(path)
+    if not any(lexical == root or lexical.is_relative_to(root) for root in work.managed_roots):
+        return  # Scratch files and backups are never live history mutations.
+    target = lexical.resolve()
+    if not any(target == root or target.is_relative_to(root) for root in work.managed_roots):
+        raise SyncError(f"Refusing history mutation outside its managed root: {lexical}")
+    if work.before_write is not None and (not work.mutation_started or work.rollback_available):
+        work.before_write()
+    work.mutation_started = True
+    work.mutated_paths.add(target)
+
+
+def copy_stream_checkpointed(source_handle: Any, target_handle: Any) -> None:
+    """Copy a stream without delaying a cooperative yield for a whole rollout."""
+    while True:
+        history_checkpoint()
+        chunk = source_handle.read(1024 * 1024)
+        if not chunk:
+            break
+        target_handle.write(chunk)
+
+
+def copy_file_checkpointed(source: Path | str, destination: Path | str) -> str:
+    """Copy in bounded chunks, retaining copy2 metadata and long-path support."""
+    source_text = extended_path(source)
+    destination_text = extended_path(destination)
+    with open(source_text, "rb") as source_handle, open(destination_text, "wb") as target_handle:
+        copy_stream_checkpointed(source_handle, target_handle)
+    shutil.copystat(source_text, destination_text)
+    return str(destination)
 
 
 def load_model_guard_context(root: Path) -> ModelGuardContext:
@@ -344,6 +476,7 @@ def load_model_guard_context(root: Path) -> ModelGuardContext:
                 context.global_model_candidates.setdefault(model_id, []).append(
                     (provider_id, prefix)
                 )
+                context.registered_slug_models.setdefault(prefix + model_id, model_id)
     return context
 
 
@@ -440,6 +573,10 @@ def _registered_namespace_model_part(
     if not isinstance(value, str):
         return None
     base, suffix = _model_lookup_parts(value)
+    if context.registered_slug_models:
+        model = context.registered_slug_models.get(base)
+        return model + suffix if model is not None else None
+    # Retain compatibility with explicitly constructed test/extension contexts.
     for model_id, candidates in context.global_model_candidates.items():
         if any(prefix + model_id == base for _provider_id, prefix in candidates):
             return model_id + suffix
@@ -614,6 +751,97 @@ def normalize_rollout_item_models(
     return item, current_provider, changed
 
 
+@dataclasses.dataclass(frozen=True)
+class RolloutModelIndex:
+    header_valid: bool
+    header_provider: Any
+    # Record only the small model-field projection, not messages/tool outputs.
+    # The provider string is a record-local override; an empty value means the
+    # caller's original source provider is still in effect.
+    slots: tuple[tuple[int, str, Any, str], ...]
+    invalid_lines: tuple[tuple[int, str], ...]
+    estimated_bytes: int = 0
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while True:
+            history_checkpoint()
+            chunk = handle.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _parse_rollout_model_index(path: Path) -> tuple[str, RolloutModelIndex]:
+    """Build a projection and full-byte digest together from actual JSONL."""
+    digest = hashlib.sha256()
+    slots = []
+    invalid = []
+    header_valid = False
+    header_provider = None
+    current_provider = ""
+    estimated_bytes = 0
+    with path.open("rb") as handle:
+        for number, raw_line in enumerate(handle, start=1):
+            history_checkpoint()
+            digest.update(raw_line)
+            try:
+                item = json.loads(raw_line.decode("utf-8"))
+            except (UnicodeError, ValueError) as exc:
+                invalid.append((number, repr(exc)))
+                continue
+            payload = item.get("payload") if isinstance(item, dict) else None
+            if number == 1:
+                header_valid = isinstance(payload, dict)
+                header_provider = payload.get("model_provider") if header_valid else None
+            if isinstance(payload, dict):
+                record_type = item.get("type")
+                provider_source = payload
+                if record_type == "session_meta":
+                    provider_source = None
+                elif record_type == "event_msg" and payload.get("type") == "thread_settings_applied":
+                    provider_source = payload.get("thread_settings")
+                elif record_type == "world_state":
+                    provider_source = payload.get("state")
+                current_provider = _provider_from_mapping(provider_source, current_provider)
+            for container, key, field in rollout_model_slots(item):
+                value = container.get(key)
+                estimated_bytes += 256 + len(field) * 2 + len(current_provider) * 2 + len(repr(value)) * 4
+                slots.append((number, field, value, current_provider))
+    return digest.hexdigest(), RolloutModelIndex(header_valid, header_provider,
+                                               tuple(slots), tuple(invalid), estimated_bytes)
+
+
+def rollout_model_index(path: Path) -> RolloutModelIndex:
+    """Reuse parses only after a fresh full-byte SHA256 proof within this run."""
+    work = _HISTORY_WORK.get()
+    if work is None:
+        return _parse_rollout_model_index(path)[1]
+    digest = _file_sha256(path)
+    cached = work.model_indexes.get(digest)
+    if cached is not None:
+        return cached
+    parsed_digest, result = _parse_rollout_model_index(path)
+    if parsed_digest != digest:
+        raise SyncError(f"Rollout changed during its model integrity scan: {path}")
+    # A bounded in-memory index, never persisted and never keyed by a weak stat
+    # fingerprint.  Changes with identical size/mtime still force a reparse.
+    if len(result.slots) <= 50000 and len(result.invalid_lines) <= 100 and result.estimated_bytes <= 16 * 1024 * 1024:
+        while work.model_indexes and (len(work.model_indexes) >= 4096 or
+                                       work.indexed_slots + len(result.slots) > 100000 or
+                                       work.indexed_bytes + result.estimated_bytes > 32 * 1024 * 1024):
+            removed = work.model_indexes.pop(next(iter(work.model_indexes)))
+            work.indexed_slots -= len(removed.slots)
+            work.indexed_bytes -= removed.estimated_bytes
+        work.model_indexes[parsed_digest] = result
+        work.indexed_slots += len(result.slots)
+        work.indexed_bytes += result.estimated_bytes
+    return result
+
+
 def canonicalize_rollout_models(
     item: Any, model_guard: ModelGuardContext | None = None
 ) -> Any:
@@ -737,7 +965,8 @@ def validate_root(root: Path) -> None:
     sessions_root = root / "sessions"
     if sessions_root.exists() and not sessions_root.is_dir():
         raise SyncError(f"Codex 会话路径不是目录：{sessions_root}")
-    sessions_root.mkdir(parents=True, exist_ok=True)
+    # A missing directory is created only by the transactional copy path; the
+    # read-only preflight must remain safe to yield without touching history.
 
 
 def qident(value: str) -> str:
@@ -770,6 +999,7 @@ def read_json_retry(path: Path, attempts: int = 10) -> dict[str, Any]:
         return {}
     last_error: Exception | None = None
     for _ in range(attempts):
+        history_checkpoint()
         try:
             before = path.stat()
             with path.open("r", encoding="utf-8") as handle:
@@ -790,6 +1020,7 @@ def atomic_write_bytes(path: Path, payload: bytes, attempts: int = 20) -> None:
     # backup tree tips past Windows' 260-char MAX_PATH and os.replace fails with a bare WinError 3.
     dest_dir = extended_path(path.parent)
     dest = extended_path(path)
+    before_history_mutation(path)
     os.makedirs(dest_dir, exist_ok=True)
     for attempt in range(attempts):
         temp_path: Path | None = None
@@ -821,6 +1052,7 @@ def atomic_copy_file(source: Path, destination: Path, attempts: int = 20) -> Non
     dest_dir = extended_path(destination.parent)
     source_ext = extended_path(source)
     dest = extended_path(destination)
+    before_history_mutation(destination)
     os.makedirs(dest_dir, exist_ok=True)
     for attempt in range(attempts):
         temp_path: Path | None = None
@@ -828,7 +1060,7 @@ def atomic_copy_file(source: Path, destination: Path, attempts: int = 20) -> Non
             fd, raw_temp = tempfile.mkstemp(prefix=".sync-", dir=dest_dir)
             os.close(fd)
             temp_path = Path(raw_temp)
-            shutil.copy2(source_ext, temp_path)
+            copy_file_checkpointed(source_ext, temp_path)
             os.replace(temp_path, dest)
             return
         except PermissionError:
@@ -892,6 +1124,57 @@ def plain_storage_path(value: str | Path) -> Path:
     return Path(text)
 
 
+def canonical_storage_path(value: str | Path) -> Path:
+    """Expand Windows 8.3 spellings without following symlinks or junctions.
+
+    Path.resolve() expands short names but also follows links. File-identity
+    comparisons need the former; history boundary checks must retain the latter
+    so an alias cannot conceal a link escaping its managed profile. For a new
+    destination, expand the nearest existing parent and append its missing tail.
+    """
+    # Keep '..' in the lexical spelling: before_history_mutation must recognize
+    # a path that starts inside its root and then escapes, rather than treating
+    # its normalized outside destination as an unrelated scratch file.
+    path = plain_storage_path(value).absolute()
+    if ".." in path.parts:
+        # GetLongPathNameW can itself collapse '..', including when expanding
+        # the nearest existing parent of a missing target. Only give it the
+        # prefix before traversal so the boundary guard retains the evidence.
+        traversal = path.parts.index("..")
+        prefix = Path(*path.parts[:traversal])
+        return canonical_storage_path(prefix).joinpath(*path.parts[traversal:])
+    if os.name != "nt":
+        return path
+    import ctypes
+    from ctypes import wintypes
+    get_long_path = ctypes.WinDLL("kernel32", use_last_error=True).GetLongPathNameW
+    get_long_path.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD]
+    get_long_path.restype = wintypes.DWORD
+    candidate, tail = path, []
+    while True:
+        size = get_long_path(str(candidate), None, 0)
+        if size:
+            buffer = ctypes.create_unicode_buffer(size + 1)
+            result = get_long_path(str(candidate), buffer, len(buffer))
+            if result and result < len(buffer):
+                return Path(buffer.value).joinpath(*reversed(tail))
+        if candidate == candidate.parent:
+            return path
+        tail.append(candidate.name)
+        candidate = candidate.parent
+
+
+def storage_path_key(value: str | Path) -> str:
+    """Case-insensitive lexical identity with Windows short names expanded."""
+    normalized = os.path.abspath(plain_storage_path(value))
+    return os.path.normcase(str(canonical_storage_path(normalized)))
+
+
+def relative_storage_path(path: Path, root: Path) -> Path:
+    """A relative path remains stable across short/long spellings of one root."""
+    return canonical_storage_path(path).relative_to(canonical_storage_path(root))
+
+
 def physical_page_id(path: Path) -> str:
     try:
         return str(uuid.UUID(path.stem[-36:]))
@@ -944,7 +1227,9 @@ def lineage_inventory(root: Path) -> tuple[dict[str, Path], dict[Path, dict[str,
     files: dict[str, Path] = {}
     metadata: dict[Path, dict[str, Any]] = {}
     for storage in SESSION_STORAGE_DIRS:
+        history_checkpoint()
         for path in sorted((root / storage).rglob("*.jsonl")):
+            history_checkpoint()
             with path.open("r", encoding="utf-8") as handle:
                 try:
                     item = json.loads(handle.readline())
@@ -967,6 +1252,7 @@ def lineage_byte_boundary(path: Path, ordinal: int) -> int:
     offset = 0
     with path.open('rb') as handle:
         for line in handle:
+            history_checkpoint()
             if int(json.loads(line).get('ordinal', 0)) >= ordinal:
                 break
             offset += len(line)
@@ -1019,6 +1305,7 @@ def logical_session_records(session: SessionFile) -> Iterable[dict[str, Any]]:
     if not (first.get('payload') or {}).get('history_base'):
         with session.path.open('rb') as handle:
             for line in handle:
+                history_checkpoint()
                 yield json.loads(line)
         return
     files, metadata = lineage_inventory(root)
@@ -1037,6 +1324,7 @@ def logical_session_records(session: SessionFile) -> Iterable[dict[str, Any]]:
             yield from read(dependency, min(cutoff, parent_cutoff) if cutoff is not None else parent_cutoff)
         with path.open('rb') as handle:
             for line in handle:
+                history_checkpoint()
                 item = json.loads(line)
                 if cutoff is not None and int(item.get('ordinal', 0)) >= cutoff:
                     break
@@ -1133,7 +1421,7 @@ def refresh_recovered_lineage(
                     first, rest = handle.readline(), handle.read()
                 record = json.loads(first)
                 record["payload"]["history_base"]["end_byte_offset"] = expected
-                atomic_copy_file(path, backup_dir / "lineage-headers" / root.name / path.relative_to(root))
+                atomic_copy_file(path, backup_dir / "lineage-headers" / root.name / relative_storage_path(path, root))
                 atomic_write_bytes(path, (json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8") + rest)
         visiting.remove(path)
         done.add(path)
@@ -1145,12 +1433,13 @@ def refresh_recovered_lineage(
         return
     with contextlib.closing(sqlite3.connect((root / "state_5.sqlite").as_uri() + "?mode=ro", uri=True)) as state:
         canonical = {str(row[0]): Path(str(row[1]).removeprefix('\\\\?\\')) for row in state.execute("SELECT id,rollout_path FROM threads")}
+    before_history_mutation(history_db)
     with contextlib.closing(sqlite3.connect(history_db, timeout=30)) as db:
         saved = {}
         with db:
             for path in pending:
                 thread_id = str(metadata[path].get("id") or "")
-                if canonical.get(thread_id) != path:
+                if not canonical.get(thread_id) or storage_path_key(canonical[thread_id]) != storage_path_key(path):
                     continue
                 turns = db.execute("SELECT turn_id,rollout_ordinal,rollout_end_ordinal,rollout_byte_offset,rollout_end_byte_offset FROM thread_turns WHERE thread_id=?", (thread_id,)).fetchall()
                 projection = db.execute("SELECT next_rollout_ordinal,next_rollout_byte_offset FROM thread_history_projection_state WHERE thread_id=?", (thread_id,)).fetchone()
@@ -1181,12 +1470,14 @@ def scan_sessions(root: Path, preferred_paths: dict[str, str] | None = None) -> 
     preferred_paths = preferred_paths or {}
     catalog: dict[str, SessionFile] = {}
     for directory_name in SESSION_STORAGE_DIRS:
+        history_checkpoint()
         storage_root = root / directory_name
         if not storage_root.exists():
             continue
         if not storage_root.is_dir():
             raise SyncError(f"Codex 会话路径不是目录：{storage_root}")
         for path in storage_root.rglob("*.jsonl"):
+            history_checkpoint()
             if not path.is_file():
                 continue
             try:
@@ -1198,7 +1489,7 @@ def scan_sessions(root: Path, preferred_paths: dict[str, str] | None = None) -> 
             current = SessionFile(
                 session_id=session_id,
                 path=path,
-                relative_path=path.relative_to(root),
+                relative_path=relative_storage_path(path, root),
                 size=stat.st_size,
                 mtime_ns=stat.st_mtime_ns,
             )
@@ -1207,9 +1498,7 @@ def scan_sessions(root: Path, preferred_paths: dict[str, str] | None = None) -> 
                 catalog[session_id] = current
                 continue
             preferred = preferred_paths.get(session_id)
-            if preferred and os.path.normcase(os.path.abspath(plain_storage_path(preferred))) == os.path.normcase(
-                os.path.abspath(plain_storage_path(path))
-            ):
+            if preferred and storage_path_key(preferred) == storage_path_key(path):
                 catalog[session_id] = current
             elif not preferred:
                 # Branch and fork rollouts legitimately share one session id; when the state
@@ -1352,6 +1641,7 @@ def find_legacy_exact_clones(
     snapshots = (left, right)
     model_guards = model_guards or {}
     catalogs: dict[Path, dict[str, SessionFile]] = {}
+    owner_paths: dict[Path, dict[str, list[Path]]] = {}
     digest_cache: dict[tuple[Path, str], str] = {}
     all_ids = set(left.threads) | set(right.threads)
     lineage_protected, _ = lineage_dependencies([left.root, right.root])
@@ -1361,6 +1651,7 @@ def find_legacy_exact_clones(
             for session_id, row in snapshot.threads.items()
         }
         catalogs[snapshot.root] = scan_sessions(snapshot.root, preferred)
+        owner_paths[snapshot.root] = session_paths_for_ids(snapshot.root, all_ids)
 
     def digest_values(session_id: str) -> dict[Path, str]:
         """Return one normalized digest per profile, not a cross-provider set.
@@ -1411,9 +1702,22 @@ def find_legacy_exact_clones(
         }
         if len(base_names) != 1:
             continue
+        # The digest below proves only the selected head and its effective
+        # ancestors. A disconnected physical branch with the same logical ID
+        # is not part of that proof, even when the preferred head is identical.
+        # Connected pagination owners are already protected by lineage above;
+        # retain every other multi-file owner rather than deleting unseen data.
+        if any(len(owner_paths[snapshot.root].get(duplicate_id, [])) > 1
+               for snapshot in snapshots):
+            warnings.append(f"冲突副本 {duplicate_id} 含未独立证明等价的物理分支，已保留。")
+            continue
         base_name = next(iter(base_names))
         duplicate_digests = digest_values(duplicate_id)
-        if not duplicate_digests:
+        duplicate_roots = {snapshot.root for snapshot in snapshots
+                           if duplicate_id in snapshot.threads or duplicate_id in catalogs[snapshot.root]}
+        if not duplicate_digests or set(duplicate_digests) != duplicate_roots:
+            # A row whose rollout is absent has no content proof. It must not
+            # become disposable merely because another replica is an exact copy.
             continue
 
         matching_canonicals: list[str] = []
@@ -1429,11 +1733,15 @@ def find_legacy_exact_clones(
             if candidate_names != {base_name}:
                 continue
             candidate_digests = digest_values(candidate_id)
-            # Require the same evidence coverage and equality within each
-            # profile.  Cross-profile digest equality is not meaningful when
-            # provider/model namespaces differ.
+            # Require a reachable keeper and equal content in EVERY profile
+            # that still holds this duplicate. Extra keeper-only replicas are
+            # safe: a prior pair may already have removed its exact clone.
+            # Requiring identical coverage strands the last root in three-way
+            # cleanup. An orphan keeper file without a thread row is not enough.
             if (
-                set(candidate_digests) == set(duplicate_digests)
+                duplicate_roots <= set(candidate_digests)
+                and all(candidate_id in snapshot.threads for snapshot in snapshots
+                        if snapshot.root in duplicate_roots)
                 and all(
                     candidate_digests[root] == duplicate_digests[root]
                     for root in duplicate_digests
@@ -1554,6 +1862,7 @@ def validate_jsonl(path: Path) -> None:
     count = 0
     with path.open("r", encoding="utf-8") as handle:
         for count, line in enumerate(handle, start=1):
+            history_checkpoint()
             if not line.endswith("\n"):
                 raise ValueError(f"line {count} is incomplete")
             json.loads(line)
@@ -1565,10 +1874,11 @@ def stable_snapshot(source: Path, temp_dir: Path, attempts: int = 6) -> Path:
     temp_dir.mkdir(parents=True, exist_ok=True)
     last_error: Exception | None = None
     for attempt in range(attempts):
+        history_checkpoint()
         destination = temp_dir / f"snapshot-{uuid.uuid4().hex}.jsonl"
         try:
             before = source.stat()
-            shutil.copy2(source, destination)
+            copy_file_checkpointed(source, destination)
             after = source.stat()
             if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
                 destination.unlink(missing_ok=True)
@@ -1621,6 +1931,7 @@ def compare_files(
         right_tail_size = os.fstat(handle_right.fileno()).st_size - right_start
         remaining = min(left_tail_size, right_tail_size)
         while remaining:
+            history_checkpoint()
             chunk_size = min(1024 * 1024, remaining)
             chunk_left = handle_left.read(chunk_size)
             chunk_right = handle_right.read(chunk_size)
@@ -1654,7 +1965,7 @@ def set_session_model_provider(path: Path, provider: str) -> None:
         try:
             with os.fdopen(fd, "wb") as target:
                 target.write(encoded + b"\n")
-                shutil.copyfileobj(source, target, length=1024 * 1024)
+                copy_stream_checkpointed(source, target)
                 target.flush()
                 os.fsync(target.fileno())
         except Exception:
@@ -1664,6 +1975,7 @@ def set_session_model_provider(path: Path, provider: str) -> None:
             raise
     assert temp_path is not None
     try:
+        before_history_mutation(path)
         os.replace(temp_path, path)
     finally:
         if temp_path.exists():
@@ -1691,6 +2003,20 @@ def rewrite_session_for_destination(
     changed = False
     source_provider = str(source_provider or "").strip()
     try:
+        index = rollout_model_index(path)
+        if not index.invalid_lines and index.header_valid and index.header_provider == destination_provider:
+            needs_model_rewrite = any(
+                _resolve_model_for_target(value, model_guard)[0] != value
+                for _number, _field, value, _provider in index.slots
+            )
+            if not needs_model_rewrite:
+                # A complete content digest backs this projection.  Preserve
+                # telemetry without parsing or writing the whole rollout again.
+                for number, field, value, provider in index.slots:
+                    history_checkpoint()
+                    qualify_model_for_target(value, provider or source_provider or str(index.header_provider or ""),
+                                             model_guard, f"{path}:{number}:{field}")
+                return
         fd, raw_temp = tempfile.mkstemp(
             prefix=".models-", dir=path.parent
         )
@@ -1700,6 +2026,7 @@ def rewrite_session_for_destination(
         ) as target:
             current_provider = source_provider
             for line_number, line in enumerate(source, start=1):
+                history_checkpoint()
                 item = json.loads(line)
                 item_changed = False
                 if line_number == 1:
@@ -1735,6 +2062,7 @@ def rewrite_session_for_destination(
         if not changed:
             return
         validate_jsonl(temp_path)
+        before_history_mutation(path)
         os.replace(temp_path, path)
         temp_path = None
     except (OSError, ValueError, json.JSONDecodeError) as exc:
@@ -1746,7 +2074,14 @@ def rewrite_session_for_destination(
 
 
 def provider_for_root(root: Path, root_providers: dict[Path, str]) -> str:
-    provider = root_providers.get(root.resolve())
+    wanted = storage_path_key(root.resolve())
+    matches = {
+        provider for candidate, provider in root_providers.items()
+        if storage_path_key(Path(candidate).resolve()) == wanted and provider
+    }
+    if len(matches) > 1:
+        raise SyncError(f"同一同步目标目录有冲突的模型提供商：{root}")
+    provider = next(iter(matches), None)
     if not provider:
         raise SyncError(f"未知的同步目标目录或模型提供商：{root}")
     return provider
@@ -1762,6 +2097,7 @@ def same_file_bytes(left: Path, right: Path) -> bool:
         return False
     with left.open("rb") as a, right.open("rb") as b:
         while True:
+            history_checkpoint()
             chunk = a.read(1024 * 1024)
             if chunk != b.read(1024 * 1024):
                 return False
@@ -1820,7 +2156,7 @@ class LineageImporter:
             with snapshot.open("rb") as source, os.fdopen(fd, "wb") as target:
                 source.readline()
                 target.write(json.dumps(header, ensure_ascii=False, separators=(",", ":")).encode("utf-8") + b"\n")
-                shutil.copyfileobj(source, target, length=1024 * 1024)
+                copy_stream_checkpointed(source, target)
                 target.flush()
                 os.fsync(target.fileno())
             return prepared
@@ -1913,6 +2249,7 @@ def make_conflict_clone(
             fd, "w", encoding="utf-8", newline="\n"
         ) as target:
             for line_number, line in enumerate(source, start=1):
+                history_checkpoint()
                 item = json.loads(line)
                 item = recursive_replace_thread_refs(item, old_id, new_id)
                 if (
@@ -1928,6 +2265,7 @@ def make_conflict_clone(
                 target.write(json.dumps(item, ensure_ascii=False, separators=(",", ":")) + "\n")
             target.flush()
             os.fsync(target.fileno())
+        before_history_mutation(destination)
         os.replace(temp_path, destination)
     finally:
         if temp_path.exists():
@@ -1946,6 +2284,10 @@ def load_root_snapshot(root: Path) -> RootSnapshot:
         for row in rows_as_dicts(connection, "thread_dynamic_tools"):
             dynamic_tools.setdefault(str(row["thread_id"]), []).append(row)
         spawn_edges = rows_as_dicts(connection, "thread_spawn_edges")
+        reference_names = ("projects", "project_roots", "project_idempotency_keys", "thread_sections")
+        reference_tables = {name: rows_as_dicts(connection, name) for name in reference_names
+                            if table_exists(connection, name)}
+        reference_columns = {name: table_columns(connection, name) for name in reference_tables}
     finally:
         connection.close()
     return RootSnapshot(
@@ -1956,6 +2298,8 @@ def load_root_snapshot(root: Path) -> RootSnapshot:
         spawn_edges=spawn_edges,
         global_state=read_json_retry(root / ".codex-global-state.json"),
         session_index=read_session_index(root / "session_index.jsonl"),
+        reference_tables=reference_tables,
+        reference_columns=reference_columns,
     )
 
 
@@ -2005,6 +2349,18 @@ def choose_thread_source(
     return left, left_row
 
 
+def choose_divergent_branches(
+    session_id: str, left: RootSnapshot, right: RootSnapshot,
+    left_file: SessionFile, right_file: SessionFile,
+) -> tuple[RootSnapshot, SessionFile, RootSnapshot, SessionFile]:
+    """Use the same canonical/alternate choice for preflight and file writes."""
+    left_key = (thread_recency(left.threads.get(session_id)), left_file.mtime_ns, left_file.size)
+    right_key = (thread_recency(right.threads.get(session_id)), right_file.mtime_ns, right_file.size)
+    if right_key >= left_key:
+        return right, right_file, left, left_file
+    return left, left_file, right, right_file
+
+
 def create_backup(
     roots: list[Path], backup_base: Path, temp_work: Path
 ) -> Path:
@@ -2020,7 +2376,9 @@ def create_backup(
         source = sqlite3.connect(f"file:{source_db}?mode=ro", uri=True, timeout=30)
         target = sqlite3.connect(target_db)
         try:
-            source.backup(target)
+            source.backup(target, pages=256,
+                          progress=lambda _status, _remaining, _total: history_checkpoint(),
+                          sleep=0.05)
             target.commit()
             count = target.execute("SELECT COUNT(*) FROM threads").fetchone()[0]
         finally:
@@ -2061,7 +2419,7 @@ def backup_conflict_file(
     # form silently tips past MAX_PATH for the longest rollout names (see extended_path).
     os.makedirs(extended_path(destination.parent), exist_ok=True)
     try:
-        shutil.copy2(extended_path(session_file.path), extended_path(destination))
+        copy_file_checkpointed(session_file.path, destination)
     except OSError as error:
         # The bare WinError names neither path, which sent the last diagnosis after a missing
         # source that was never missing. Say which end failed and how long the paths were.
@@ -2140,6 +2498,7 @@ def sync_session_files(
         ).strip()
 
     for session_id in sorted((set(left_files) | set(right_files)) & relevant_ids):
+        history_checkpoint()
         left_file = left_files.get(session_id)
         right_file = right_files.get(session_id)
         if left_file is None or right_file is None:
@@ -2198,18 +2557,9 @@ def sync_session_files(
 
         # True divergence: keep the most recent branch under the original ID and
         # create a second, visible thread for the alternate branch.
-        left_key = (thread_recency(left.threads.get(session_id)), left_file.mtime_ns, left_file.size)
-        right_key = (
-            thread_recency(right.threads.get(session_id)),
-            right_file.mtime_ns,
-            right_file.size,
+        canonical_snapshot_root, canonical_file, alternate_snapshot_root, alternate_file = (
+            choose_divergent_branches(session_id, left, right, left_file, right_file)
         )
-        if right_key >= left_key:
-            canonical_snapshot_root, canonical_file = right, right_file
-            alternate_snapshot_root, alternate_file = left, left_file
-        else:
-            canonical_snapshot_root, canonical_file = left, left_file
-            alternate_snapshot_root, alternate_file = right, right_file
         source_provider_by_id[session_id] = source_provider(
             canonical_snapshot_root, session_id
         )
@@ -2295,6 +2645,7 @@ def sync_session_files(
     # rollout in sessions makes it discoverable again after restarting the app.
     for root, paths in target_paths.items():
         for session_id, path in list(paths.items()):
+            history_checkpoint()
             if physical_page_id(path) in referenced_pages:
                 independent_head = fresh_head(path, session_id, physical_page_id(path))
                 copy_snapshot_to(path, independent_head)
@@ -2303,7 +2654,7 @@ def sync_session_files(
             if chosen is None:
                 continue
             storage = "archived_sessions" if chosen[1].get("archived") else "sessions"
-            relative = path.relative_to(root)
+            relative = relative_storage_path(path, root)
             if relative.parts[0] == storage:
                 continue
             destination = root / storage / Path(*relative.parts[1:])
@@ -2314,6 +2665,8 @@ def sync_session_files(
             resolved_root = root.resolve()
             if not path.resolve().is_relative_to(resolved_root) or not destination.resolve().is_relative_to(resolved_root):
                 raise SyncError("拒绝移动会话目录之外的文件")
+            before_history_mutation(path)
+            before_history_mutation(destination)
             destination.parent.mkdir(parents=True, exist_ok=True)
             path.rename(destination)
             paths[session_id] = destination
@@ -2323,6 +2676,7 @@ def sync_session_files(
     for root, paths in target_paths.items():
         provider = provider_for_root(root, root_providers)
         for session_id, path in paths.items():
+            history_checkpoint()
             rewrite_session_for_destination(
                 path,
                 provider,
@@ -2338,7 +2692,7 @@ def sync_session_files(
         for root in (left.root, right.root):
             path = target_paths[root][session_id]
             stat = path.stat()
-            pair.append(SessionFile(session_id, path, path.relative_to(root), stat.st_size, stat.st_mtime_ns))
+            pair.append(SessionFile(session_id, path, relative_storage_path(path, root), stat.st_size, stat.st_mtime_ns))
         if compare_files(*pair, model_guards.get(left.root), model_guards.get(right.root)) != "equal":
             raise SyncError(f"History content did not converge after copying: {session_id}; no branch may be discarded.")
 
@@ -2379,25 +2733,19 @@ def preflight_model_guards(
                     or provider_for_root(snapshot.root, root_providers)
                 ).strip()
                 try:
-                    with session.path.open("r", encoding="utf-8") as handle:
-                        for line_number, line in enumerate(handle, start=1):
-                            try:
-                                item = json.loads(line)
-                            except (ValueError, json.JSONDecodeError) as exc:
-                                raise SyncError(
-                                    f"模型保护预检无法解析 rollout：{session.path}:{line_number}"
-                                ) from exc
-                            for container, key, field_path in rollout_model_slots(item):
-                                _resolved, reason = _resolve_model_for_target(
-                                    container.get(key), context
-                                )
-                                if reason:
-                                    context.record_unresolved(
-                                        reason,
-                                        container.get(key),
-                                        source_provider,
-                                        f"{target_root}:{session.path}:{line_number}:{field_path}",
-                                    )
+                    index = rollout_model_index(session.path)
+                    if index.invalid_lines:
+                        raise SyncError(
+                            f"模型保护预检无法解析 rollout：{session.path}:{index.invalid_lines[0][0]}"
+                        )
+                    for line_number, field_path, value, _provider in index.slots:
+                        history_checkpoint()
+                        _resolved, reason = _resolve_model_for_target(value, context)
+                        if reason:
+                            context.record_unresolved(
+                                reason, value, source_provider,
+                                f"{target_root}:{session.path}:{line_number}:{field_path}",
+                            )
                 except OSError as exc:
                     raise SyncError(
                         f"模型保护预检无法读取 rollout：{session.path}"
@@ -2553,6 +2901,7 @@ def session_paths_for_ids(root: Path, session_ids: set[str]) -> dict[str, list[P
         if not sessions_root.is_dir():
             continue
         for path in sessions_root.rglob("*.jsonl"):
+            history_checkpoint()
             if not path.is_file():
                 continue
             try:
@@ -2579,6 +2928,12 @@ def purge_legacy_exact_clones(
 
     mapping = {item.duplicate_id: item.canonical_id for item in plan}
     duplicate_ids = set(mapping)
+    paths_by_root = {root: session_paths_for_ids(root, duplicate_ids) for root in roots}
+    protected, _ = lineage_dependencies(roots)
+    if duplicate_ids & protected or any(
+        len(paths) > 1 for paths_by_id in paths_by_root.values() for paths in paths_by_id.values()
+    ):
+        raise SyncError("精确副本清理证据已变化：存在分页依赖或未证明等价的物理分支；未删除任何副本。")
     atomic_write_json(
         backup_dir / "removed-exact-duplicates" / "manifest.json",
         {
@@ -2595,10 +2950,10 @@ def purge_legacy_exact_clones(
     )
     removed_files = 0
     for label, root in zip(("cockpit", "plus"), roots):
-        paths_by_id = session_paths_for_ids(root, duplicate_ids)
+        paths_by_id = paths_by_root[root]
         for duplicate_id, paths in paths_by_id.items():
             for path in paths:
-                relative = path.relative_to(root.resolve())
+                relative = relative_storage_path(path, root)
                 destination = (
                     backup_dir
                     / "removed-exact-duplicates"
@@ -2606,8 +2961,9 @@ def purge_legacy_exact_clones(
                     / relative
                 )
                 destination.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(path, destination)
+                atomic_copy_file(path, destination)
 
+        before_history_mutation(root / "state_5.sqlite")
         connection = sqlite3.connect(root / "state_5.sqlite", timeout=30)
         connection.execute("PRAGMA busy_timeout=30000")
         try:
@@ -2686,6 +3042,7 @@ def purge_legacy_exact_clones(
 
         for paths in paths_by_id.values():
             for path in paths:
+                before_history_mutation(path)
                 path.unlink()
                 removed_files += 1
 
@@ -2698,7 +3055,7 @@ def purge_legacy_exact_clones(
     }
 
 
-def clear_archived_sidebar_placement(connection: sqlite3.Connection) -> int:
+def clear_archived_sidebar_placement(connection: sqlite3.Connection, *, dry_run: bool = False) -> int:
     """Detach archived threads from every visible sidebar section in state_5.sqlite.
 
     When a thread that sits in a section (e.g. "Pinned") is archived, the App sets archived=1 but
@@ -2723,11 +3080,148 @@ def clear_archived_sidebar_placement(connection: sqlite3.Connection) -> int:
     dirty = " OR ".join(
         f"{c} != 0" if c == "is_pinned" else f"{c} IS NOT NULL" for c in targets
     )
+    if dry_run:
+        return int(connection.execute(
+            f"SELECT COUNT(*) FROM threads WHERE archived IS NOT NULL AND archived != 0 AND ({dirty})"
+        ).fetchone()[0])
     cursor = connection.execute(
         f"UPDATE threads SET {set_clause} "
         f"WHERE archived IS NOT NULL AND archived != 0 AND ({dirty})"
     )
     return cursor.rowcount
+
+
+def plan_thread_reference_rows(
+    destination: RootSnapshot,
+    selected: Iterable[tuple[RootSnapshot, dict[str, Any]]],
+) -> dict[str, list[dict[str, Any]]]:
+    """Copy only referenced entities; never overwrite target-owned projects.
+
+    Display names, ordering and timestamps are not a project identity. A
+    different creation identity, conflicting root slot or idempotency key is
+    ambiguous and must stop before any writes, not silently bind a chat to an
+    unrelated target entity. Shared thread membership identifies renamed
+    sections when their schema has no creation identity.
+    """
+    keys = {"projects": ("id",), "project_roots": ("project_id", "position"),
+            "project_idempotency_keys": ("key",), "thread_sections": ("id",)}
+    current = {name: {tuple(row.get(key) for key in key_columns): dict(row)
+                      for row in destination.reference_tables.get(name, [])}
+               for name, key_columns in keys.items()}
+    planned: dict[str, list[dict[str, Any]]] = {name: [] for name in keys}
+
+    def add(name: str, row: dict[str, Any], source: RootSnapshot) -> None:
+        columns = destination.reference_columns.get(name)
+        if not columns or any(key not in columns for key in keys[name]):
+            raise SyncError(f"目标历史 schema 无法保存所引用的实体：{destination.root} / {name}")
+        key = tuple(row.get(column) for column in keys[name])
+        existing = current[name].get(key)
+        if existing is not None:
+            conflict = False
+            if name == "projects":
+                # Renames/metadata edits must not block the entire history sync.
+                # created_at_ms is stable across those normal display changes.
+                left_created, right_created = row.get("created_at_ms"), existing.get("created_at_ms")
+                conflict = left_created is not None and right_created is not None and left_created != right_created
+            elif name == "project_roots":
+                conflict = os.path.normcase(os.path.normpath(str(row.get("path") or ""))) != os.path.normcase(os.path.normpath(str(existing.get("path") or "")))
+            elif name == "project_idempotency_keys":
+                conflict = row.get("project_id") != existing.get("project_id")
+            elif name == "thread_sections":
+                changed = any(row.get(column) != existing.get(column) for column in ("name", "appearance") if column in columns)
+                shared_membership = any(
+                    source_row.get("thread_section_id") == row.get("id")
+                    and destination.threads[thread_id].get("thread_section_id") == row.get("id")
+                    for thread_id, source_row in source.threads.items() if thread_id in destination.threads
+                )
+                conflict = changed and not shared_membership
+            if conflict:
+                raise SyncError(f"跨配置引用实体存在身份冲突，已保留目标数据：{name} {key!r} ({source.root} -> {destination.root})")
+            return
+        copied = {column: row[column] for column in columns if column in row}
+        planned[name].append(copied)
+        current[name][key] = copied
+
+    for source, row in selected:
+        if source.root == destination.root:
+            continue
+        if "project_id" in destination.thread_columns and row.get("project_id") is not None:
+            project_id = row["project_id"]
+            project = next((item for item in source.reference_tables.get("projects", []) if item.get("id") == project_id), None)
+            if project is None:
+                raise SyncError(f"源会话引用了缺失的 project：{row.get('id')} / {project_id}")
+            add("projects", project, source)
+            for name in ("project_roots", "project_idempotency_keys"):
+                for dependency in source.reference_tables.get(name, []):
+                    if dependency.get("project_id") == project_id:
+                        add(name, dependency, source)
+        if ("thread_section_id" in destination.thread_columns and row.get("thread_section_id") is not None
+                and not int(row.get("archived") or 0)):
+            section_id = row["thread_section_id"]
+            section = next((item for item in source.reference_tables.get("thread_sections", []) if item.get("id") == section_id), None)
+            if section is None:
+                raise SyncError(f"源会话引用了缺失的 thread section：{row.get('id')} / {section_id}")
+            add("thread_sections", section, source)
+    return planned
+
+
+def insert_thread_reference_rows(connection: sqlite3.Connection, plan: dict[str, list[dict[str, Any]]]) -> None:
+    for name in ("projects", "project_roots", "project_idempotency_keys", "thread_sections"):
+        for row in plan.get(name, []):
+            columns = list(row)
+            connection.execute(
+                f"INSERT INTO {qident(name)} ({','.join(qident(column) for column in columns)}) "
+                f"VALUES ({','.join('?' for _ in columns)})",
+                [row[column] for column in columns],
+            )
+
+
+def preflight_thread_references(
+    left: RootSnapshot, right: RootSnapshot,
+    model_guards: dict[Path, ModelGuardContext] | None = None,
+) -> None:
+    """Prove selected rows AND any new conflict clone before changing files.
+
+    Usually all existing entity references are mutually compatible, so one
+    broad metadata-only check avoids re-reading large rollout histories. When
+    unused stale metadata conflicts, inspect actual branches before rejecting
+    it: equal/prefix histories do not import the alternate row's entities.
+    """
+    chosen = {session_id: value for session_id in set(left.threads) | set(right.threads)
+              if (value := choose_thread_source(session_id, left, right)) is not None}
+    selected = list(chosen.values())
+    for destination in (left, right):
+        plan_thread_reference_rows(destination, selected)
+    all_rows = [(source, row) for source in (left, right) for row in source.threads.values()]
+    try:
+        for destination in (left, right):
+            plan_thread_reference_rows(destination, all_rows)
+        return
+    except SyncError:
+        # A conflict in a row that will not be imported is not a sync failure.
+        pass
+
+    model_guards = model_guards or {}
+    catalogs = {}
+    for source in (left, right):
+        preferred = {sid: str(row.get("rollout_path") or "") for sid, row in source.threads.items()}
+        catalogs[source.root] = {sid: session for sid, session in scan_sessions(source.root, preferred).items()
+                                 if sid in source.threads}
+    left_files, right_files = catalogs[left.root], catalogs[right.root]
+    for session_id in sorted(set(left_files) & set(right_files)):
+        left_file, right_file = left_files[session_id], right_files[session_id]
+        if compare_files(left_file, right_file, model_guards.get(left.root), model_guards.get(right.root)) != "divergent":
+            continue
+        _, _, alternate, alternate_file = choose_divergent_branches(
+            session_id, left, right, left_file, right_file
+        )
+        if alternate.root == chosen[session_id][0].root:
+            continue  # Its entity closure is already in selected.
+        if alternate_branch_holder(left, right, left_files, right_files, session_id,
+                                   alternate_file, alternate.root, model_guards) is None:
+            selected.append((alternate, alternate.threads[session_id]))
+    for destination in (left, right):
+        plan_thread_reference_rows(destination, selected)
 
 
 def sync_databases(
@@ -2761,16 +3255,31 @@ def sync_databases(
 
     integrity: dict[str, str] = {}
     clone_ids = {clone.new_id for clone in clones}
+    reference_plans = {
+        destination.root: plan_thread_reference_rows(destination, (
+            value for session_id, value in selected.items()
+            if target_paths[destination.root].get(session_id) is not None
+        )) for destination in (left, right)
+    }
     for destination_snapshot in (left, right):
+        before_history_mutation(destination_snapshot.root / "state_5.sqlite")
         connection = sqlite3.connect(destination_snapshot.root / "state_5.sqlite", timeout=30)
         connection.execute("PRAGMA busy_timeout=30000")
         try:
             connection.execute("BEGIN IMMEDIATE")
+            insert_thread_reference_rows(connection, reference_plans[destination_snapshot.root])
             for session_id, (source_snapshot, row) in selected.items():
+                history_checkpoint()
                 rollout_path = target_paths[destination_snapshot.root].get(session_id)
                 if rollout_path is None:
                     continue
                 destination_row = dict(row)
+                if int(destination_row.get("archived") or 0):
+                    for column in ("thread_section_id", "section_position"):
+                        if column in destination_row:
+                            destination_row[column] = None
+                    if "is_pinned" in destination_row:
+                        destination_row["is_pinned"] = 0
                 model_guard = model_guards.get(destination_snapshot.root)
                 if model_guard is not None and "model" in destination_row:
                     source_provider = str(
@@ -3455,48 +3964,23 @@ def find_unqualified_rollout_models(
     """Find active rollout model fields that still lack a provider namespace."""
     findings: list[dict[str, Any]] = []
     try:
-        with path.open("r", encoding="utf-8") as handle:
-            for line_number, line in enumerate(handle, start=1):
-                try:
-                    item = json.loads(line)
-                except (ValueError, json.JSONDecodeError) as exc:
-                    findings.append(
-                        {
-                            "line": line_number,
-                            "field": "<json>",
-                            "model": repr(exc),
-                            "reason": "invalid_json",
-                        }
-                    )
-                    continue
-                for container, key, field_path in rollout_model_slots(item):
-                    value = container.get(key)
-                    is_qualified = (
-                        _model_has_namespace_in_context(value, model_guard)
-                        if model_guard is not None
-                        else model_has_namespace(value)
-                    )
-                    if not is_qualified:
-                        # Record WHY it is still bare. "unqualified_model" means the writer could
-                        # have namespaced it and did not -- a real post-condition failure. Any other
-                        # reason means it was never qualifiable (no enabled provider offers the id,
-                        # or several do), so leaving it verbatim was the correct, deliberate outcome
-                        # and must not fail the sync.
-                        reason = "unqualified_model"
-                        if model_guard is not None:
-                            _resolved, unresolved = _resolve_model_for_target(
-                                value, model_guard
-                            )
-                            if unresolved:
-                                reason = unresolved
-                        findings.append(
-                            {
-                                "line": line_number,
-                                "field": field_path,
-                                "model": repr(value),
-                                "reason": reason,
-                            }
-                        )
+        index = rollout_model_index(path)
+        findings.extend({"line": number, "field": "<json>", "model": error,
+                         "reason": "invalid_json"} for number, error in index.invalid_lines)
+        for line_number, field_path, value, _provider in index.slots:
+            history_checkpoint()
+            is_qualified = (
+                _model_has_namespace_in_context(value, model_guard)
+                if model_guard is not None else model_has_namespace(value)
+            )
+            if not is_qualified:
+                reason = "unqualified_model"
+                if model_guard is not None:
+                    _resolved, unresolved = _resolve_model_for_target(value, model_guard)
+                    if unresolved:
+                        reason = unresolved
+                findings.append({"line": line_number, "field": field_path,
+                                 "model": repr(value), "reason": reason})
     except OSError as exc:
         findings.append(
             {
@@ -3539,6 +4023,7 @@ def verify_roots(
     id_sets: list[set[str]] = []
     expected_sidebar_account_ids = expected_sidebar_account_ids or set()
     for root in roots:
+        history_checkpoint()
         validate_lineage([root], check_offsets=True)
         connection = sqlite3.connect(
             f"file:{root / 'state_5.sqlite'}?mode=ro", uri=True, timeout=30
@@ -3599,6 +4084,7 @@ def verify_roots(
         requalifiable_session_ids: set[str] = set()
         unqualified_rollout_values = 0
         for session_id, session in sessions.items():
+            history_checkpoint()
             try:
                 with session.path.open("r", encoding="utf-8") as handle:
                     header = json.loads(handle.readline())
@@ -3640,7 +4126,7 @@ def verify_roots(
             str(row[0]) for row in rows if int(row[3] or 0) != 0
         }
         archived_sidebar_ids = sorted(archived_thread_ids_in_db & sidebar_ids)
-        index_ids = set(read_session_index(root / "session_index.json"))
+        index_ids = set(read_session_index(root / "session_index.jsonl"))
         archived_index_ids = sorted(archived_thread_ids_in_db & index_ids)
         missing_sidebar_main_ids = sorted(unarchived_main_thread_ids - sidebar_ids)
         atom_state = global_state.get(ATOM_STATE_KEY, {})
@@ -3761,6 +4247,28 @@ def run_sync(
     right_provider: str = PLUS_MODEL_PROVIDER,
     model_guard_roots: Iterable[Path] | None = None,
     archive_state_overrides: dict[str, dict[str, Any]] | None = None,
+    quiescence_check: Callable[[], None] | None = None,
+    before_write_check: Callable[[], None] | None = None,
+) -> dict[str, Any]:
+    # A three-way caller owns the outer recovery image and keeps one model
+    # index across all passes.  Standalone calls get a separate bounded scope.
+    scope = (contextlib.nullcontext() if _HISTORY_WORK.get() is not None else
+             history_checkpoint_scope(quiescence_check, before_write_check,
+                                      managed_roots=(left_root, right_root)))
+    with scope:
+        history_checkpoint(force=True)
+        return _run_sync_impl(left_root, right_root, backup_base, left_provider,
+                              right_provider, model_guard_roots, archive_state_overrides)
+
+
+def _run_sync_impl(
+    left_root: Path,
+    right_root: Path,
+    backup_base: Path,
+    left_provider: str = COCKPIT_MODEL_PROVIDER,
+    right_provider: str = PLUS_MODEL_PROVIDER,
+    model_guard_roots: Iterable[Path] | None = None,
+    archive_state_overrides: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     started = utc_now()
     roots = [left_root.resolve(), right_root.resolve()]
@@ -3774,12 +4282,14 @@ def run_sync(
     }
     for root in roots:
         validate_root(root)
+    history_checkpoint(force=True)
     validate_lineage(roots)
     model_guards = build_model_guard_contexts(roots, model_guard_roots)
 
     backup_base.mkdir(parents=True, exist_ok=True)
-    (INSTALL_DIR / "work").mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix="codex-history-sync-", dir=INSTALL_DIR / "work") as raw_temp:
+    work_dir = INSTALL_DIR / "work"
+    work_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="codex-history-sync-", dir=work_dir) as raw_temp:
         temp_dir = Path(raw_temp)
         backup_dir = create_backup(roots, backup_base, temp_dir)
         left = load_root_snapshot(roots[0])
@@ -3801,10 +4311,12 @@ def run_sync(
         # the first preflight after that cleanup could leave a two-way caller
         # partially changed when an ambiguous model is discovered.
         preflight_model_guards((left, right), root_providers, model_guards)
+        preflight_thread_references(left, right, model_guards)
 
         duplicate_plan, duplicate_warnings = find_legacy_exact_clones(
             left, right, model_guards
         )
+        history_checkpoint(force=True)
         duplicate_cleanup = purge_legacy_exact_clones(
             roots, duplicate_plan, backup_dir
         )
@@ -3817,6 +4329,7 @@ def run_sync(
         target_paths, clones, counters, sync_warnings = sync_session_files(
             left, right, backup_dir, temp_dir, root_providers, model_guards
         )
+        history_checkpoint(force=True)
         integrity = sync_databases(
             left, right, target_paths, clones, root_providers, model_guards
         )
@@ -3952,12 +4465,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--left-provider",
-        default=COCKPIT_MODEL_PROVIDER,
+        default=None,
         help="左侧 Codex 配置使用的模型提供商 ID",
     )
     parser.add_argument(
         "--right-provider",
-        default=PLUS_MODEL_PROVIDER,
+        default=None,
         help="右侧 Codex 配置使用的模型提供商 ID",
     )
     parser.add_argument("--json", action="store_true", help="以 JSON 输出结果")
@@ -3965,11 +4478,15 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
+    import codex_app_lifecycle as lifecycle
     log_path = setup_logging()
     args = build_parser().parse_args()
     result: dict[str, Any]
     try:
-        with SingleInstanceLock(LOCK_PATH):
+        args.left_provider = args.left_provider or configured_model_provider(args.left, COCKPIT_MODEL_PROVIDER)
+        args.right_provider = args.right_provider or configured_model_provider(args.right, PLUS_MODEL_PROVIDER)
+        with lifecycle.lifecycle_lock(), SingleInstanceLock(LOCK_PATH):
+            lifecycle.assert_quiescent()
             logging.info("开始同步：%s <-> %s", args.left, args.right)
             result = run_sync(
                 args.left,
@@ -3977,6 +4494,7 @@ def main() -> int:
                 args.backup_base,
                 args.left_provider,
                 args.right_provider,
+                quiescence_check=lifecycle.assert_quiescent,
             )
             result["log_path"] = str(log_path)
             logging.info("同步完成：%s", result)

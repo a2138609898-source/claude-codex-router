@@ -5,7 +5,10 @@
     [switch]$NoGui,
     [switch]$AuditOnly,
     [switch]$SkipSync,
-    [switch]$PrepareOnly
+    [switch]$PrepareOnly,
+    [string]$LaunchRequestId,
+    [ValidateRange(0, 30)][int]$LifecycleWaitSeconds = 3,
+    [ValidateRange(1, 120)][int]$WindowReadyTimeoutSeconds = 30
 )
 
 $ErrorActionPreference = 'Stop'
@@ -17,7 +20,15 @@ function Resolve-ConfiguredRoot {
     }
     return [System.IO.Path]::GetFullPath((Join-Path $env:USERPROFILE $DefaultName))
 }
+if (-not $LaunchRequestId) { $LaunchRequestId = [guid]::NewGuid().ToString('N') }
+if ($LaunchRequestId -notmatch '^[a-zA-Z0-9_-]{1,80}$') { throw 'Invalid launch request id.' }
 $installDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$lifecycleWorkDir = Join-Path $installDir 'work'
+$lifecycleLockPath = Join-Path $lifecycleWorkDir 'codex-app-lifecycle.lock'
+$launchRequestDir = Join-Path $lifecycleWorkDir 'codex-launch-requests'
+$launchRequestGuardPath = Join-Path $lifecycleWorkDir 'codex-launch-requests.lock'
+$shellLaunchRequestPath = Join-Path $launchRequestDir ('shell-' + $LaunchRequestId + '-' + $PID + '.json')
+$launchStatusPath = Join-Path $lifecycleWorkDir ('launch-status-' + $LaunchRequestId + '.json')
 $runnerPath = Join-Path $installDir 'Run-CodexHistorySync.ps1'
 $syncCorePath = Join-Path $installDir 'sync_codex_histories.py'
 $lastResultPath = Join-Path $installDir 'last-result.json'
@@ -83,6 +94,86 @@ function Show-ProfileMessage {
         [System.Windows.MessageBoxButton]::OK,
         $iconValue
     ) | Out-Null
+}
+
+function Enter-AppLifecycleLock {
+    param([string]$LockPath = $lifecycleLockPath, [int]$WaitSeconds = $LifecycleWaitSeconds)
+    [IO.Directory]::CreateDirectory($lifecycleWorkDir) | Out-Null
+    $stream = [IO.File]::Open($LockPath, [IO.FileMode]::OpenOrCreate,
+        [IO.FileAccess]::ReadWrite, [IO.FileShare]::ReadWrite)
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    do {
+        try { $stream.Lock(0, 1); return $stream }
+        catch [IO.IOException] {
+            if ($clock.Elapsed.TotalSeconds -ge $WaitSeconds) { $stream.Dispose(); return $null }
+            Start-Sleep -Milliseconds 100
+        }
+    } while ($true)
+}
+
+function Set-LaunchRequest {
+    [IO.Directory]::CreateDirectory($launchRequestDir) | Out-Null
+    $payload = @{
+        request_id = $LaunchRequestId; request_source = 'shell'; launcher_pid = $PID
+        launcher_creation_ticks = (Get-Process -Id $PID -ErrorAction Stop).StartTime.ToUniversalTime().ToFileTimeUtc().ToString()
+        expires_at = ([DateTime]::UtcNow.AddMinutes(30) - [DateTime]'1970-01-01Z').TotalSeconds
+    } | ConvertTo-Json -Compress
+    $guard = Enter-AppLifecycleLock -LockPath $launchRequestGuardPath -WaitSeconds 1
+    if (-not $guard) { throw 'Could not publish the Codex profile launch request.' }
+    $temporary = $shellLaunchRequestPath + '.new-' + $PID
+    try {
+        [IO.File]::WriteAllText($temporary, $payload, [Text.UTF8Encoding]::new($false))
+        Move-Item -LiteralPath $temporary -Destination $shellLaunchRequestPath -Force
+    }
+    finally {
+        Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue
+        $guard.Unlock(0, 1); $guard.Dispose()
+    }
+}
+
+function Clear-LaunchRequest {
+    $guard = $null
+    try {
+        $guard = Enter-AppLifecycleLock -LockPath $launchRequestGuardPath -WaitSeconds 1
+        if (-not $guard) { return }
+        Remove-Item -LiteralPath $shellLaunchRequestPath -Force -ErrorAction SilentlyContinue
+    }
+    catch { }
+    finally { if ($guard) { $guard.Unlock(0, 1); $guard.Dispose() } }
+}
+
+function Write-ProfileLaunchResult {
+    param([string]$Status, [string]$Phase, [int]$AppProcessId = 0, [string]$ErrorText)
+    $app = if ($AppProcessId -gt 0) { Get-Process -Id $AppProcessId -ErrorAction SilentlyContinue } else { $null }
+    $result = [ordered]@{
+        status = $Status; profile = $Profile; request_id = $LaunchRequestId; phase = $Phase
+        launcher_pid = $PID
+        launcher_creation_ticks = (Get-Process -Id $PID -ErrorAction SilentlyContinue).StartTime.ToUniversalTime().ToFileTimeUtc().ToString()
+        app_process_id = if ($app) { $app.Id } else { $null }
+        app_creation_ticks = if ($app) { $app.StartTime.ToUniversalTime().ToFileTimeUtc().ToString() } else { $null }
+        window_owned = [bool]($app -and $app.MainWindowHandle -ne 0)
+        error = $ErrorText
+    } | ConvertTo-Json -Compress
+    if (-not $AuditOnly -and -not $PrepareOnly) {
+        $temporary = $launchStatusPath + '.new-' + $PID
+        try {
+            [IO.Directory]::CreateDirectory($lifecycleWorkDir) | Out-Null
+            [IO.File]::WriteAllText($temporary, $result, [Text.UTF8Encoding]::new($false))
+            Move-Item -LiteralPath $temporary -Destination $launchStatusPath -Force
+        }
+        catch { Write-Warning 'Could not persist profile launch status; structured stdout remains available.' }
+        finally { Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue }
+    }
+    Write-Output $result
+}
+
+function Get-ActiveCodexAppBackends {
+    return @(Get-CimInstance Win32_Process -Filter "Name = 'codex.exe'" -ErrorAction Stop |
+        Where-Object {
+            $_.CommandLine -match '(?:^|\s)"?app-server"?(?:\s|$)' -and
+            ($_.ExecutablePath -match '\\OpenAI\\(?:CodexCliBundled|Codex)\\' -or
+             $_.ExecutablePath -match '\\WindowsApps\\OpenAI\.Codex_[^\\]+\\app\\resources\\')
+        })
 }
 
 function Get-CodexAppExecutable {
@@ -165,28 +256,7 @@ function Stop-CodexApp {
         Start-Sleep -Milliseconds 200
     } while ([DateTime]::UtcNow -lt $deadline)
 
-    $taskkill = Join-Path $env:SystemRoot 'System32\taskkill.exe'
-    $mainProcesses = @($remaining | Where-Object { $_.MainWindowHandle -ne 0 })
-    if ($mainProcesses.Count -eq 0) {
-        $mainProcesses = @($remaining | Select-Object -First 1)
-    }
-    foreach ($process in $mainProcesses) {
-        & $taskkill /PID $process.Id /T /F | Out-Null
-    }
-
-    $forceDeadline = [DateTime]::UtcNow.AddSeconds(8)
-    do {
-        $remaining = @(Get-OwnedCodexAppProcesses)
-        if ($remaining.Count -eq 0) {
-            return
-        }
-        foreach ($process in $remaining) {
-            & $taskkill /PID $process.Id /T /F 2>$null | Out-Null
-        }
-        Start-Sleep -Milliseconds 250
-    } while ([DateTime]::UtcNow -lt $forceDeadline)
-
-    throw 'ChatGPT.exe processes remained after Codex App shutdown.'
+    throw 'Codex has not finished closing. It was not force-terminated. Finish or cancel active work, close its window, then retry the profile switch.'
 }
 
 function Stop-CockpitTools {
@@ -254,6 +324,28 @@ function Test-ProfileConfig {
     return $null -ne $result -and $result.valid -eq $true
 }
 
+function Test-ExplicitPortableCodexApp {
+    param([string]$ExecutablePath)
+    $configured = [Environment]::GetEnvironmentVariable('CODEX_APP_EXE')
+    if ([string]::IsNullOrWhiteSpace($configured)) { return $false }
+    $configured = [IO.Path]::GetFullPath([Environment]::ExpandEnvironmentVariables($configured))
+    $selected = [IO.Path]::GetFullPath($ExecutablePath)
+    if (-not [string]::Equals($configured, $selected, [StringComparison]::OrdinalIgnoreCase)) { return $false }
+    # A Store executable always needs its package identity, including an old
+    # package selected explicitly. Never fall back after a Store launch fails.
+    if ($selected -match '\\WindowsApps\\') { return $false }
+    $packages = @(Invoke-WithComRetry -Action { Get-AppxPackage -Name 'OpenAI.Codex' -ErrorAction Stop })
+    foreach ($package in $packages) {
+        foreach ($image in @('ChatGPT.exe', 'Codex.exe')) {
+            $packaged = Join-Path $package.InstallLocation ('app\' + $image)
+            if ([string]::Equals($selected, [IO.Path]::GetFullPath($packaged), [StringComparison]::OrdinalIgnoreCase)) {
+                return $false
+            }
+        }
+    }
+    return $true
+}
+
 function Start-CodexAppForProfile {
     param(
         [string]$ExecutablePath,
@@ -293,25 +385,29 @@ function Start-CodexAppForProfile {
         $startInfo.EnvironmentVariables.Remove($name)
     }
 
-    $startedProcess = [System.Diagnostics.Process]::Start($startInfo)
+    $storeLauncher = Join-Path $PSScriptRoot 'Start-CodexStoreProcess.ps1'
+    if (Test-ExplicitPortableCodexApp -ExecutablePath $ExecutablePath) {
+        $startedProcess = [System.Diagnostics.Process]::Start($startInfo)
+    }
+    else { $startedProcess = & $storeLauncher -StartInfo $startInfo }
     if (-not $startedProcess) {
         throw 'Windows did not return a Codex App process.'
     }
 
-    $launcherProcessId = $startedProcess.Id
-    $deadline = [DateTime]::UtcNow.AddSeconds(12)
+    $deadline = [DateTime]::UtcNow.AddSeconds($WindowReadyTimeoutSeconds)
+    $lastOwned = @()
     do {
         Start-Sleep -Milliseconds 250
-        $mainProcessInfo = Get-CimInstance Win32_Process -Filter "Name = 'ChatGPT.exe'" -ErrorAction SilentlyContinue |
-            Where-Object { $_.ParentProcessId -eq $launcherProcessId -or $_.ParentProcessId -eq $PID } |
-            Select-Object -First 1
-        if ($mainProcessInfo) {
-            return [int]$mainProcessInfo.ProcessId
-        }
+        $lastOwned = @(Get-OwnedCodexAppProcesses)
+        $window = @($lastOwned | Where-Object { $_.MainWindowHandle -ne 0 } | Sort-Object StartTime | Select-Object -First 1)
+        if ($window.Count -gt 0) { return [int]$window[0].Id }
     } while ([DateTime]::UtcNow -lt $deadline)
 
-    Stop-Process -Id $launcherProcessId -Force -ErrorAction SilentlyContinue
-    throw 'The Codex desktop launcher did not create a ChatGPT App process with the isolated environment.'
+    if ($lastOwned.Count -gt 0) {
+        $script:launchWindowPending = $true
+        return [int](@($lastOwned | Sort-Object StartTime | Select-Object -First 1)[0].Id)
+    }
+    throw 'The owned Codex desktop process exited before creating its window.'
 }
 
 function Get-SessionFileCount {
@@ -373,6 +469,7 @@ function Ensure-CockpitApiService {
 function Get-PythonExecutable {
     $candidates = @(
         [Environment]::GetEnvironmentVariable('CODEX_SOTA_PYTHON'),
+        (Join-Path (Split-Path -Parent (Split-Path -Parent $PSScriptRoot)) 'codex-sota-runtime.exe'),
         [Environment]::GetEnvironmentVariable('CODEX_PYTHON'),
         (Join-Path $env:USERPROFILE '.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe'),
         (Join-Path $env:LOCALAPPDATA 'Programs\Python\Python313\python.exe'),
@@ -521,11 +618,16 @@ function Test-CockpitApiHealth {
 }
 
 function Set-ActiveProfileMarker {
-    param([ValidateSet('Plus', 'Cockpit')][string]$SelectedProfile)
+    param([ValidateSet('Plus', 'Cockpit')][string]$SelectedProfile, [int]$AppProcessId)
 
+    $app = Get-Process -Id $AppProcessId -ErrorAction Stop
     $payload = [ordered]@{
         profile = $SelectedProfile
         updated_utc = [DateTime]::UtcNow.ToString('o')
+        app_process_id = $app.Id
+        app_creation_ticks = $app.StartTime.ToUniversalTime().ToFileTimeUtc().ToString()
+        creation_request_id = $LaunchRequestId
+        request_id = $LaunchRequestId
     } | ConvertTo-Json -Compress
     $temporaryPath = $activeProfilePath + '.new-' + $PID + '-' + [guid]::NewGuid().ToString('N')
     try {
@@ -535,6 +637,23 @@ function Set-ActiveProfileMarker {
     finally {
         Remove-Item -LiteralPath $temporaryPath -Force -ErrorAction SilentlyContinue
     }
+}
+
+function Get-RequestedProfileApp {
+    foreach ($path in @($activeProfilePath, $launchStatusPath)) {
+        try {
+            $marker = Get-Content -Raw -Encoding UTF8 -LiteralPath $path -ErrorAction Stop | ConvertFrom-Json
+            if ($marker.profile -ne $Profile -or ($marker.creation_request_id -ne $LaunchRequestId -and
+                $marker.request_id -ne $LaunchRequestId)) { continue }
+            if (-not $marker.app_process_id -or -not $marker.app_creation_ticks) { continue }
+            foreach ($app in @(Get-OwnedCodexAppProcesses)) {
+                if ($app.Id -eq [int]$marker.app_process_id -and
+                    $app.StartTime.ToUniversalTime().ToFileTimeUtc().ToString() -eq [string]$marker.app_creation_ticks) { return $app }
+            }
+        }
+        catch { }
+    }
+    return $null
 }
 
 function Start-PostExitSyncWatcher {
@@ -613,6 +732,12 @@ function Test-StructuredSyncSuccess {
         [switch]$AuditOnly
     )
 
+    if ($Result -and $Result.status -eq 'skipped' -and
+        $Result.reason -eq 'optional_profiles_absent' -and $Result.sync_performed -eq $false -and
+        @($Result.missing_optional_profiles).Count -gt 0 -and
+        $Result.mode -eq $(if ($AuditOnly) { 'three-way-audit' } else { 'three-way' })) {
+        return $true
+    }
     if (-not $Result -or $Result.status -ne 'ok') {
         return $false
     }
@@ -723,7 +848,7 @@ $machineApiSignals = @($apiEnvironmentNames | Where-Object {
     -not [string]::IsNullOrEmpty([Environment]::GetEnvironmentVariable($_, 'Machine'))
 }).Count
 
-if ($PrepareOnly) {
+if ($PrepareOnly -and -not $AuditOnly) {
     try {
         if (-not (Test-Path -LiteralPath $targetRoot)) {
             throw "Codex profile directory was not found: $targetRoot"
@@ -818,6 +943,12 @@ if ($AuditOnly) {
     exit 1
 }
 
+$lifecycleLease = $null
+$historyWriteLease = $null
+try {
+# Announce intent before Appx/config probes or normal shutdown. These requests
+# are independent of SOTA launches and share the same synchronization guards.
+Set-LaunchRequest
 $appExecutable = Get-CodexAppExecutable
 if (-not $appExecutable) {
     Show-ProfileMessage -Title 'Codex 切换失败' -Icon Error -Message '找不到 Codex App 程序。'
@@ -827,16 +958,45 @@ if (-not $appExecutable) {
 $legacyRecovered = 0
 $cockpitServiceReady = $null
 try {
-    Stop-CodexApp
-    if ($Profile -eq 'Plus') {
-        $null = Stop-CockpitTools
+    $lifecycleLease = Enter-AppLifecycleLock
+    if ($lifecycleLease) {
+        $historyWriteLease = Enter-AppLifecycleLock -LockPath (Join-Path $installDir 'sync.lock') -WaitSeconds 0
     }
-    if (-not $SkipSync) {
-        Invoke-CanonicalHistorySync
+    if (-not $lifecycleLease -or -not $historyWriteLease) {
+        Write-ProfileLaunchResult -Status 'deferred' -Phase 'waiting_for_history_sync'
+        exit 0
+    }
+    $requestedApp = Get-RequestedProfileApp
+    if (-not $requestedApp) {
+        Stop-CodexApp
+        if ($Profile -eq 'Plus') {
+            $null = Stop-CockpitTools
+        }
+        if (-not $SkipSync) {
+            # The explicit cross-profile sync acquires both leases itself.
+            $historyWriteLease.Unlock(0, 1); $historyWriteLease.Dispose(); $historyWriteLease = $null
+            $lifecycleLease.Unlock(0, 1); $lifecycleLease.Dispose(); $lifecycleLease = $null
+            Clear-LaunchRequest
+            Invoke-CanonicalHistorySync
+            Set-LaunchRequest
+            $lifecycleLease = Enter-AppLifecycleLock
+            if ($lifecycleLease) {
+                $historyWriteLease = Enter-AppLifecycleLock -LockPath (Join-Path $installDir 'sync.lock') -WaitSeconds 0
+            }
+            if (-not $lifecycleLease -or -not $historyWriteLease) {
+                Write-ProfileLaunchResult -Status 'deferred' -Phase 'waiting_for_history_sync'
+                exit 0
+            }
+        }
+        if (@(Get-ActiveCodexAppBackends).Count -gt 0) {
+            Write-ProfileLaunchResult -Status 'deferred' -Phase 'waiting_for_previous_app'
+            exit 0
+        }
     }
 }
 catch {
     Show-ProfileMessage -Title 'Codex 切换失败' -Icon Error -Message "无法安全地准备登录环境。`n`n$($_.Exception.Message)"
+    if ($NoGui) { Write-ProfileLaunchResult -Status 'error' -Phase 'preflight' -ErrorText $_.Exception.Message }
     exit 1
 }
 
@@ -854,7 +1014,11 @@ if ($Profile -eq 'Cockpit') {
 }
 
 try {
-    $appProcessId = Start-CodexAppForProfile -ExecutablePath $appExecutable -SelectedProfile $Profile
+    if ($requestedApp) {
+        $appProcessId = $requestedApp.Id
+        $script:launchWindowPending = $requestedApp.MainWindowHandle -eq 0
+    }
+    else { $appProcessId = Start-CodexAppForProfile -ExecutablePath $appExecutable -SelectedProfile $Profile }
 }
 catch {
     $launchError = $_.Exception.Message
@@ -863,19 +1027,26 @@ catch {
 }
 
 try {
-    Start-PostExitSyncWatcher -AppProcessId $appProcessId
-    Set-ActiveProfileMarker -SelectedProfile $Profile
+    Set-ActiveProfileMarker -SelectedProfile $Profile -AppProcessId $appProcessId
 }
 catch {
-    $watcherError = $_.Exception.Message
-    try {
-        Stop-CodexApp
-    }
-    catch {
-        $watcherError += "`nCleanup failed: $($_.Exception.Message)"
-    }
-    Show-ProfileMessage -Title 'Codex 切换失败' -Icon Error -Message "退出后的三方同步监控未能启动，本次 App 启动已撤销。`n`n$watcherError"
-    exit 1
+    Write-Warning ("The active profile marker could not be saved: " + $_.Exception.Message)
+}
+try {
+    Start-PostExitSyncWatcher -AppProcessId $appProcessId
+}
+catch {
+    # Optional post-exit maintenance must not close a successfully opened app.
+    Write-Warning ("Post-exit history maintenance could not be armed: " + $_.Exception.Message)
+}
+
+if ($script:launchWindowPending) {
+    Write-ProfileLaunchResult -Status 'deferred' -Phase 'waiting_for_window' -AppProcessId $appProcessId
+    exit 0
+}
+if ($NoGui) {
+    Write-ProfileLaunchResult -Status 'ready' -Phase 'window_ready' -AppProcessId $appProcessId
+    exit 0
 }
 
 $result = Get-LastSyncResult
@@ -918,5 +1089,11 @@ $countLine
 $legacyLine$environmentNote
 已保留原生“项目 + 最近”侧栏布局。$serviceLine$watcherLine
 "@
+}
+finally {
+    if ($historyWriteLease) { $historyWriteLease.Unlock(0, 1); $historyWriteLease.Dispose() }
+    if ($lifecycleLease) { $lifecycleLease.Unlock(0, 1); $lifecycleLease.Dispose() }
+    Clear-LaunchRequest
+}
 
 exit 0

@@ -806,14 +806,39 @@ class LayoutTests(unittest.TestCase):
                 problems.extend(walk(child))
             return problems
 
-        with mock.patch.object(manager.messagebox, "showerror"),                 mock.patch.object(manager.messagebox, "showinfo"),                 mock.patch.object(manager.messagebox, "showwarning"):
+        with tempfile.TemporaryDirectory(prefix="layout-fixture-") as temporary, contextlib.ExitStack() as patches:
+            workspace = make_workspace(registry, Path(temporary))
+            fixture_provider = provider_config("https://layout.fixture.invalid/v1")
+            fixture_provider["workspace"] = workspace.name
+            fixture_provider["is_default"] = True
+            workspace.registry_path.write_text(
+                json.dumps({"version": 1, "providers": [fixture_provider]}), encoding="utf-8"
+            )
+            # Exercise the real Tk tree, registry loader and model renderer. The
+            # layout fixture owns all configuration paths; background app/router
+            # checks are not part of layout and must not inspect a live profile.
+            patches.enter_context(mock.patch.object(manager, "CODEX", workspace))
+            patches.enter_context(mock.patch.dict(registry.WORKSPACES, {"codex": workspace}))
+            patches.enter_context(mock.patch.object(manager.CodexSotaApp, "_run_audit"))
+            patches.enter_context(mock.patch.object(
+                manager.CodexSotaApp, "_refresh_claude_status", autospec=True,
+                side_effect=lambda app: app.claude_status_var.set("合成 Claude 工作区：21 个 Messages 模型"),
+            ))
+            errors = patches.enter_context(mock.patch.object(manager.messagebox, "showerror"))
+            patches.enter_context(mock.patch.object(manager.messagebox, "showinfo"))
+            patches.enter_context(mock.patch.object(manager.messagebox, "showwarning"))
             try:
                 app = manager.CodexSotaApp()
             except tkinter.TclError as error:  # pragma: no cover - no display
                 self.skipTest(f"no display: {error}")
             try:
+                app._load_registry()
                 app.update()
                 app.update_idletasks()
+
+                self.assertEqual(app.provider_tree.get_children(), ("test_vendor",))
+                self.assertEqual(len(app.draft_models), 1)
+                errors.assert_not_called()
 
                 self.assertEqual(walk(app), [])
 

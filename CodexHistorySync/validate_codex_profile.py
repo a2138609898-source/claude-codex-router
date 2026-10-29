@@ -189,7 +189,8 @@ def validate_profile(profile: str, root: Path, catalog: Path | None) -> tuple[bo
         return True, "ok"
 
     if profile == "Sota":
-        if data.get("model_provider") != "tango_relay":
+        selected_provider = data.get("model_provider")
+        if not isinstance(selected_provider, str) or not selected_provider.strip() or not _provider(data, selected_provider):
             return False, "model_provider_mismatch"
         if catalog is None or not _same_path(data.get("model_catalog_json"), catalog, root):
             return False, "model_catalog_mismatch"
@@ -209,7 +210,7 @@ def validate_profile(profile: str, root: Path, catalog: Path | None) -> tuple[bo
                 return False, f"{field}_unqualified"
             if slug not in slugs:
                 return False, f"{field}_not_in_catalog"
-        provider = _provider(data, "tango_relay")
+        provider = _provider(data, selected_provider)
         if provider.get("base_url") != "http://127.0.0.1:17895":
             return False, "base_url_mismatch"
         if provider.get("wire_api") != "responses":
@@ -270,6 +271,7 @@ def main() -> int:
     args = parser.parse_args()
 
     repair_report: dict[str, Any] | None = None
+    model_provider: str | None = None
     try:
         if args.probe_cockpit:
             if args.profile != "Cockpit":
@@ -287,10 +289,15 @@ def main() -> int:
                 repair_report = repair_pinned_models(args.root, args.catalog)
                 if repair_report.get("repaired"):
                     valid, reason = validate_profile(args.profile, args.root, args.catalog)
+        selected_provider = _read_config(args.root).get("model_provider")
+        if isinstance(selected_provider, str):
+            model_provider = selected_provider
     except Exception:
         valid, reason = False, "validation_failed"
 
     payload: dict[str, Any] = {"valid": valid, "reason": reason}
+    if model_provider is not None:
+        payload["model_provider"] = model_provider
     if repair_report is not None:
         payload["repair"] = repair_report
     print(json.dumps(payload, separators=(",", ":")))

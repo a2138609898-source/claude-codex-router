@@ -33,13 +33,8 @@ def configured_root(env_name: str, default_name: str) -> Path:
     if value:
         return Path(os.path.expandvars(value)).expanduser().resolve()
     return Path.home() / default_name
-
-
-DEFAULT_ROOTS = (
-    configured_root("CODEX_SOTA_COCKPIT_ROOT", ".codex-personal"),
-    configured_root("CODEX_SOTA_PLUS_ROOT", ".codex-plus"),
-    configured_root("CODEX_SOTA_CODEX_ROOT", ".codex-sota"),
-)
+DEFAULT_ROOTS = tuple(Path.home() / name for name in (
+    ".codex-personal", ".codex-plus", ".codex-sota"))
 STORAGE = ("sessions", "archived_sessions")
 CONFLICT_SUFFIX = "\uff08\u540c\u6b65\u51b2\u7a81\u526f\u672c\uff09"
 UUID_PATTERN = (r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
@@ -782,12 +777,17 @@ def apply_plan(plan: dict, backup: Path | None = None) -> dict:
                 # later user continuation is allowed to change these files;
                 # completing queue bookkeeping must never replay the repair.
                 return {"status": "already-applied", "backup": str(backup), "plan_id": plan["plan_id"]}
-            if manifest["status"] not in {"prepared", "applying", "rolled_back"}:
+            if manifest["status"] not in {"preparing", "prepared", "applying", "rolled_back"}:
                 raise RepairError("Existing backup needs review; status=" + manifest["status"])
         verify_targets(plan, resuming=manifest is not None and manifest["status"] == "applying")
         if manifest is None:
             manifest = prepare_backup(plan, backup)
-        elif manifest["status"] in {"prepared", "rolled_back"}:
+        elif manifest["status"] in {"preparing", "prepared", "rolled_back"}:
+            # A preparing manifest is durable before the first backup copy,
+            # and no profile write is allowed until it becomes prepared.
+            # verify_targets above must still prove the reviewed inputs are
+            # unchanged. Preserve the interrupted image and create a fresh
+            # attempt instead of treating a partial backup as complete.
             manifest = refresh_prepared_backup(plan, backup)
         try:
             mutate_plan(plan, backup, manifest)

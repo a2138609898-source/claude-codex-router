@@ -18,12 +18,15 @@ from pathlib import Path
 import re
 import statistics
 import subprocess
+import tempfile
 import time
 from typing import Any
 import urllib.error
 import urllib.parse
 import urllib.request
 from uuid import uuid4
+
+from sota_network import build_network_opener
 
 
 def _resolve_configured_path(value: str) -> Path:
@@ -84,7 +87,16 @@ class Workspace:
 
     @property
     def source_catalog_path(self) -> Path:
-        return self.root / "tango-relay-model-catalog.json"
+        # Keep existing installations' source templates, independently of the old
+        # provider brand in their filename. Never mistake the generated catalog
+        # (whose model slugs already contain provider prefixes) for a source.
+        preferred = self.root / "tango-relay-model-catalog.json"
+        if preferred.is_file():
+            return preferred
+        for candidate in sorted(self.root.glob("*-model-catalog.json")):
+            if candidate != self.catalog_path and candidate.is_file():
+                return candidate
+        return preferred
 
     @property
     def secrets_root(self) -> Path:
@@ -169,6 +181,7 @@ REQUEST_ADAPTERS = (
 )
 # How many vendors one request may be handed to before giving up.
 FAILOVER_MAX_ATTEMPTS = 3
+REASONING_EFFORT_ORDER = ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra")
 # What `protected` actually protects.  A protected entry is one whose *identity* this app does not
 # own: the codex_auth provider borrows the Codex App's own login and base URL. Its model prefix is
 # also pinned because it is part of the published slug written into config.toml and the catalog;
@@ -420,15 +433,21 @@ def dpapi_protect(value: str, path: Path, entropy_label: str) -> None:
             ctypes.byref(entropy_blob),
             None,
             None,
-            0,
+            1,  # CRYPTPROTECT_UI_FORBIDDEN: saving must never open a hidden prompt.
             ctypes.byref(output_blob),
         ):
             raise ctypes.WinError()
         protected = ctypes.string_at(output_blob.pbData, output_blob.cbData)
         path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_suffix(path.suffix + ".new")
-        temporary.write_text(base64.b64encode(protected).decode("ascii"), encoding="ascii")
-        os.replace(temporary, path)
+        temporary = path.parent / f".{path.name}.{uuid4().hex}.tmp"
+        try:
+            with temporary.open("w", encoding="ascii") as handle:
+                handle.write(base64.b64encode(protected).decode("ascii"))
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
     finally:
         if output_blob.pbData:
             kernel32.LocalFree(output_blob.pbData)
@@ -450,7 +469,7 @@ def dpapi_unprotect(path: Path, entropy_label: str) -> str:
         ctypes.byref(entropy_blob),
         None,
         None,
-        0,
+        1,  # Do not let a background router wait on a Windows credential dialog.
         ctypes.byref(output_blob),
     ):
         raise ctypes.WinError()
@@ -496,10 +515,10 @@ def provider_workspace(provider: dict[str, Any]) -> Workspace:
 
 
 def uses_responses_to_anthropic_messages(provider: dict[str, Any]) -> bool:
-    """Return whether the one explicitly supported Codex provider uses the Messages adapter."""
+    """Use the explicit adapter setting for any Responses-to-Messages provider."""
     return (
-        str(provider.get("id") or "").lower() == "juno"
-        and provider.get("request_adapter") == RESPONSES_TO_ANTHROPIC_MESSAGES_ADAPTER
+        str(provider.get("request_adapter") or "").strip()
+        == RESPONSES_TO_ANTHROPIC_MESSAGES_ADAPTER
     )
 
 
@@ -514,8 +533,7 @@ def uses_messages_to_chat_completions(provider: dict[str, Any]) -> bool:
 def uses_responses_to_chat_completions(provider: dict[str, Any]) -> bool:
     """Whether this provider is an OpenAI-Chat-only gateway bridged for the Codex App.
 
-    Not id-gated like the Messages adapter: any gateway can be configured this way, which
-    is the point -- these vendors are exactly the ones neither app can talk to natively.
+    Any gateway can explicitly opt into this adapter.
     """
     return (
         str(provider.get("request_adapter") or "").strip()
@@ -583,6 +601,44 @@ def secret_path(provider: dict[str, Any]) -> Path:
     return candidate
 
 
+class CredentialOwnershipError(ValueError):
+    """A provider claims another identity's encrypted credential file."""
+
+
+def _secret_identity(provider: dict[str, Any]) -> str:
+    # The application runs on Windows: differently cased spellings are not independent files.
+    return str(secret_path(provider).resolve()).replace("\\", "/").casefold()
+
+
+def _secret_owners(providers: list[dict[str, Any]]) -> dict[str, set[str]]:
+    owners: dict[str, set[str]] = {}
+    for provider in providers:
+        if provider.get("auth_type") != "dpapi":
+            continue
+        identity = _secret_identity(provider)
+        owners.setdefault(identity, set()).add(str(provider["id"]))
+    return owners
+
+
+def _validate_secret_ownership(
+    providers: list[dict[str, Any]],
+    previous_providers: list[dict[str, Any]] | None = None,
+) -> None:
+    previous = _secret_owners(previous_providers or [])
+    for identity, owners in _secret_owners(providers).items():
+        # Existing shared references remain readable/editable, and removing a claimant is
+        # safe. A new claimant (including a rename) must choose its own credential file.
+        # Check the previous owners even when the proposed registry has only one owner:
+        # removing an identity must not let its replacement inherit the old credential.
+        previous_owners = previous.get(identity, set())
+        if (len(owners) > 1 or previous_owners) and not owners.issubset(previous_owners):
+            raise CredentialOwnershipError(
+                f"Encrypted credential file {identity!r} is claimed by providers "
+                f"{', '.join(sorted(previous_owners | owners))}; "
+                "use a separate secret_file for each provider"
+            )
+
+
 def provider_key(provider: dict[str, Any], temporary_key: str | None = None) -> str:
     if temporary_key and temporary_key.strip():
         return temporary_key.strip()
@@ -642,6 +698,12 @@ def endpoint_url(provider: dict[str, Any], kind: str) -> str:
 def auth_headers(
     provider: dict[str, Any], key: str, include_probe_defaults: bool = True
 ) -> dict[str, str]:
+    raw_header = str(provider.get("auth_header") or "Authorization")
+    if _has_forbidden_header_control(raw_header):
+        raise ValueError("Authentication header name contains a forbidden control character")
+    header = raw_header.strip()
+    if not HTTP_HEADER_NAME_PATTERN.fullmatch(header):
+        raise ValueError("Authentication header name is invalid")
     headers: dict[str, str] = {}
     if include_probe_defaults:
         headers.update(
@@ -661,19 +723,21 @@ def auth_headers(
             raise ValueError(f"Invalid HTTP header name: {name!r}")
         if _has_forbidden_header_control(value):
             raise ValueError(f"HTTP header {name!r} contains a forbidden control character")
-        if name.lower() in {"authorization", "content-length", "host"}:
+        if name.lower() in {"authorization", "content-length", "host", header.lower()}:
             continue
+        # HTTP header names are case-insensitive. Remove an earlier spelling before adding
+        # its override, including probe defaults, so urllib cannot reverse the winner later.
+        for previous in list(headers):
+            if previous.lower() == name.lower():
+                del headers[previous]
         headers[name] = value
-    raw_header = str(provider.get("auth_header") or "Authorization")
-    if _has_forbidden_header_control(raw_header):
-        raise ValueError("Authentication header name contains a forbidden control character")
-    header = raw_header.strip()
     prefix = str(provider.get("auth_prefix") if provider.get("auth_prefix") is not None else "Bearer ")
-    if not HTTP_HEADER_NAME_PATTERN.fullmatch(header):
-        raise ValueError("Authentication header name is invalid")
     auth_value = prefix + key
     if _has_forbidden_header_control(auth_value):
         raise ValueError("Authentication header value contains a forbidden control character")
+    for previous in list(headers):
+        if previous.lower() == header.lower():
+            del headers[previous]
     headers[header] = auth_value
     return headers
 
@@ -696,7 +760,7 @@ def _http_json(
         data = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     request = urllib.request.Request(url, data=data, headers=request_headers, method=method)
     try:
-        response = urllib.request.urlopen(request, timeout=timeout)
+        response = build_network_opener().open(request, timeout=timeout)
     except urllib.error.HTTPError as error:
         response = error
     with response:
@@ -786,6 +850,46 @@ def _model_ids(body: Any) -> list[str]:
     return sorted(result, key=str.casefold)
 
 
+def _model_capability_metadata(body: Any) -> dict[str, dict[str, Any]]:
+    """Retain only explicit, bounded capability hints returned with model ids."""
+    if isinstance(body, dict):
+        candidates = body.get("data")
+        if not isinstance(candidates, list):
+            candidates = body.get("models")
+    elif isinstance(body, list):
+        candidates = body
+    else:
+        candidates = None
+    if not isinstance(candidates, list):
+        return {}
+    result: dict[str, dict[str, Any]] = {}
+    for item in candidates:
+        if not isinstance(item, dict):
+            continue
+        model_id = item.get("id") or item.get("slug") or item.get("name")
+        if not isinstance(model_id, str) or not model_id.strip():
+            continue
+        metadata: dict[str, Any] = {}
+        context_window = next(
+            (
+                item.get(key)
+                for key in ("context_window_tokens", "context_window", "context_length")
+                if type(item.get(key)) is int
+            ),
+            None,
+        )
+        if context_window is not None and 0 < context_window <= 100_000_000:
+            metadata["context_window_tokens"] = context_window
+        for key in ("supports_1m_context", "supports1m"):
+            explicit_1m = item.get(key)
+            if type(explicit_1m) is bool:
+                metadata["supports_1m_context"] = explicit_1m
+                break
+        if metadata:
+            result[model_id.strip()] = metadata
+    return result
+
+
 def _candidate_model_paths(provider: dict[str, Any]) -> list[str]:
     configured = normalize_path(str(provider.get("models_path") or "/models"), "/models")
     candidates = [configured]
@@ -831,6 +935,7 @@ def discover_models(
                     "url": url,
                     "models_path": path,
                     "models": models,
+                    "model_metadata": _model_capability_metadata(body),
                 }
             errors.append(
                 {
@@ -1078,6 +1183,119 @@ def auto_repair_messages_path(
     }
 
 
+def candidate_chat_paths(provider: dict[str, Any]) -> list[str]:
+    """Ordered Chat Completions paths without guessing another configured origin."""
+    configured = normalize_path(
+        str(provider.get("chat_path") or "/v1/chat/completions"), "/v1/chat/completions"
+    )
+    candidates = [configured]
+    if configured.startswith(("https://", "http://")):
+        return candidates
+    base_path = urllib.parse.urlsplit(
+        normalize_base_url(str(provider.get("base_url") or ""))
+    ).path.rstrip("/")
+    models_path = normalize_path(str(provider.get("models_path") or "/models"), "/models")
+    if configured.startswith("/v1/v1/"):
+        candidates.append(configured[3:])
+    if base_path.endswith("/v1"):
+        if configured.startswith("/v1/"):
+            candidates.append(configured[3:])
+    else:
+        if models_path.startswith("/v1/") and not configured.startswith("/v1/"):
+            candidates.append("/v1" + configured)
+        candidates.append("/v1/chat/completions")
+    candidates.append("/chat/completions")
+    return list(dict.fromkeys(candidates))
+
+
+def discover_chat_path(
+    provider: dict[str, Any], temporary_key: str | None = None
+) -> dict[str, Any]:
+    """Probe Chat endpoints with a Chat payload, regardless of the client-side protocol."""
+    item = validate_provider(deepcopy(provider), allow_missing_secret=True)
+    enabled = [model["id"] for model in item.get("models") or [] if model.get("enabled")]
+    model = enabled[0] if enabled else None
+    if model is None:
+        return {"ok": False, "chat_path": None, "reason": "该供应商没有启用任何模型", "attempts": []}
+    key = provider_key(item, temporary_key)
+    timeout = min(120, max(30, int(item.get("timeout_seconds") or 120)))
+    payload = {
+        "model": model,
+        "max_tokens": 64,
+        "stream": False,
+        "messages": [{"role": "user", "content": "Reply exactly OK"}],
+    }
+    attempts: list[dict[str, Any]] = []
+    try:
+        for path in candidate_chat_paths(item):
+            probe = dict(item)
+            probe["chat_path"] = path
+            url = endpoint_url(probe, "chat")
+            try:
+                status, body, text = _http_json(
+                    url, "POST", auth_headers(item, key), payload, timeout
+                )
+            except Exception as error:
+                attempts.append({"path": path, "status": None, "note": _redact_text(str(error), [key])[:160]})
+                continue
+            if not 200 <= status < 300:
+                attempts.append({"path": path, "status": status, "note": f"HTTP {status}"})
+                continue
+            problem = response_shape_problem(body, text, "chat")
+            if problem is None:
+                choices = body["choices"]
+                if not any(
+                    isinstance(choice, dict)
+                    and isinstance(choice.get("message"), dict)
+                    and any(field in choice["message"] for field in ("content", "tool_calls"))
+                    for choice in choices
+                ):
+                    problem = "Chat Completions 结果没有可用的 assistant message"
+            if problem:
+                attempts.append({"path": path, "status": status, "note": _redact_text(problem, [key])[:160]})
+                continue
+            return {"ok": True, "chat_path": path, "model": model, "attempts": attempts}
+    finally:
+        key = ""
+    return {
+        "ok": False,
+        "chat_path": None,
+        "model": model,
+        "reason": "试过的路径都没有返回 Chat Completions 结果",
+        "attempts": attempts,
+    }
+
+
+def auto_repair_chat_path(
+    provider: dict[str, Any], temporary_key: str | None = None
+) -> dict[str, Any]:
+    """Probe and correct only provider['chat_path']; callers choose when to persist it."""
+    before = normalize_path(
+        str(provider.get("chat_path") or "/v1/chat/completions"), "/v1/chat/completions"
+    )
+    try:
+        result = discover_chat_path(provider, temporary_key)
+    except Exception as error:
+        return {"changed": False, "before": before, "after": None, "reason": str(error)}
+    if not result.get("ok"):
+        return {
+            "changed": False,
+            "before": before,
+            "after": None,
+            "reason": result.get("reason") or "没有可用的 Chat Completions 路径",
+        }
+    after = result["chat_path"]
+    if after == before:
+        return {"changed": False, "before": before, "after": after, "reason": "路径本来就是对的"}
+    provider["chat_path"] = after
+    return {
+        "changed": True,
+        "before": before,
+        "after": after,
+        "reason": f"{before} 打不到 Chat Completions API，自动改成 {after}",
+    }
+
+
 def measure_latency(
     provider: dict[str, Any],
     model_id: str,
@@ -1143,6 +1361,11 @@ def response_shape_problem(body: Any, text: str, protocol: str = "responses") ->
     if not isinstance(body, dict):
         head = (text or "").strip()[:80].replace("\n", " ")
         if head.lower().startswith(("<!doctype", "<html")):
+            if protocol == "chat":
+                return (
+                    "上游返回的是 HTML 网页而不是 Chat Completions 结果，"
+                    "通常说明路径写错了（检查 /chat/completions 或 /v1/chat/completions）"
+                )
             if protocol == "messages":
                 return (
                     "上游返回的是 HTML 网页（打到了网站首页）而不是 API 结果。"
@@ -1517,6 +1740,20 @@ def validate_model(model: dict[str, Any]) -> dict[str, Any]:
     model["enabled"] = enabled
     model["display_name"] = str(model.get("display_name") or "").strip()
     model["description"] = str(model.get("description") or "").strip()
+    context_window = model.get("context_window_tokens")
+    if type(context_window) is not int or not 0 < context_window <= 100_000_000:
+        model.pop("context_window_tokens", None)
+    max_output_tokens = model.get("max_output_tokens")
+    if type(max_output_tokens) is not int or not 0 < max_output_tokens <= 100_000_000:
+        model.pop("max_output_tokens", None)
+    supports_1m = model.get("supports_1m_context")
+    if type(supports_1m) is not bool:
+        model.pop("supports_1m_context", None)
+    if "reasoning_effort_ceiling" in model:
+        ceiling = str(model["reasoning_effort_ceiling"]).strip().lower()
+        if ceiling not in REASONING_EFFORT_ORDER:
+            raise ValueError(f"Model {model_id!r} has an invalid reasoning_effort_ceiling")
+        model["reasoning_effort_ceiling"] = ceiling
     if model.get("last_test_status") not in {None, "ready", "failed", "untested"}:
         model["last_test_status"] = "untested"
     if model.get("fast_tier_status") not in {None, "supported", "unsupported", "unknown"}:
@@ -1694,7 +1931,8 @@ def validate_provider(
 
 
 def validate_registry(
-    registry: dict[str, Any], allow_missing_secrets: bool = False
+    registry: dict[str, Any], allow_missing_secrets: bool = False,
+    *, allow_shared_secrets: bool = False,
 ) -> dict[str, Any]:
     if not isinstance(registry, dict):
         raise ValueError("Provider registry must be a JSON object")
@@ -1755,16 +1993,29 @@ def validate_registry(
     # Demanding a default here would make a new workspace impossible to create at all.
     if providers and default_count != 1:
         raise ValueError("Provider registry must have exactly one default provider")
+    if not allow_shared_secrets:
+        _validate_secret_ownership(clean_providers)
     registry["providers"] = clean_providers
     registry["version"] = REGISTRY_VERSION
     return registry
 
 
 def load_registry(
-    path: Path = REGISTRY_PATH, allow_missing_secrets: bool = False
+    path: Path = REGISTRY_PATH, allow_missing_secrets: bool = False,
+    *, allow_shared_secrets: bool = True,
 ) -> dict[str, Any]:
-    registry = json.loads(path.read_text(encoding="utf-8-sig"))
-    return validate_registry(registry, allow_missing_secrets=allow_missing_secrets)
+    # Legacy shared credentials are not changed by reading/routing. Ownership changes are
+    # checked against the current registry by write_registry and before any key overwrite.
+    try:
+        registry = json.loads(path.read_text(encoding="utf-8-sig"))
+    except FileNotFoundError:
+        # Reading a brand-new workspace is harmless. Creation belongs to the
+        # first successful save, so opening or auditing the UI does not write it.
+        registry = {"version": REGISTRY_VERSION, "providers": []}
+    return validate_registry(
+        registry, allow_missing_secrets=allow_missing_secrets,
+        allow_shared_secrets=allow_shared_secrets,
+    )
 
 
 def write_registry(
@@ -1773,8 +2024,14 @@ def write_registry(
     allow_missing_secrets: bool = False,
 ) -> None:
     clean = validate_registry(
-        deepcopy(registry), allow_missing_secrets=allow_missing_secrets
+        deepcopy(registry), allow_missing_secrets=allow_missing_secrets,
+        allow_shared_secrets=True,
     )
+    previous = (
+        load_registry(path, allow_missing_secrets=True)["providers"]
+        if path.exists() else []
+    )
+    _validate_secret_ownership(clean["providers"], previous)
     clean["updated_at"] = utc_now()
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.parent / f".{path.name}.{uuid4().hex}.tmp"
@@ -1847,6 +2104,51 @@ def registry_digest(registry: dict[str, Any]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _builtin_catalog_source() -> dict[str, Any]:
+    """A small, neutral template lets a clean machine save its first provider.
+
+    This contains no copied user instructions or credentials. Installations with
+    an existing source catalog continue using their own capability metadata.
+    Model-specific context limits and reasoning ceilings can narrow this template.
+    """
+    return {
+        "models": [{
+            "slug": "generic",
+            "display_name": "Custom model",
+            "description": "A model served through the local SOTA router.",
+            "default_reasoning_level": "medium",
+            "supported_reasoning_levels": [
+                {"effort": level, "description": label}
+                for level, label in (
+                    ("low", "Light reasoning"),
+                    ("medium", "Balanced reasoning"),
+                    ("high", "Detailed reasoning"),
+                )
+            ],
+            "shell_type": "shell_command",
+            "visibility": "list",
+            "supported_in_api": True,
+            "priority": 1,
+            "base_instructions": "You are a coding assistant. Help the user complete their task accurately.",
+            "supports_reasoning_summaries": False,
+            "default_reasoning_summary": "none",
+            "support_verbosity": True,
+            "default_verbosity": "medium",
+            "apply_patch_tool_type": "freeform",
+            "truncation_policy": {"mode": "tokens", "limit": 10000},
+            "supports_parallel_tool_calls": True,
+            "context_window": 128000,
+            "max_context_window": 128000,
+            "effective_context_window_percent": 95,
+            "experimental_supported_tools": [],
+            "input_modalities": ["text", "image"],
+            "additional_speed_tiers": [],
+            "service_tiers": [],
+            "upgrade": None,
+        }],
+    }
+
+
 def build_model_catalog(
     registry: dict[str, Any] | None = None,
     source_path: Path = SOURCE_CATALOG_PATH,
@@ -1881,7 +2183,10 @@ def build_model_catalog(
                 # information do not change the registry digest.
                 model["publish_as"] = ""
     registry = catalog_registry
-    source = json.loads(source_path.read_text(encoding="utf-8-sig"))
+    try:
+        source = json.loads(source_path.read_text(encoding="utf-8-sig"))
+    except FileNotFoundError:
+        source = _builtin_catalog_source()
     source_models = source.get("models")
     if not isinstance(source_models, list) or not source_models:
         raise RuntimeError("Source catalog has no model templates")
@@ -1897,6 +2202,7 @@ def build_model_catalog(
     for provider in registry["providers"]:
         if not provider["enabled"]:
             continue
+        prefix = effective_model_prefix(provider)
         for model_config in provider["models"]:
             if not model_config["enabled"]:
                 continue
@@ -1913,10 +2219,14 @@ def build_model_catalog(
             if source_model is None:
                 source_model = terra_template if "terra" in model_id.lower() else default_template
             model = deepcopy(source_model)
-            if model_id.lower() == "gpt-5.6-luna":
+            if "luna" in model_id.lower():
                 # Older direct-provider catalogs may not include Luna and therefore fall
-                # back to the Sol template.  Luna supports reasoning through `max`, not
-                # Sol's additional `ultra` level, so clamp the copied capability metadata.
+                # back to the Sol template.  Luna *the model* supports reasoning through
+                # `max`, not Sol's additional `ultra` level, so clamp the copied capability
+                # metadata.  Keyed on the family rather than on one version string: matching
+                # `gpt-5.6-luna` exactly left `gpt-6-luna` advertising an `ultra` level its
+                # model cannot honour -- the same line of model with two different capability
+                # sets, decided by nothing but a hardcoded suffix.
                 levels = model.get("supported_reasoning_levels")
                 if isinstance(levels, list):
                     model["supported_reasoning_levels"] = [
@@ -1930,6 +2240,25 @@ def build_model_catalog(
                             isinstance(level, str) and level.lower() == "ultra"
                         )
                     ]
+            # Only explicit provider/model overrides narrow the copied template.  Do not
+            # assume every Chat-compatible gateway has the same reasoning capabilities.
+            ceiling = model_config.get("reasoning_effort_ceiling")
+            if ceiling in REASONING_EFFORT_ORDER:
+                allowed = set(REASONING_EFFORT_ORDER[:REASONING_EFFORT_ORDER.index(ceiling) + 1])
+                model["supported_reasoning_levels"] = [
+                    level for level in model.get("supported_reasoning_levels", [])
+                    if (level.get("effort") if isinstance(level, dict) else level) in allowed
+                ]
+                if not model["supported_reasoning_levels"]:
+                    raise ValueError(f"No reasoning level remains for {model_id!r} below {ceiling!r}")
+            # The source templates are GPT-sized (272k).  A non-GPT model that keeps that
+            # number makes the app believe the upstream accepts more context than it does,
+            # so it never compacts in time.  The manager's per-model value overrides both
+            # the usable window and the hard ceiling the app reads.
+            configured_context = model_config.get("context_window_tokens")
+            if type(configured_context) is int and 0 < configured_context <= 100_000_000:
+                model["context_window"] = configured_context
+                model["max_context_window"] = configured_context
             model["slug"] = published_slug(provider, model_config)
             model["display_name"] = model_config.get("display_name") or (
                 model_id + " (" + provider["name"] + ")"
@@ -1941,6 +2270,9 @@ def build_model_catalog(
             model["default_reasoning_level"] = str(
                 model_config.get("default_reasoning_level") or "medium"
             )
+            if ceiling in REASONING_EFFORT_ORDER and model["default_reasoning_level"] not in allowed:
+                last_level = model["supported_reasoning_levels"][-1]
+                model["default_reasoning_level"] = last_level.get("effort") if isinstance(last_level, dict) else last_level
             if model_config.get("fast_tier_status") == "supported":
                 model["additional_speed_tiers"] = ["fast"]
                 model["service_tiers"] = [deepcopy(PRIORITY_SERVICE_TIER)]
@@ -1978,6 +2310,64 @@ def build_model_catalog(
     }
 
 
+def ensure_codex_profile(
+    registry: dict[str, Any], workspace: Workspace | None = None,
+) -> dict[str, Any]:
+    """Create only missing first-run client files, never an upstream credential.
+
+    A random local token satisfies the Codex API-key login flow. It must not be
+    created when a configured upstream borrows auth.json: that would silently
+    replace a missing real login with a fake upstream key. Existing files are
+    always preserved, including custom settings and the user's real login.
+    """
+    workspace = workspace or default_workspace()
+    if workspace.name != CODEX.name or not workspace.needs_catalog:
+        return {"status": "not-applicable", "created": []}
+    slugs = selectable_slugs(registry)
+    if not slugs:
+        return {"status": "empty", "created": []}
+    config_path = workspace.root / "config.toml"
+    auth_path = workspace.auth_path
+    uses_upstream_auth = any(
+        provider.get("enabled") and provider.get("auth_type") == "codex_auth"
+        for provider in registry.get("providers", [])
+    )
+    if not auth_path.exists() and uses_upstream_auth:
+        return {"status": "authentication-required", "created": []}
+    token = "sota-local-" + uuid4().hex + uuid4().hex
+    config = (
+        'model_provider = "codex_sota"\n'
+        + "model = " + json.dumps(slugs[0], ensure_ascii=False) + "\n"
+        + "model_catalog_json = " + json.dumps(workspace.catalog_path.as_posix(), ensure_ascii=False) + "\n"
+        + 'cli_auth_credentials_store = "file"\n'
+        + 'forced_login_method = "api"\n'
+        + '\n[model_providers.codex_sota]\n'
+        + 'name = "SOTA Local Router"\n'
+        + f'base_url = "http://127.0.0.1:{workspace.router_port}"\n'
+        + 'wire_api = "responses"\n'
+        + 'requires_openai_auth = true\n'
+    )
+    auth = json.dumps({"auth_mode": "apikey", "OPENAI_API_KEY": token}, indent=2) + "\n"
+    created: list[Path] = []
+    workspace.root.mkdir(parents=True, exist_ok=True)
+    try:
+        for path, content in ((config_path, config), (auth_path, auth)):
+            try:
+                handle = path.open("x", encoding="utf-8", newline="\n")
+            except FileExistsError:
+                continue
+            created.append(path)
+            with handle:
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+    except Exception:
+        for path in reversed(created):
+            path.unlink(missing_ok=True)
+        raise
+    return {"status": "ready", "created": [str(path) for path in created]}
+
+
 def _snapshot(paths: list[Path]) -> dict[Path, bytes | None]:
     return {path: path.read_bytes() if path.exists() else None for path in paths}
 
@@ -2000,6 +2390,41 @@ def _restore(snapshot: dict[Path, bytes | None]) -> None:
                 temporary.unlink()
             except OSError:
                 pass
+
+
+def _run_router_starter(command: list[str], timeout_seconds: float = 30.0) -> subprocess.CompletedProcess:
+    """Bound the shell's wait even when a detached router inherits its output.
+
+    Windows ``run(capture_output=True, timeout=...)`` can wait forever in the
+    timeout cleanup's second ``communicate()`` if a long-lived child owns the
+    pipe. A real file needs no EOF. Only this invocation's shell is stopped on
+    timeout, with a bounded reap; its detached router is never killed here.
+    """
+    with tempfile.TemporaryFile(mode="w+b") as output:
+        process = subprocess.Popen(
+            command, stdin=subprocess.DEVNULL, stdout=output,
+            stderr=subprocess.STDOUT, close_fds=True,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        try:
+            code = process.wait(timeout=timeout_seconds)
+        except subprocess.TimeoutExpired:
+            try:
+                process.kill()
+            except OSError:
+                pass
+            try:
+                process.wait(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                pass
+            raise RuntimeError(
+                "Router starter did not finish within its timeout; its desktop "
+                "and detached router were not stopped. Check the workspace router status."
+            ) from None
+        output.seek(0, os.SEEK_END)
+        output.seek(max(0, output.tell() - 131072))
+        text = output.read(131072).decode("utf-8-sig", errors="replace")
+    return subprocess.CompletedProcess(command, code, stdout=text, stderr="")
 
 
 def restart_router(workspace: Workspace | None = None, *, force: bool = False) -> dict[str, Any]:
@@ -2030,16 +2455,7 @@ def restart_router(workspace: Workspace | None = None, *, force: bool = False) -
         "-File",
         str(workspace.router_starter),
     ]
-    completed = subprocess.run(
-        command,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=30,
-        check=False,
-        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-    )
+    completed = _run_router_starter(command)
     lines = [line.strip() for line in (completed.stdout + "\n" + completed.stderr).splitlines() if line.strip()]
     result = None
     for line in reversed(lines):
@@ -2079,16 +2495,7 @@ def stop_router(workspace: Workspace | None = None) -> dict[str, Any]:
         str(workspace.router_starter),
         "-Stop",
     ]
-    completed = subprocess.run(
-        command,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=30,
-        check=False,
-        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-    )
+    completed = _run_router_starter(command)
     lines = [line.strip() for line in (completed.stdout + "\n" + completed.stderr).splitlines() if line.strip()]
     result = None
     for line in reversed(lines):
@@ -2111,10 +2518,15 @@ BOOKKEEPING_FIELDS = (
     "fast_tier_status",
     "fast_tier_effect",
 )
+ENDPOINT_REPAIR_FIELDS = ("responses_path", "messages_path", "chat_path")
+ENDPOINT_REPAIR_IDENTITY_FIELDS = PROTECTED_PINNED_PROVIDER_KEYS + (
+    "id", "enabled", "extra_headers",
+)
 
 
 def save_provider_bookkeeping(
-    providers: list[dict[str, Any]], workspace: Workspace | None = None
+    providers: list[dict[str, Any]], workspace: Workspace | None = None,
+    *, endpoint_baselines: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Persist probe results for many providers in one transaction, without restarting.
 
@@ -2122,16 +2534,62 @@ def save_provider_bookkeeping(
     told about them — and one write for the whole batch rebuilds the catalog once instead
     of once per provider, which is what turned a checkup into a burst of dropped
     connections. Protected providers are included: their results are only bookkeeping.
+
+    Optional endpoint repairs are compare-and-swap updates against the full provider copy
+    captured before probing. Only the three inference paths may change; concurrent routing
+    or credential edits and protected identities are never overwritten by a stale probe.
     """
     workspace = workspace or default_workspace()
+    sources = {provider["id"]: provider for provider in providers}
     wanted = {
         provider["id"]: {model["id"]: model for model in provider.get("models") or []}
         for provider in providers
     }
+    endpoint_plans: dict[str, tuple[dict[str, Any], dict[str, Any], dict[str, str]]] = {}
+    for provider_id, baseline in (endpoint_baselines or {}).items():
+        source = sources.get(provider_id)
+        if source is None:
+            continue
+        before = validate_provider(deepcopy(baseline), allow_missing_secret=True)
+        after = validate_provider(deepcopy(source), allow_missing_secret=True)
+        changes = {
+            field: after[field] for field in ENDPOINT_REPAIR_FIELDS
+            if after[field] != before[field]
+        }
+        if changes:
+            endpoint_plans[provider_id] = (before, after, changes)
     with registry_write_lock(workspace=workspace):
         registry = load_registry(workspace.registry_path, allow_missing_secrets=True)
         touched: list[str] = []
+        endpoint_updates: list[str] = []
+        endpoint_conflicts: list[str] = []
+        seen: set[str] = set()
         for provider in registry["providers"]:
+            provider_id = provider["id"]
+            seen.add(provider_id)
+            plan = endpoint_plans.get(provider_id)
+            if plan is not None:
+                before, after, changes = plan
+                stale = (
+                    provider.get("protected")
+                    or before["id"] != provider_id
+                    or after["id"] != provider_id
+                    or before["workspace"] != workspace.name
+                    or any(
+                        provider.get(field) != before.get(field)
+                        for field in ENDPOINT_REPAIR_IDENTITY_FIELDS
+                    )
+                    or any(
+                        after.get(field) != before.get(field)
+                        for field in ENDPOINT_REPAIR_IDENTITY_FIELDS
+                        if field not in ENDPOINT_REPAIR_FIELDS
+                    )
+                )
+                if stale:
+                    endpoint_conflicts.append(provider_id)
+                else:
+                    provider.update(changes)
+                    endpoint_updates.append(provider_id)
             updates = wanted.get(provider["id"])
             if not updates:
                 continue
@@ -2143,6 +2601,7 @@ def save_provider_bookkeeping(
                     if field in source:
                         model[field] = source[field]
             touched.append(provider["id"])
+        endpoint_conflicts.extend(provider_id for provider_id in endpoint_plans if provider_id not in seen)
         snapshot = _snapshot([workspace.registry_path, workspace.catalog_path])
         try:
             write_registry(registry, workspace.registry_path, allow_missing_secrets=True)
@@ -2150,7 +2609,10 @@ def save_provider_bookkeeping(
         except Exception:
             _restore(snapshot)
             raise
-    return {"status": "ready", "providers": touched, "catalog": catalog}
+    return {
+        "status": "ready", "providers": touched, "catalog": catalog,
+        "endpoint_updates": endpoint_updates, "endpoint_conflicts": endpoint_conflicts,
+    }
 
 
 def apply_provider(
@@ -2196,7 +2658,23 @@ def apply_provider(
         # or hostile values in fields the caller is not allowed to own (an invalid secret path,
         # adapter, endpoint or prefix) are discarded before their validators can interfere with
         # an otherwise legitimate model/settings edit.
+        if not registry["providers"]:
+            submitted["is_default"] = True
         candidate = validate_provider(submitted, allow_missing_secret=True)
+        # Reject a colliding credential identity BEFORE dpapi_protect can overwrite it. A
+        # later write_registry failure and rollback must not be the first ownership check.
+        proposed = [
+            item for item in registry["providers"] if item["id"] != candidate["id"]
+        ] + [candidate]
+        _validate_secret_ownership(proposed, registry["providers"])
+        if api_key and candidate.get("auth_type") == "dpapi":
+            shared_with = _secret_owners(proposed).get(_secret_identity(candidate), set())
+            if len(shared_with) > 1:
+                raise CredentialOwnershipError(
+                    f"Cannot replace encrypted credential {candidate['secret_file']!r}: "
+                    f"it is still used by providers {', '.join(sorted(shared_with))}; "
+                    "choose a separate secret_file before replacing this key"
+                )
         # Check credential availability only after a protected entry has restored its on-disk
         # auth_type and secret identity.  Doing this against the caller's stale candidate first
         # lets a forged dpapi shape fail before the codex_auth pin can neutralize it.
@@ -2205,6 +2683,8 @@ def apply_provider(
             if not api_key and not existing_secret:
                 raise ValueError("API key is required for a new provider")
         paths = [workspace.registry_path, workspace.catalog_path]
+        if workspace.name == CODEX.name:
+            paths += [workspace.root / "config.toml", workspace.auth_path]
         if candidate.get("auth_type") == "dpapi":
             paths.append(secret_path(candidate))
         snapshot = _snapshot(paths)
@@ -2221,8 +2701,9 @@ def apply_provider(
                 registry["providers"][existing_index] = candidate
             write_registry(registry, workspace.registry_path)
             catalog = rebuild_catalog(workspace)
+            profile = ensure_codex_profile(registry, workspace)
             router = restart_router(workspace) if restart else {"status": "hot-reload"}
-            return {"status": "ready", "catalog": catalog, "router": router}
+            return {"status": "ready", "catalog": catalog, "router": router, "profile": profile}
         except Exception:
             _restore(snapshot)
             if restart:
@@ -2277,7 +2758,14 @@ def delete_provider(
         provider = find_provider(registry, provider_id)
         if provider.get("protected"):
             raise ValueError("Protected provider cannot be deleted")
-        remaining = [item for item in registry["providers"] if item["id"] != provider_id]
+        remaining = [item for item in registry["providers"] if item["id"] != provider["id"]]
+        shared_with = []
+        if provider.get("auth_type") == "dpapi":
+            identity = _secret_identity(provider)
+            shared_with = [
+                item["id"] for item in remaining
+                if item.get("auth_type") == "dpapi" and _secret_identity(item) == identity
+            ]
         promoted: str | None = None
         if provider.get("is_default"):
             # The registry needs exactly one enabled default, so deleting the current one is
@@ -2314,7 +2802,7 @@ def delete_provider(
         archived_secret = archive_root / str(provider.get("secret_file") or "api-key.dpapi")
         metadata_path = archive_root / "provider.json"
         paths = [workspace.registry_path, workspace.catalog_path, metadata_path]
-        if provider.get("auth_type") == "dpapi":
+        if provider.get("auth_type") == "dpapi" and not shared_with:
             paths.extend([secret_path(provider), archived_secret])
         snapshot = _snapshot(paths)
         try:
@@ -2334,7 +2822,7 @@ def delete_provider(
                 json.dumps(provider, ensure_ascii=False, indent=2) + "\n",
                 encoding="utf-8",
             )
-            if provider.get("auth_type") == "dpapi" and secret_path(provider).exists():
+            if provider.get("auth_type") == "dpapi" and not shared_with and secret_path(provider).exists():
                 os.replace(secret_path(provider), archived_secret)
             return {
                 "status": "ready",
@@ -2342,6 +2830,7 @@ def delete_provider(
                 "catalog": catalog,
                 "router": router,
                 "archive": str(archive_root),
+                "secret_retained_for": shared_with,
             }
         except Exception:
             _restore(snapshot)
@@ -2452,6 +2941,53 @@ def lint_registry(
                         pid,
                         "开了「失败时自动换别家」，但没有别的供应商提供同名模型，开关不会生效",
                     )
+
+    # Which enabled models have no capability template to inherit from.
+    #
+    # `build_model_catalog` silently falls back to the default GPT template for a name the
+    # source catalog does not carry, so a model the vendor just released wears another model's
+    # reasoning levels and context metadata with nothing anywhere saying so.  Reported per
+    # distinct name (not per provider-model) so a registry where six vendors all serve the same
+    # new model produces one line, not six.
+    if workspace.needs_catalog:
+        try:
+            source = json.loads(workspace.source_catalog_path.read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError):
+            source = None
+        template_slugs = {
+            model["slug"]
+            for model in ((source or {}).get("models") or [])
+            if isinstance(model, dict) and isinstance(model.get("slug"), str)
+        }
+        if template_slugs:
+            uncovered: dict[str, list[str]] = {}
+            for provider in providers:
+                if not provider.get("enabled"):
+                    continue
+                pid = str(provider.get("id") or "?")
+                prefix = str(provider.get("prefix") or "")
+                for model in provider.get("models") or []:
+                    if not model.get("enabled"):
+                        continue
+                    model_id = str(model.get("id") or "")
+                    override = str(model.get("publish_as") or "").strip()
+                    key = (
+                        override[len(prefix):]
+                        if override and prefix and override.startswith(prefix)
+                        else model_id
+                    )
+                    if key in template_slugs or model_id in template_slugs:
+                        continue
+                    uncovered.setdefault(key, []).append(pid)
+            for key, owners in uncovered.items():
+                add(
+                    "info",
+                    "、".join(sorted(set(owners))[:4]) + ("…" if len(set(owners)) > 4 else ""),
+                    f"能力模板里没有「{key}」：Codex 会套用默认 GPT 模板，"
+                    "推理档位/上下文可能和官方不一致。把它映射到模板里已有的名字，"
+                    "或在 tango-relay-model-catalog.json 里补一份该名字的模板",
+                    key,
+                )
     return findings
 
 

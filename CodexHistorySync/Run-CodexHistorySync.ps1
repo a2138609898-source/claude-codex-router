@@ -1,4 +1,4 @@
-param(
+﻿param(
     [switch]$NoGui,
     [switch]$AuditOnly,
     [switch]$WaitForExisting,
@@ -9,13 +9,6 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-try { [Console]::OutputEncoding = [Text.Encoding]::UTF8; $OutputEncoding = [Text.Encoding]::UTF8 } catch { }
-$env:PYTHONIOENCODING = 'utf-8'
-$installDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$scriptPath = Join-Path $installDir 'sync_codex_histories_three_way.py'
-$profileSwitcherPath = Join-Path $installDir 'Switch-CodexProfile.ps1'
-$sotaSwitcherPath = Join-Path $installDir 'Switch-CodexSota.ps1'
-$activeProfilePath = Join-Path $installDir 'active-profile.json'
 function Resolve-ConfiguredRoot {
     param([string]$EnvironmentName, [string]$DefaultName)
     $configured = [Environment]::GetEnvironmentVariable($EnvironmentName)
@@ -24,6 +17,13 @@ function Resolve-ConfiguredRoot {
     }
     return [System.IO.Path]::GetFullPath((Join-Path $env:USERPROFILE $DefaultName))
 }
+try { [Console]::OutputEncoding = [Text.Encoding]::UTF8; $OutputEncoding = [Text.Encoding]::UTF8 } catch { }
+$env:PYTHONIOENCODING = 'utf-8'
+$installDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$scriptPath = Join-Path $installDir 'sync_codex_histories_three_way.py'
+$profileSwitcherPath = Join-Path $installDir 'Switch-CodexProfile.ps1'
+$sotaSwitcherPath = Join-Path $installDir 'Switch-CodexSota.ps1'
+$activeProfilePath = Join-Path $installDir 'active-profile.json'
 $profileRoots = @{
     Plus = Resolve-ConfiguredRoot 'CODEX_SOTA_PLUS_ROOT' '.codex-plus'
     Cockpit = Resolve-ConfiguredRoot 'CODEX_SOTA_COCKPIT_ROOT' '.codex-personal'
@@ -52,6 +52,7 @@ if (Test-Path -LiteralPath $messagesPath) {
 
 $pythonCandidates = @(
     [Environment]::GetEnvironmentVariable('CODEX_SOTA_PYTHON'),
+    (Join-Path (Split-Path -Parent (Split-Path -Parent $PSScriptRoot)) 'codex-sota-runtime.exe'),
     [Environment]::GetEnvironmentVariable('CODEX_PYTHON'),
     (Join-Path $env:USERPROFILE '.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe')
 )
@@ -165,14 +166,15 @@ function Stop-CodexApp {
         return $false
     }
 
-    $mainProcesses = @($processes | Where-Object { $_.MainWindowHandle -ne 0 })
-    if ($mainProcesses.Count -eq 0) {
-        $mainProcesses = @($processes | Select-Object -First 1)
-    }
-
-    $taskkill = Join-Path $env:SystemRoot 'System32\taskkill.exe'
-    foreach ($process in $mainProcesses) {
-        & $taskkill /PID $process.Id /T | Out-Null
+    foreach ($process in $processes | Where-Object { $_.MainWindowHandle -ne 0 }) {
+        $expectedPath = $process.Path
+        $expectedBirth = $process.StartTime.ToUniversalTime().ToFileTimeUtc()
+        $fresh = Get-Process -Id $process.Id -ErrorAction Stop
+        if (-not [string]::Equals($fresh.Path, $expectedPath, [StringComparison]::OrdinalIgnoreCase) -or
+            $fresh.StartTime.ToUniversalTime().ToFileTimeUtc() -ne $expectedBirth) {
+            throw 'Codex process identity changed before shutdown. No recycled process was closed.'
+        }
+        $null = $fresh.CloseMainWindow()
     }
 
     $deadline = [DateTime]::UtcNow.AddSeconds(8)
@@ -184,25 +186,57 @@ function Stop-CodexApp {
         Start-Sleep -Milliseconds 200
     } while ([DateTime]::UtcNow -lt $deadline)
 
-    foreach ($process in $remaining) {
-        & $taskkill /PID $process.Id /T /F | Out-Null
+    throw 'Codex has not finished closing. It was not force-terminated. Finish or cancel active work, close its window, then retry history sync.'
+}
+
+function Set-RestartLaunchRequest {
+    param([string]$RequestId)
+    $work = Join-Path $installDir 'work'
+    $requests = Join-Path $work 'codex-launch-requests'
+    [IO.Directory]::CreateDirectory($requests) | Out-Null
+    $path = Join-Path $requests ('restart-' + $RequestId + '-' + $PID + '.json')
+    $guard = [IO.File]::Open((Join-Path $work 'codex-launch-requests.lock'),
+        [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::ReadWrite)
+    $held = $false
+    $temporary = $path + '.new-' + $PID
+    try {
+        $clock = [Diagnostics.Stopwatch]::StartNew()
+        do {
+            try { $guard.Lock(0, 1); $held = $true }
+            catch [IO.IOException] {
+                if ($clock.Elapsed.TotalSeconds -ge 1) { throw 'Could not publish the Codex restart request.' }
+                Start-Sleep -Milliseconds 100
+            }
+        } while (-not $held)
+        $payload = @{
+            request_id = $RequestId; request_source = 'restart-runner'; launcher_pid = $PID
+            launcher_creation_ticks = (Get-Process -Id $PID -ErrorAction Stop).StartTime.ToUniversalTime().ToFileTimeUtc().ToString()
+            expires_at = ([DateTime]::UtcNow.AddMinutes(30) - [DateTime]'1970-01-01Z').TotalSeconds
+        } | ConvertTo-Json -Compress
+        [IO.File]::WriteAllText($temporary, $payload, [Text.UTF8Encoding]::new($false))
+        Move-Item -LiteralPath $temporary -Destination $path -Force
     }
-    $forceDeadline = [DateTime]::UtcNow.AddSeconds(8)
-    do {
-        Start-Sleep -Milliseconds 250
-        $remaining = @(Get-OwnedCodexAppProcesses)
-        if ($remaining.Count -eq 0) {
-            return $true
-        }
-    } while ([DateTime]::UtcNow -lt $forceDeadline)
-    throw 'OpenAI.Codex ChatGPT.exe processes remained after shutdown.'
+    finally {
+        Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue
+        if ($held) { $guard.Unlock(0, 1) }
+        $guard.Dispose()
+    }
+}
+
+function Clear-RestartLaunchRequest {
+    param([string]$RequestId)
+    # This filename is private to this runner PID and one immutable request.
+    $path = Join-Path $installDir ('work\codex-launch-requests\restart-' + $RequestId + '-' + $PID + '.json')
+    Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
 }
 
 function Start-CodexApp {
     param(
         [string]$ExecutablePath,
         [ValidateSet('Plus', 'Cockpit', 'Sota', 'None')]
-        [string]$Profile
+        [string]$Profile,
+        [ValidateRange(1, 30)][int]$MaxAttempts = 5,
+        [ValidateRange(0, 60000)][int]$RetryDelayMilliseconds = 1000
     )
 
     if (-not $ExecutablePath -or -not (Test-Path -LiteralPath $ExecutablePath)) {
@@ -216,13 +250,15 @@ function Start-CodexApp {
     if (-not (Test-Path -LiteralPath $powershell)) {
         throw 'Windows PowerShell was not found for the isolated Codex restart.'
     }
+    $requestId = [guid]::NewGuid().ToString('N')
     if ($Profile -eq 'Sota') {
         if (-not (Test-Path -LiteralPath $sotaSwitcherPath)) {
             throw "SOTA profile switcher was not found: $sotaSwitcherPath"
         }
         $arguments = @(
             '-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass',
-            '-File', $sotaSwitcherPath, '-SkipSync', '-NoGui'
+            '-File', $sotaSwitcherPath, '-SkipSync', '-NoGui',
+            '-LaunchRequestId', $requestId
         )
     }
     else {
@@ -231,22 +267,42 @@ function Start-CodexApp {
         }
         $arguments = @(
             '-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass',
-            '-File', $profileSwitcherPath, '-Profile', $Profile, '-SkipSync', '-NoGui'
+            '-File', $profileSwitcherPath, '-Profile', $Profile, '-SkipSync', '-NoGui',
+            '-LaunchRequestId', $requestId
         )
     }
-    $previous = $ErrorActionPreference
-    $ErrorActionPreference = 'Continue'
+    Set-RestartLaunchRequest -RequestId $requestId
     try {
-        $output = @(& $powershell @arguments 2>&1)
-        $exitCode = $LASTEXITCODE
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        $previous = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            $output = @(& $powershell @arguments 2>&1)
+            $exitCode = $LASTEXITCODE
+        }
+        finally { $ErrorActionPreference = $previous }
+        $launchResult = $null
+        foreach ($line in $output) {
+            try {
+                $parsed = ([string]$line | ConvertFrom-Json -ErrorAction Stop)
+                if ($parsed.status) { $launchResult = $parsed }
+            } catch { }
+        }
+        if ($launchResult -and $launchResult.status -eq 'deferred' -and $exitCode -in @(0, 75)) {
+            if ($attempt -eq $MaxAttempts) {
+                throw "The $Profile restart is still deferred after $MaxAttempts attempts ($($launchResult.phase)). Codex was not confirmed reopened; retry once synchronization has finished."
+            }
+            Start-Sleep -Milliseconds $RetryDelayMilliseconds
+            continue
+        }
+        if ($exitCode -ne 0 -or -not $launchResult -or $launchResult.status -ne 'ready') {
+            $detail = @($output | ForEach-Object { $_.ToString() }) -join [Environment]::NewLine
+            throw "The $Profile profile switcher did not confirm restart (exit code $exitCode).`n$detail"
+        }
+        return
     }
-    finally {
-        $ErrorActionPreference = $previous
     }
-    if ($exitCode -ne 0) {
-        $detail = @($output | ForEach-Object { $_.ToString() }) -join [Environment]::NewLine
-        throw "The $Profile profile switcher failed with exit code $exitCode.`n$detail"
-    }
+    finally { Clear-RestartLaunchRequest -RequestId $requestId }
 }
 
 function Resolve-RestartProfile {
@@ -288,6 +344,7 @@ function Resolve-RestartProfile {
 
 $appExecutablePath = $null
 $restartAppWhenDone = $false
+$syncSafeToRestart = $false
 $resolvedRestartProfile = 'None'
 $scriptExitCode = 0
 
@@ -298,7 +355,27 @@ try {
     if (-not (Test-Path -LiteralPath $scriptPath)) {
         throw "Sync core file is missing: $scriptPath"
     }
-    if (-not $NoGui -and -not $AuditOnly) {
+    if (-not (Test-Path -LiteralPath (Join-Path $profileRoots.Cockpit 'state_5.sqlite')) -or
+        -not (Test-Path -LiteralPath (Join-Path $profileRoots.Plus 'state_5.sqlite'))) {
+        # Detect a standalone installation before considering any app shutdown.
+        # The CLI owns availability semantics and does not create missing stores.
+        $availability = @(& $python $scriptPath --json --audit-only 2>&1)
+        $availabilityResult = $null
+        foreach ($line in $availability) {
+            try {
+                $parsed = ([string]$line | ConvertFrom-Json -ErrorAction Stop)
+                if ($parsed.status) { $availabilityResult = $parsed }
+            } catch { }
+        }
+        if ($availabilityResult -and $availabilityResult.status -eq 'skipped' -and
+            $availabilityResult.reason -eq 'optional_profiles_absent') {
+            $availabilityResult.mode = if ($AuditOnly) { 'three-way-audit' } else { 'three-way' }
+            if ($NoGui) { Write-Output ($availabilityResult | ConvertTo-Json -Depth 8 -Compress) }
+            else { Show-SyncMessage -Message ([string]$availabilityResult.message) -Title 'Cross-profile history sync inactive' -Icon 'Information' }
+            exit 0
+        }
+    }
+    if (-not $NoGui -and -not $AuditOnly -and -not $DeferIfAppRunning) {
         $resolvedRestartProfile = Resolve-RestartProfile -RequestedProfile $RestartProfile
         $appExecutablePath = Get-CodexAppExecutable
         if (-not $appExecutablePath) {
@@ -343,6 +420,15 @@ try {
         else { Show-SyncMessage -Message 'History sync is deferred until Codex is safely closed and other synchronization has finished.' -Title 'Codex history sync deferred' -Icon 'Information' }
         exit 0
     }
+
+    if ($result -and $result.status -eq 'skipped' -and $result.reason -eq 'optional_profiles_absent') {
+        $syncSafeToRestart = $true
+        if ($NoGui) { Write-Output ($result | ConvertTo-Json -Depth 8 -Compress) }
+        else { Show-SyncMessage -Message ([string]$result.message) -Title 'Cross-profile history sync inactive' -Icon 'Information' }
+        exit 0
+    }
+
+    $syncSafeToRestart = $result -and ($result.status -eq 'ok' -or $result.recovery_status -in @('restored', 'not_needed'))
 
     if ($exitCode -ne 0 -or -not $result -or $result.status -ne 'ok') {
         $detail = if ($result -and $result.error) {
@@ -477,7 +563,7 @@ catch {
     }
 }
 finally {
-    if ($restartAppWhenDone) {
+    if ($restartAppWhenDone -and $syncSafeToRestart) {
         try {
             Start-CodexApp -ExecutablePath $appExecutablePath -Profile $resolvedRestartProfile
         }
@@ -485,6 +571,9 @@ finally {
             $scriptExitCode = 1
             Show-SyncMessage -Message "Codex App could not be reopened.`n`n$($_.Exception.Message)" -Title 'Codex restart failed' -Icon 'Error'
         }
+    }
+    elseif ($restartAppWhenDone) {
+        Show-SyncMessage -Message 'Codex was left closed because synchronization did not confirm a safe completed or restored state. Review the sync result before reopening it.' -Title 'Codex restart deferred' -Icon 'Warning'
     }
 }
 

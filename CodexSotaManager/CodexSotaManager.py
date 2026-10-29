@@ -20,8 +20,13 @@ import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from typing import Any, Callable, Mapping
+from uuid import uuid4
 import unicodedata
 import urllib.request
+
+
+# Local health checks must never inherit an upstream HTTP proxy setting.
+LOCAL_HEALTH_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
 def _expanded_path(value: str) -> Path:
@@ -165,9 +170,7 @@ def codex_sota_invocation(command: Path) -> tuple[list[str], Path]:
 
 
 CORE_ROOT = resolve_core_root()
-# Keep the registry and every helper script on the same installation root.  This is especially
-# important for PyInstaller builds, where the source module is bundled but PowerShell helpers are
-# unpacked as data files under the resolved application directory.
+# All subprocess helpers must resolve the same deployment as this manager.
 os.environ.setdefault("CODEX_SOTA_CORE_ROOT", str(CORE_ROOT))
 if str(CORE_ROOT) not in sys.path:
     sys.path.insert(0, str(CORE_ROOT))
@@ -176,19 +179,26 @@ from codex_app_lifecycle import detect_codex_app_processes, inspect_codex_app_pr
 from codex_launch_controller import LaunchAttempt, PHASE_LABELS  # noqa: E402
 
 from claude_desktop import (  # noqa: E402
+    CLAUDE_1M_CONTEXT_MODELS as claude_1m_context_models,
     CLAUDE_3P_ROOT,
+    CLAUDE_THINKING_MODELS as claude_thinking_models,
     SOTA_ENTRY_ID as CLAUDE_ENTRY_ID,
     SOTA_ENTRY_NAME as CLAUDE_ENTRY_NAME,
     apply_entry as apply_claude_entry,
     build_inference_models,
     canonical_model_id as claude_canonical_model_id,
     claim_slot as claim_claude_slot,
+    claude_desktop_pids,
+    confirm_slot_claim as confirm_claude_slot_claim,
     ensure_deployment_mode,
+    image_process_pids,
     library_status as claude_library_status,
     migrate_legacy_entry,
+    model_supports_1m_context as claude_model_supports_1m_context,
     reconcile_slot as reconcile_claude_slot,
     release_slot as release_claude_slot,
     slot_state as claude_slot_state,
+    slot_claim_token,
     supports_1m_context as claude_supports_1m_context,
     thinking_effort_levels as claude_thinking_effort_levels,
     thinking_summary as claude_thinking_summary,
@@ -196,10 +206,13 @@ from claude_desktop import (  # noqa: E402
 )
 from codex_sota_router import ROUTER_VERSION  # noqa: E402
 from sota_registry import (  # noqa: E402
+    _restore as restore_config_snapshot,
+    _snapshot as snapshot_config_files,
     AUTH_PATH,
     CLAUDE,
     CODEX,
     MESSAGES_PREFIX_SUFFIX,
+    PUBLISH_AS_PATTERN,
     PROTECTED_PINNED_PROVIDER_KEYS,
     uses_responses_to_anthropic_messages,
     WORKSPACES,
@@ -208,6 +221,7 @@ from sota_registry import (  # noqa: E402
     allows_legacy_bare_model,
     apply_provider,
     audit_registry,
+    auto_repair_chat_path,
     auto_repair_messages_path,
     auto_repair_responses_path,
     delete_provider,
@@ -222,6 +236,7 @@ from sota_registry import (  # noqa: E402
     measure_latency,
     pin_protected_provider_identity,
     probe_fast_tier,
+    probe_protocol,
     published_slug,
     rebuild_catalog,
     redacted_registry,
@@ -297,6 +312,125 @@ def slugify(value: str) -> str:
     return text[:40]
 
 
+def model_catalog_template_slugs(source_path: Path) -> list[str]:
+    """Read actual local Codex catalog template names without changing the catalog."""
+    try:
+        source = json.loads(Path(source_path).read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return []
+    models = source.get("models") if isinstance(source, dict) else None
+    if not isinstance(models, list):
+        return []
+    return list(
+        dict.fromkeys(
+            model["slug"]
+            for model in models
+            if isinstance(model, dict)
+            and isinstance(model.get("slug"), str)
+            and PUBLISH_AS_PATTERN.fullmatch(model["slug"])
+        )
+    )
+
+
+def model_mapping_suggestions(
+    workspace_name: str,
+    prefix: str,
+    model_id: str,
+    *,
+    codex_template_slugs: list[str] | None = None,
+    known_model_ids: list[str] | None = None,
+) -> list[str]:
+    """Build mapping hints from the imported model and the workspace's own registry.
+
+    `known_model_ids` is every enabled model id the registry already carries.  It has to be
+    part of the list: the Codex App's capability *templates* are keyed on a handful of names,
+    but the names a user can meaningfully map onto are whatever the vendors actually serve,
+    and a hardcoded list is how a live model (`gpt-6-sol`, `gpt-6-luna`) stayed unselectable
+    in this dialog while the catalog routed it perfectly well.
+
+    Order is deliberate and is what the dialog defaults to: the vendor's own id first (the
+    honest name), then the capability templates (the names that carry real reasoning-level
+    metadata), then everything else the registry knows, then a small seed so a brand-new
+    workspace is not an empty dropdown.
+    """
+    if workspace_name == "claude":
+        # Curated names first -- these are the ones known to sit in the app's own capability
+        # table.  Everything after them is *derived*, so the dropdown grows when the capability
+        # tables grow instead of needing another hand-edit here: the tables' own keys, then
+        # every Claude-shaped id this workspace's registry already carries.
+        #
+        # That derived half is what the dialog exists for.  A vendor serving `glm-5.3` or
+        # `deepseek-v4-flash` produces an empty `discovered` -- its id is not Claude-shaped --
+        # so before this the entire dropdown was the fixed list below, and a newly released
+        # official model simply could not be chosen without editing this file.
+        suffixes = tuple(
+            dict.fromkeys(
+                [
+                    "claude-opus-5-5",
+                    "claude-opus-5",
+                    "claude-opus-4-8",
+                    "claude-fable-5-1",
+                    "claude-fable-5",
+                    "claude-mythos-5",
+                    "claude-opus-4-7",
+                    "claude-opus-4-6",
+                    "claude-sonnet-5-5",
+                    "claude-sonnet-5",
+                    "claude-sonnet-4-6",
+                    "claude-sonnet-4-5",
+                    "claude-haiku-4-5",
+                    *sorted(claude_thinking_models),
+                    *sorted(claude_1m_context_models),
+                    *sorted(
+                        {
+                            shaped
+                            for shaped in (
+                                claude_canonical_model_id(str(known))
+                                for known in (known_model_ids or [])
+                            )
+                            if shaped.startswith("claude-")
+                        }
+                    ),
+                ]
+            )
+        )
+        model_name = model_id.rsplit("/", 1)[-1]
+        canonical = claude_canonical_model_id(model_name)
+        discovered = [prefix + canonical] if canonical.startswith("claude-") else []
+    else:
+        suffixes = tuple(
+            dict.fromkeys(
+                [
+                    *(codex_template_slugs or []),
+                    *(known_model_ids or []),
+                    "gpt-5.6-sol",
+                    "gpt-5.6-terra",
+                    "gpt-5.6-luna",
+                    "gpt-6-astra",
+                    "gpt-6-sol",
+                    "gpt-6-luna",
+                    "gpt-5.5",
+                    "gpt-5.4",
+                    "gpt-5.4-mini",
+                ]
+            )
+        )
+        discovered_suffix = model_id
+        if not PUBLISH_AS_PATTERN.fullmatch(discovered_suffix):
+            discovered_suffix = re.sub(
+                r"[^A-Za-z0-9._:@-]+", "-", model_id
+            ).strip("-.:@")
+        discovered = [prefix + discovered_suffix] if discovered_suffix else []
+    candidates = [*discovered, *(prefix + suffix for suffix in suffixes)]
+    return list(
+        dict.fromkeys(
+            candidate
+            for candidate in candidates
+            if len(candidate) <= 160 and PUBLISH_AS_PATTERN.fullmatch(candidate)
+        )
+    )
+
+
 def draft_protocols(responses: bool, messages: bool, workspace: Any) -> list[str]:
     """The protocols an editor's two checkboxes select, in registry order.
 
@@ -322,7 +456,7 @@ API_KEY_REJECT = re.compile(r"Get-Clipboard|codex-sota|--with-api-key|[|\r\n]", 
 
 
 def sota_auth_problem() -> str | None:
-    """Mirror Test-ExistingSotaAuth so the GUI never triggers a hidden login prompt."""
+    """Check the local client login before handing control to the launcher."""
     if not AUTH_PATH.exists():
         return f"未找到 {AUTH_PATH}"
     try:
@@ -359,11 +493,13 @@ FORM_OWNED_PROVIDER_KEYS = (
     "enabled",
     "allow_failover",
     "protocols",
+    "request_adapter",
     "auth_header",
     "auth_prefix",
     "models_path",
     "responses_path",
     "messages_path",
+    "chat_path",
     "timeout_seconds",
     "extra_headers",
     "models",
@@ -442,6 +578,7 @@ def merge_restored_registry(
     }
     restored: list[dict[str, Any]] = []
     report: dict[str, Any] = {
+        "registry_digest": registry_digest(current),
         "added": [],
         "removed": [],
         "protected_removed": [],
@@ -449,6 +586,7 @@ def merge_restored_registry(
         "needs_key": [],
         "kept_headers": [],
         "foreign_workspace": [],
+        "independent_key_required": [],
     }
     for provider in incoming.get("providers") or []:
         provider = deepcopy(provider)
@@ -472,8 +610,32 @@ def merge_restored_registry(
             report["protected_identity_pinned"].extend(
                 f"{provider_id}.{field}" for field in pinned
             )
+        elif previous.get("auth_type") == "codex_auth":
+            # Even an older entry without the protected marker is an existing
+            # borrowed identity. A restore must not retarget its shared login.
+            for field in PROTECTED_PINNED_PROVIDER_KEYS:
+                if provider.get(field) != previous.get(field) or (
+                    (field in provider) != (field in previous)
+                ):
+                    report["protected_identity_pinned"].append(f"{provider_id}.{field}")
+                if field in previous:
+                    provider[field] = deepcopy(previous[field])
+                else:
+                    provider.pop(field, None)
         elif "entropy" not in provider and "entropy" in previous:
             provider["entropy"] = previous["entropy"]
+        if provider.get("auth_type") == "codex_auth" and (
+            previous is None or previous.get("auth_type") != "codex_auth"
+        ):
+            # A backup cannot grant a new endpoint access to OPENAI_API_KEY.
+            # Allocate an unused, independent key slot; never trust an imported
+            # secret_file (or accidentally reuse a same-id orphaned key).
+            key_identity = uuid4().hex
+            provider["auth_type"] = "dpapi"
+            provider["protected"] = False
+            provider["secret_file"] = f"{provider_id}-import-{key_identity}.dpapi"
+            provider["entropy"] = f"CodexSota.Import.{key_identity}.v1"
+            report["independent_key_required"].append(provider_id)
         headers = provider.get("extra_headers")
         old_headers = (previous or {}).get("extra_headers") or {}
         if isinstance(headers, dict):
@@ -507,6 +669,40 @@ def merge_restored_registry(
             report["needs_key"].append(str(provider.get("id") or ""))
     candidate = {"version": incoming.get("version"), "providers": restored}
     return candidate, report
+
+
+def restore_registry_transaction(
+    candidate: dict[str, Any], workspace: Any, *, expected_registry_digest: str | None = None,
+) -> dict[str, Any]:
+    """Restore the registry and its derived catalog together, retaining a recovery copy."""
+    with registry_write_lock(workspace=workspace):
+        if expected_registry_digest is not None:
+            current = load_registry(workspace.registry_path, allow_missing_secrets=True)
+            if registry_digest(current) != expected_registry_digest:
+                raise RuntimeError("配置在预览后发生变化，恢复已取消；请重新打开备份并确认。")
+        paths = [workspace.registry_path, workspace.catalog_path]
+        snapshot = snapshot_config_files(paths)
+        target = workspace.root / "backups" / (
+            "pre-restore-" + time.strftime("%Y%m%d-%H%M%S") + "-" + uuid4().hex[:12]
+        )
+        target.mkdir(parents=True, exist_ok=False)
+        saved = []
+        for path in paths:
+            if snapshot[path] is not None:
+                shutil.copy2(path, target / path.name)
+                saved.append(path.name)
+        try:
+            write_registry(candidate, workspace.registry_path, allow_missing_secrets=True)
+            catalog = rebuild_catalog(workspace)
+        except Exception as error:
+            try:
+                restore_config_snapshot(snapshot)
+            except Exception as recovery_error:
+                raise RuntimeError(
+                    f"恢复配置失败，且回滚未完成；原文件仍备份在 {target}：{recovery_error}"
+                ) from error
+            raise
+    return {"backup": target, "saved": saved, "catalog": catalog}
 
 
 def percentile(values: list[float], fraction: float) -> float:
@@ -729,29 +925,16 @@ def start_claude_process(target: Mapping[str, str]) -> dict[str, Any]:
     (check_explorer_launch_exitcode.py): activating a valid AppsFolder target returns exit
     code 1 even though the app starts, and a nonexistent AUMID also returns 1.  The exit code
     therefore carries no information, and treating non-zero as failure rejected every working
-    launch.  Whether a Claude window appears is the only authoritative signal, so it is kept
-    here purely as a diagnostic hint for the "no window appeared" message.
+    launch. Whether a verified Claude Desktop owns a visible window is the
+    authoritative signal; dispatch returns before any shell exit code is known.
 
-    The direct-exe kinds must not go through capture_output: Claude Desktop holds its stdout
-    pipe open for its whole lifetime, so the reader would block until the timeout expires.
+    All entry kinds are detached and have no captured pipes. The shell dispatcher
+    can pass inherited output handles to a long-lived child; on Windows even
+    subprocess.run's timeout then blocks while communicate() drains those pipes.
+    Window discovery below supervises the actual Desktop, not the dispatcher's life.
     """
     command, command_cwd = claude_launch_command(target)
     cwd = str(command_cwd) if command_cwd else None
-    if target.get("kind") == "aumid":
-        completed = subprocess.run(
-            command,
-            cwd=cwd,
-            capture_output=True,
-            text=True,
-            errors="replace",
-            timeout=60,
-            check=False,
-        )
-        return {
-            "command": command,
-            "returncode": completed.returncode,
-            "detail": first_meaningful_line(completed.stderr, completed.stdout),
-        }
     creationflags = 0
     if os.name == "nt":
         creationflags = getattr(subprocess, "DETACHED_PROCESS", 0x00000008) | getattr(
@@ -781,7 +964,9 @@ def resolve_helper_python() -> Path | None:
     override = str(os.environ.get("CODEX_SOTA_PYTHON") or os.environ.get("CODEX_PYTHON") or "").strip()
     if override:
         candidates.append(_expanded_path(override))
-    if not getattr(sys, "frozen", False):
+    if getattr(sys, "frozen", False):
+        candidates.append(Path(sys.executable).with_name("codex-sota-runtime.exe"))
+    else:
         # pythonw keeps the watcher from flashing a console window on the user's desktop.
         interpreter = Path(sys.executable)
         candidates.extend([interpreter.with_name("pythonw.exe"), interpreter])
@@ -797,10 +982,12 @@ def resolve_helper_python() -> Path | None:
         if candidate.is_file():
             return candidate
     found = shutil.which("pythonw.exe") or shutil.which("python.exe")
-    return Path(found) if found else None
+    if found and not any(part.lower() == "windowsapps" for part in Path(found).parts):
+        return Path(found)
+    return None
 
 
-def arm_claude_slot_release() -> dict[str, Any]:
+def arm_claude_slot_release(claim_id: str | None = None) -> dict[str, Any]:
     """Start the detached watcher that returns the shared config slot when Claude exits.
 
     Deliberately best-effort: a Claude that is already up must not be reported as a failed
@@ -817,8 +1004,11 @@ def arm_claude_slot_release() -> dict[str, Any]:
     if os.name == "nt":
         creationflags |= getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
     try:
+        command = [str(interpreter), str(script)]
+        if claim_id:
+            command.extend(["--claim-id", claim_id])
         process = subprocess.Popen(  # noqa: S603 - fixed script path, no user input
-            [str(interpreter), str(script)],
+            command,
             cwd=str(CORE_ROOT),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
@@ -836,31 +1026,14 @@ def arm_claude_slot_release() -> dict[str, Any]:
 def image_pids(image_name: str) -> set[int]:
     """Return PIDs for an image, failing closed when Windows cannot answer.
 
-    An empty set means tasklist completed successfully and found no matching process.
+    An empty set means the native snapshot completed and found no matching process.
     Query failures must stay visible to callers: treating them as an empty set could make
     the launcher start a second Claude/Codex instance over a still-running one.
     """
-    tasklist = os.path.join(
-        os.environ.get("SystemRoot", r"C:\Windows"), "System32", "tasklist.exe"
-    )
     try:
-        completed = subprocess.run(
-            [tasklist, "/FI", f"IMAGENAME eq {image_name}", "/FO", "CSV", "/NH"],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            timeout=20,
-        )
-    except (OSError, subprocess.SubprocessError) as error:
+        return image_process_pids(image_name)
+    except OSError as error:
         raise RuntimeError(f"无法查询 {image_name} 进程状态：{error}") from error
-    if completed.returncode != 0:
-        detail = (completed.stderr or completed.stdout or "unknown error").strip()
-        raise RuntimeError(
-            f"tasklist 查询 {image_name} 进程失败（退出码 {completed.returncode}）：{detail}"
-        )
-    return {int(match) for match in re.findall(r'^"[^"]*","(\d+)"', completed.stdout, re.MULTILINE)}
 
 
 def pids_own_visible_window(pids: set[int]) -> bool:
@@ -870,20 +1043,39 @@ def pids_own_visible_window(pids: set[int]) -> bool:
     import ctypes
     from ctypes import wintypes
 
-    user32 = ctypes.windll.user32
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
     found = False
+    query_error = None
+    callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    user32.EnumWindows.argtypes = [callback_type, wintypes.LPARAM]
+    user32.EnumWindows.restype = wintypes.BOOL
+    user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+    user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+    user32.IsWindowVisible.argtypes = [wintypes.HWND]
+    user32.IsWindowVisible.restype = wintypes.BOOL
 
-    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    @callback_type
     def visit(hwnd: int, _: int) -> bool:
-        nonlocal found
+        nonlocal found, query_error
         owner = wintypes.DWORD()
-        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner))
+        if not user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner)):
+            # A window may disappear while it is enumerated. An invalid HWND is
+            # absent; other errors leave ownership unknown and fail closed.
+            error = ctypes.get_last_error()
+            if error == 1400:  # ERROR_INVALID_WINDOW_HANDLE
+                return True
+            query_error = OSError(error, "Cannot establish visible window ownership")
+            return False
         if owner.value in pids and user32.IsWindowVisible(hwnd):
             found = True
             return False
         return True
 
-    user32.EnumWindows(visit, 0)
+    enumerated = user32.EnumWindows(visit, 0)
+    if query_error is not None:
+        raise query_error
+    if not enumerated and not found:
+        raise OSError(ctypes.get_last_error(), "Cannot enumerate visible windows")
     return found
 
 
@@ -894,19 +1086,44 @@ def close_visible_process_windows(pids: set[int]) -> set[int]:
     import ctypes
     from ctypes import wintypes
 
-    user32 = ctypes.windll.user32
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
     signalled: set[int] = set()
+    query_error = None
+    callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    user32.EnumWindows.argtypes = [callback_type, wintypes.LPARAM]
+    user32.EnumWindows.restype = wintypes.BOOL
+    user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+    user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+    user32.IsWindowVisible.argtypes = [wintypes.HWND]
+    user32.IsWindowVisible.restype = wintypes.BOOL
+    user32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+    user32.PostMessageW.restype = wintypes.BOOL
 
-    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    @callback_type
     def visit(hwnd: int, _: int) -> bool:
+        nonlocal query_error
         owner = wintypes.DWORD()
-        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner))
+        if not user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner)):
+            error = ctypes.get_last_error()
+            if error == 1400:
+                return True
+            query_error = OSError(error, "Cannot establish window ownership before closing")
+            return False
         if owner.value in pids and user32.IsWindowVisible(hwnd):
-            if user32.PostMessageW(hwnd, 0x0010, 0, 0):  # WM_CLOSE
-                signalled.add(owner.value)
+            if not user32.PostMessageW(hwnd, 0x0010, 0, 0):  # WM_CLOSE
+                error = ctypes.get_last_error()
+                if error == 1400:
+                    return True
+                query_error = OSError(error, "Cannot request Claude window close")
+                return False
+            signalled.add(owner.value)
         return True
 
-    user32.EnumWindows(visit, 0)
+    enumerated = user32.EnumWindows(visit, 0)
+    if query_error is not None:
+        raise query_error
+    if not enumerated:
+        raise OSError(ctypes.get_last_error(), "Cannot enumerate windows before closing Claude")
     return signalled
 
 
@@ -923,7 +1140,7 @@ def chatgpt_window_present() -> bool:
 
 
 def claude_pids() -> set[int]:
-    return image_pids("claude.exe")
+    return claude_desktop_pids(candidate_pids=image_pids("claude.exe"))
 
 
 def claude_window_present() -> bool:
@@ -958,17 +1175,14 @@ def auto_repair_active_inference_path(
     provider: dict[str, Any], temporary_key: str | None = None
 ) -> dict[str, Any]:
     """Repair the endpoint for the protocol this provider's workspace actually probes."""
-    protocols = provider.get("protocols") or ["responses"]
-    use_messages = (
-        uses_responses_to_anthropic_messages(provider)
-        or (provider.get("workspace") == CLAUDE.name and "messages" in protocols)
-    )
-    repair = (
-        auto_repair_messages_path(provider, temporary_key)
-        if use_messages
-        else auto_repair_responses_path(provider, temporary_key)
-    )
-    repair["protocol"] = "messages" if use_messages else "responses"
+    protocol = probe_protocol(provider)
+    repairer = {
+        "chat": auto_repair_chat_path,
+        "messages": auto_repair_messages_path,
+        "responses": auto_repair_responses_path,
+    }[protocol]
+    repair = repairer(provider, temporary_key)
+    repair["protocol"] = protocol
     return repair
 
 
@@ -1068,19 +1282,37 @@ class ModelMappingDialog(tk.Toplevel):
         suggestions: list[str],
         *,
         workspace_name: str = "claude",
+        supports_1m_context: bool = False,
+        codex_template_slugs: list[str] | None = None,
+        context_window_tokens: int | None = None,
+        max_output_tokens: int | None = None,
         conflict_check: Callable[[str], list[str]] | None = None,
     ):
         super().__init__(parent)
         self.title("模型映射（Claude）" if workspace_name == "claude" else "模型映射（Codex）")
-        self.geometry("560x340")
-        self.minsize(520, 310)
+        self.geometry("560x500" if workspace_name != "claude" else "560x380")
+        self.minsize(520, 460 if workspace_name != "claude" else 340)
         self.configure(bg=SURFACE)
         self.transient(parent)
         self.grab_set()
         self.result: str | None = None
         self.prefix = prefix
         self.workspace_name = workspace_name
+        self.codex_template_slugs = set(codex_template_slugs or [])
+        self.supports_1m_var = tk.BooleanVar(value=supports_1m_context)
         self.conflict_check = conflict_check
+        self.initial_context_window_tokens = (
+            context_window_tokens
+            if type(context_window_tokens) is int and context_window_tokens > 0
+            else None
+        )
+        self.initial_max_output_tokens = (
+            max_output_tokens
+            if type(max_output_tokens) is int and max_output_tokens > 0
+            else None
+        )
+        self.context_window_tokens = self.initial_context_window_tokens
+        self.max_output_tokens = self.initial_max_output_tokens
 
         prompt = (
             "在 Claude Desktop 里显示为（可下拉选一个 Claude 型号名，也可自己输入）："
@@ -1109,6 +1341,55 @@ class ModelMappingDialog(tk.Toplevel):
             text=f"命名空间前缀：{prefix or '（旧版默认档，无前缀）'}",
             style="Field.TLabel",
         ).grid(row=3, column=0, sticky="w", pady=(0, 10))
+        preview_row = 4
+        self.context_window_var = tk.StringVar(
+            value=(
+                str(self.initial_context_window_tokens)
+                if self.initial_context_window_tokens is not None
+                else ""
+            )
+        )
+        self.max_output_tokens_var = tk.StringVar(
+            value=(
+                str(self.initial_max_output_tokens)
+                if self.initial_max_output_tokens is not None
+                else ""
+            )
+        )
+        if workspace_name == "claude":
+            ttk.Checkbutton(
+                body,
+                text="允许 1M 上下文（已确认上游支持）",
+                variable=self.supports_1m_var,
+            ).grid(row=preview_row, column=0, sticky="w", pady=(0, 8))
+            preview_row += 1
+        else:
+            capabilities = ttk.Frame(body)
+            capabilities.grid(row=preview_row, column=0, sticky="ew", pady=(0, 8))
+            capabilities.columnconfigure(1, weight=1)
+            ttk.Label(
+                capabilities, text="上下文窗口（tokens）", style="Field.TLabel"
+            ).grid(row=0, column=0, sticky="w", padx=(0, 10))
+            ttk.Entry(
+                capabilities, textvariable=self.context_window_var, width=16
+            ).grid(row=0, column=1, sticky="ew")
+            ttk.Label(
+                capabilities, text="最大输出（tokens）", style="Field.TLabel"
+            ).grid(row=1, column=0, sticky="w", padx=(0, 10), pady=(6, 0))
+            ttk.Entry(
+                capabilities, textvariable=self.max_output_tokens_var, width=16
+            ).grid(row=1, column=1, sticky="ew", pady=(6, 0))
+            ttk.Label(
+                capabilities,
+                text=(
+                    "留空 = 用目录模板默认 / 不注入。上下文写进 Codex 模型目录；"
+                    "最大输出由本地路由器写入 Responses 请求，按上游真实上限填。"
+                ),
+                style="Field.TLabel",
+                wraplength=520,
+                justify="left",
+            ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
+            preview_row += 1
         self.preview_var = tk.StringVar(value="")
         ttk.Label(
             body,
@@ -1116,7 +1397,7 @@ class ModelMappingDialog(tk.Toplevel):
             style="Field.TLabel",
             wraplength=520,
             justify="left",
-        ).grid(row=4, column=0, sticky="w", pady=(0, 10))
+        ).grid(row=preview_row, column=0, sticky="w", pady=(0, 10))
         restart_note = (
             "改完要点「保存并应用」并重新启动 Claude Desktop 才会生效；"
             "同一个名字不能同时映射给两个模型。"
@@ -1130,9 +1411,9 @@ class ModelMappingDialog(tk.Toplevel):
             style="Field.TLabel",
             wraplength=520,
             justify="left",
-        ).grid(row=5, column=0, sticky="w")
+        ).grid(row=preview_row + 1, column=0, sticky="w")
         actions = ttk.Frame(body)
-        actions.grid(row=6, column=0, sticky="e", pady=(14, 0))
+        actions.grid(row=preview_row + 2, column=0, sticky="e", pady=(14, 0))
         ttk.Button(actions, text="清除映射", command=self._clear).pack(side="left", padx=(0, 8))
         ttk.Button(actions, text="取消", command=self.destroy).pack(side="left", padx=(0, 8))
         ttk.Button(actions, text="确定", style="Accent.TButton", command=self._accept).pack(
@@ -1142,6 +1423,7 @@ class ModelMappingDialog(tk.Toplevel):
         entry.focus_set()
         entry.icursor("end")
         self.alias_var.trace_add("write", lambda *_args: self._update_preview())
+        self.supports_1m_var.trace_add("write", lambda *_args: self._update_preview())
         self.bind("<Return>", lambda _event: self._accept())
         self.bind("<Escape>", lambda _event: self.destroy())
         self._update_preview()
@@ -1149,7 +1431,14 @@ class ModelMappingDialog(tk.Toplevel):
     def _update_preview(self) -> None:
         alias = self.alias_var.get().strip()
         if not alias:
-            self.preview_var.set("（无映射）按原名发布这个模型 ID。")
+            parts = ["（无映射）按原名发布这个模型 ID。"]
+            if self.workspace_name == "claude":
+                parts.append(
+                    "会附加 [1m] 长上下文入口"
+                    if self.supports_1m_var.get()
+                    else "不声明 1M 上下文"
+                )
+            self.preview_var.set("  ·  ".join(parts))
             return
         suffix = (
             alias[len(self.prefix):]
@@ -1158,29 +1447,71 @@ class ModelMappingDialog(tk.Toplevel):
         )
         if self.workspace_name != "claude":
             parts = [f"Codex 里显示为：{alias}"]
-            if suffix in ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"):
-                parts.append("使用完整 GPT 能力模板（含 ultra 推理档）")
+            if suffix in self.codex_template_slugs:
+                parts.append(f"使用本地目录中的 {suffix} 能力模板")
             else:
-                parts.append("⚠ 目录里没有这个名字的模板，会套用默认 GPT 模板")
+                parts.append("⚠ 本地目录没有此模板；运行时会回退默认模板，模型能力可能不匹配")
             self.preview_var.set("  ·  ".join(parts))
             return
         canonical = claude_canonical_model_id(alias)
         levels = claude_thinking_effort_levels(alias)
         parts = [f"Claude 解析为：{canonical}"]
         parts.append(claude_thinking_summary(alias))
-        if claude_supports_1m_context(alias):
+        if self.supports_1m_var.get():
             parts.append("会附加 [1m] 长上下文入口")
+        else:
+            parts.append("不声明 1M 上下文")
         if canonical == alias:
             parts.append("（本身就是标准 Claude 名）")
         if levels is None and not canonical.startswith("claude-"):
             parts.append("⚠ Claude 可能不认识这个名字，建议用 claude- 开头的型号名")
         self.preview_var.set("  ·  ".join(parts))
 
+    def _parse_token_field(
+        self, variable: tk.StringVar, label: str
+    ) -> tuple[int | None, str | None]:
+        raw = variable.get().strip().replace(",", "").replace("_", "").replace(" ", "")
+        if not raw:
+            return None, None
+        try:
+            value = int(raw)
+        except ValueError:
+            return None, f"{label}必须是整数 tokens。"
+        if not 0 < value <= 100_000_000:
+            return None, f"{label}必须在 1 到 100000000 之间。"
+        return value, None
+
+    def _read_capabilities(self) -> bool:
+        """Parse the Codex-only token fields; return False after showing an error."""
+        if self.workspace_name == "claude":
+            return True
+        context_window, error = self._parse_token_field(
+            self.context_window_var, "上下文窗口"
+        )
+        if error:
+            messagebox.showerror("参数无效", error, parent=self)
+            return False
+        max_output, error = self._parse_token_field(
+            self.max_output_tokens_var, "最大输出"
+        )
+        if error:
+            messagebox.showerror("参数无效", error, parent=self)
+            return False
+        self.context_window_tokens = context_window
+        self.max_output_tokens = max_output
+        return True
+
     def _clear(self) -> None:
+        # Only the alias is cleared; the token fields still save, so a model can be left
+        # unmapped while carrying its real context/output limits.
+        if not self._read_capabilities():
+            return
         self.result = ""
         self.destroy()
 
     def _accept(self) -> None:
+        if not self._read_capabilities():
+            return
         alias = self.alias_var.get().strip()
         if alias and self.prefix and not alias.startswith(self.prefix):
             messagebox.showerror(
@@ -1255,6 +1586,7 @@ class CodexSotaApp(tk.Tk):
         self.models_path_var = tk.StringVar(value="/models")
         self.responses_path_var = tk.StringVar(value="/responses")
         self.messages_path_var = tk.StringVar(value="/v1/messages")
+        self.chat_path_var = tk.StringVar(value="/v1/chat/completions")
         self.auth_header_var = tk.StringVar(value="Authorization")
         self.auth_prefix_var = tk.StringVar(value="Bearer ")
         self.timeout_var = tk.StringVar(value="120")
@@ -1287,6 +1619,24 @@ class CodexSotaApp(tk.Tk):
         self.deiconify()
         self.after(20, self._initial_load)
         self.after(50, self._drain_task_events)
+
+    def destroy(self) -> None:
+        # Tk.destroy removes the registered Python commands, but Tcl keeps their
+        # pending after/after_idle scripts. Cancel our timers before deleting those
+        # commands; a _closing check inside a now-missing callback is too late.
+        self._closing = True
+        progress = getattr(self, "progress", None)
+        if progress is not None:
+            progress.stop()
+        commands = set(self._tclCommands or ())
+        try:
+            for timer_id in self.tk.splitlist(self.tk.call("after", "info")):
+                script, _kind = self.tk.splitlist(self.tk.call("after", "info", timer_id))
+                if str(script) in commands:
+                    self.after_cancel(timer_id)
+        except tk.TclError:
+            pass
+        super().destroy()
 
     def _place_in_work_area(self) -> None:
         """Center the complete native window frame inside its monitor work area."""
@@ -1453,8 +1803,10 @@ class CodexSotaApp(tk.Tk):
             order_actions, text="↓ 下移", command=lambda: self._move_provider(1)
         )
         self.move_down_button.pack(side="left", fill="x", expand=True)
+        provider_list = ttk.Frame(sidebar, style="Sidebar.TFrame")
+        provider_list.pack(fill="both", expand=True, padx=12, pady=(0, 10))
         self.provider_tree = ttk.Treeview(
-            sidebar,
+            provider_list,
             columns=("models",),
             show="tree headings",
             selectmode="browse",
@@ -1464,7 +1816,10 @@ class CodexSotaApp(tk.Tk):
         self.provider_tree.heading("models", text="模型")
         self.provider_tree.column("#0", width=190, minwidth=150)
         self.provider_tree.column("models", width=60, minwidth=50, anchor="center", stretch=False)
-        self.provider_tree.pack(fill="both", expand=True, padx=12, pady=(0, 10))
+        provider_scroll = ttk.Scrollbar(provider_list, orient="vertical", command=self.provider_tree.yview)
+        self.provider_tree.configure(yscrollcommand=provider_scroll.set)
+        self.provider_tree.pack(side="left", fill="both", expand=True)
+        provider_scroll.pack(side="right", fill="y")
         self.provider_tree.bind("<<TreeviewSelect>>", self._provider_selected)
 
         content = ttk.Frame(self, padding=(18, 14, 18, 0))
@@ -1573,6 +1928,7 @@ class CodexSotaApp(tk.Tk):
         self.models_path_entry = self._field(tab, "模型列表路径", self.models_path_var, 11, 0)
         self.responses_path_entry = self._field(tab, "Responses 路径", self.responses_path_var, 11, 1)
         self.messages_path_entry = self._field(tab, "Messages 路径", self.messages_path_var, 13, 0)
+        self.chat_path_entry = self._field(tab, "Chat Completions 路径", self.chat_path_var, 13, 1)
         self.auth_header_entry = self._field(tab, "认证请求头", self.auth_header_var, 15, 0)
         self.auth_prefix_entry = self._field(tab, "密钥前缀", self.auth_prefix_var, 15, 1)
 
@@ -1668,6 +2024,25 @@ class CodexSotaApp(tk.Tk):
         )
         self.remove_models_button.pack(side="left", padx=(8, 0))
 
+        def arrange_actions(event: tk.Event[Any]) -> None:
+            if getattr(model_actions, "_layout_width", None) == event.width:
+                return
+            model_actions._layout_width = event.width
+            row = column = used = 0
+            buttons = model_actions.winfo_children()
+            for button in buttons:
+                button.pack_forget()
+            for button in buttons:
+                width = button.winfo_reqwidth() + 8
+                if used and used + width > event.width:
+                    row += 1
+                    column = used = 0
+                button.grid(row=row, column=column, sticky="w", padx=(0, 8), pady=(0, 4))
+                column += 1
+                used += width
+
+        model_actions.bind("<Configure>", arrange_actions)
+
         table = ttk.Frame(tab, style="Surface.TFrame")
         table.grid(row=2, column=0, sticky="nsew")
         columns = ("enabled", "model", "publish", "display", "status", "speed")
@@ -1685,9 +2060,13 @@ class CodexSotaApp(tk.Tk):
         self.model_tree.column("status", width=92, minwidth=80, anchor="center", stretch=False)
         self.model_tree.column("speed", width=84, minwidth=72, anchor="center", stretch=False)
         scroll = ttk.Scrollbar(table, orient="vertical", command=self.model_tree.yview)
-        self.model_tree.configure(yscrollcommand=scroll.set)
-        self.model_tree.pack(side="left", fill="both", expand=True)
-        scroll.pack(side="right", fill="y")
+        horizontal = ttk.Scrollbar(table, orient="horizontal", command=self.model_tree.xview)
+        self.model_tree.configure(yscrollcommand=scroll.set, xscrollcommand=horizontal.set)
+        self.model_tree.grid(row=0, column=0, sticky="nsew")
+        scroll.grid(row=0, column=1, sticky="ns")
+        horizontal.grid(row=1, column=0, sticky="ew")
+        table.rowconfigure(0, weight=1)
+        table.columnconfigure(0, weight=1)
         self.model_tree.bind("<Double-1>", self._toggle_model_event)
         self.model_tree.bind("<space>", self._toggle_model_event)
         self.model_tree.bind("<<TreeviewSelect>>", self._show_route_chain)
@@ -1944,6 +2323,8 @@ class CodexSotaApp(tk.Tk):
         self.models_path_var.set("/models")
         self.responses_path_var.set("/responses")
         self.messages_path_var.set("/v1/messages")
+        if hasattr(self, "chat_path_var"):
+            self.chat_path_var.set("/v1/chat/completions")
         self.auth_header_var.set("Authorization")
         self.auth_prefix_var.set("Bearer ")
         self.timeout_var.set("120")
@@ -1972,9 +2353,14 @@ class CodexSotaApp(tk.Tk):
         # Keep the editor usable when an old provider's key file is missing. The audit board
         # reports the credential problem, while saving that provider with a replacement key
         # still performs the strict final validation.
-        self.registry = load_registry(
-            self.workspace.registry_path, allow_missing_secrets=True
-        )
+        try:
+            self.registry = load_registry(
+                self.workspace.registry_path, allow_missing_secrets=True
+            )
+        except FileNotFoundError:
+            # A fresh Windows account has no providers yet. Keep the editor
+            # usable; the first explicit save creates its own workspace files.
+            self.registry = {"version": 1, "providers": []}
         current = select_id or self.current_id
         self.provider_ids = [provider["id"] for provider in self.registry["providers"]]
         visible = self._render_providers()
@@ -2071,6 +2457,8 @@ class CodexSotaApp(tk.Tk):
         self.models_path_var.set(provider["models_path"])
         self.responses_path_var.set(provider["responses_path"])
         self.messages_path_var.set(provider.get("messages_path") or "/v1/messages")
+        if hasattr(self, "chat_path_var"):
+            self.chat_path_var.set(provider.get("chat_path") or "/v1/chat/completions")
         self.auth_header_var.set(provider["auth_header"])
         self.auth_prefix_var.set(provider["auth_prefix"])
         self.timeout_var.set(str(provider["timeout_seconds"]))
@@ -2124,6 +2512,11 @@ class CodexSotaApp(tk.Tk):
         ):
             widget.configure(state=state)
         self.proto_responses_check.configure(state=state)
+        bridge_check = getattr(self, "chat_bridge_check", None)
+        if bridge_check is not None:
+            bridge_check.configure(state=state)
+        if hasattr(self, "chat_path_entry"):
+            self.chat_path_entry.configure(state=state)
         self.proto_messages_check.configure(state=state)
         self.show_key_button.configure(state=state)
         editable_state = "disabled" if self._busy else "normal"
@@ -2175,6 +2568,8 @@ class CodexSotaApp(tk.Tk):
         self.models_path_var.set("/models")
         self.responses_path_var.set("/responses")
         self.messages_path_var.set("/v1/messages")
+        if hasattr(self, "chat_path_var"):
+            self.chat_path_var.set("/v1/chat/completions")
         self.auth_header_var.set("Authorization")
         self.auth_prefix_var.set("Bearer ")
         self.timeout_var.set("120")
@@ -2252,11 +2647,13 @@ class CodexSotaApp(tk.Tk):
             "enabled": "启用状态",
             "allow_failover": "自动换家",
             "protocols": "协议",
+            "request_adapter": "协议适配器",
             "auth_header": "认证头",
             "auth_prefix": "认证前缀",
             "models_path": "models 路径",
             "responses_path": "responses 路径",
             "messages_path": "messages 路径",
+            "chat_path": "Chat Completions 路径",
             "timeout_seconds": "超时",
             "extra_headers": "附加请求头",
             "models": "模型清单",
@@ -2369,6 +2766,8 @@ class CodexSotaApp(tk.Tk):
         else:
             provider["request_adapter"] = existing_adapter
         provider.update(pinned)
+        if hasattr(self, "chat_path_var") and "chat_path" not in pinned:
+            provider["chat_path"] = self.chat_path_var.get().strip()
         return validate_provider(provider, allow_missing_secret=True)
 
     def _render_models(self) -> None:
@@ -2508,35 +2907,29 @@ class CodexSotaApp(tk.Tk):
             return
         prefix = self._model_mapping_prefix()
         current = str(model.get("publish_as") or "")
-        if self.workspace is CLAUDE:
-            # Claude families Claude Desktop actually recognises, most useful first. Opus
-            # and the fable/mythos family carry the full thinking slider. The suffix list
-            # mirrors claude_desktop's capability tables.
-            suffixes = (
-                "claude-opus-5",
-                "claude-opus-4-8",
-                "claude-fable-5",
-                "claude-mythos-5",
-                "claude-opus-4-7",
-                "claude-opus-4-6",
-                "claude-sonnet-5",
-                "claude-sonnet-4-6",
-                "claude-sonnet-4-5",
-                "claude-haiku-4-5",
+        codex_templates = (
+            model_catalog_template_slugs(self.workspace.source_catalog_path)
+            if self.workspace is CODEX
+            else []
+        )
+        # Every enabled model the registry already carries: the names a user can meaningfully
+        # map onto are whatever the vendors actually serve, not a list compiled into this file.
+        known_model_ids = list(
+            dict.fromkeys(
+                str(other["id"])
+                for entry in self.registry.get("providers", [])
+                if entry.get("enabled")
+                for other in entry.get("models") or []
+                if other.get("enabled")
             )
-        else:
-            # Slugs the generated catalog has real templates for, so a mapped model picks
-            # up correct reasoning levels and context metadata.
-            suffixes = (
-                "gpt-5.6-sol",
-                "gpt-5.6-terra",
-                "gpt-5.6-luna",
-                "gpt-6-astra",
-                "gpt-5.5",
-                "gpt-5.4",
-                "gpt-5.4-mini",
-            )
-        suggestions = [prefix + suffix for suffix in suffixes]
+        )
+        suggestions = model_mapping_suggestions(
+            self.workspace.name,
+            prefix,
+            model["id"],
+            codex_template_slugs=codex_templates,
+            known_model_ids=known_model_ids,
+        )
         dialog = ModelMappingDialog(
             self,
             model["id"],
@@ -2544,6 +2937,21 @@ class CodexSotaApp(tk.Tk):
             prefix,
             suggestions,
             workspace_name=self.workspace.name,
+            supports_1m_context=(
+                # Judged by the name the app will actually see -- `publish_as` when the model
+                # sets one -- because that is the name Claude Desktop looks up.  Passing the
+                # vendor id alone silently dropped the 1M row from every mapped model.
+                claude_model_supports_1m_context(model, published_slug(provider, model))
+                if self.workspace is CLAUDE
+                else False
+            ),
+            codex_template_slugs=codex_templates,
+            context_window_tokens=(
+                model.get("context_window_tokens") if self.workspace is CODEX else None
+            ),
+            max_output_tokens=(
+                model.get("max_output_tokens") if self.workspace is CODEX else None
+            ),
             conflict_check=lambda candidate: mapping_conflicts(
                 self.draft_models, provider, candidate, self_model=model
             ),
@@ -2564,6 +2972,17 @@ class CodexSotaApp(tk.Tk):
                 )
                 return
         model["publish_as"] = alias
+        if self.workspace is CLAUDE:
+            model["supports_1m_context"] = dialog.supports_1m_var.get()
+        else:
+            for key, value in (
+                ("context_window_tokens", dialog.context_window_tokens),
+                ("max_output_tokens", dialog.max_output_tokens),
+            ):
+                if value is None:
+                    model.pop(key, None)
+                else:
+                    model[key] = value
         self._render_models()
         if self.model_tree.exists(f"model_{index}"):
             self.model_tree.selection_set(f"model_{index}")
@@ -2606,6 +3025,16 @@ class CodexSotaApp(tk.Tk):
 
         self._run_task("正在测试连接", worker, success, [key])
 
+    def _apply_inference_path_repair(self, repair: dict[str, Any]) -> str:
+        protocol = repair.get("protocol") or "responses"
+        variable, label = {
+            "chat": ("chat_path_var", "Chat Completions"),
+            "messages": ("messages_path_var", "Messages"),
+            "responses": ("responses_path_var", "Responses"),
+        }[protocol]
+        getattr(self, variable).set(repair["after"])
+        return label
+
     def _fetch_models(self) -> None:
         try:
             provider = self._provider_from_form()
@@ -2633,20 +3062,13 @@ class CodexSotaApp(tk.Tk):
                 raise RuntimeError(self._probe_failure_text(result))
             repair = payload.get("endpoint") or {}
             if repair.get("changed"):
-                if repair.get("protocol") == "messages":
-                    self.messages_path_var.set(repair["after"])
-                    label = "Messages"
-                else:
-                    self.responses_path_var.set(repair["after"])
-                    label = "Responses"
+                label = CodexSotaApp._apply_inference_path_repair(self, repair)
                 self._append_log(f"已自动修正 {label} 路径 — " + repair["reason"])
             self.models_path_var.set(result["models_path"])
             existing = {model["id"]: model for model in self.draft_models}
             merged: list[dict[str, Any]] = []
             for model_id in result["models"]:
-                merged.append(
-                    existing.get(model_id)
-                    or {
+                model = existing.get(model_id) or {
                         "id": model_id,
                         "enabled": False,
                         "display_name": "",
@@ -2656,7 +3078,12 @@ class CodexSotaApp(tk.Tk):
                         "fast_tier_effect": "untested",
                         "fast_tier_forced": False,
                     }
-                )
+                metadata = (result.get("model_metadata") or {}).get(model_id)
+                if isinstance(metadata, dict):
+                    for key in ("context_window_tokens", "supports_1m_context"):
+                        if key in metadata:
+                            model[key] = metadata[key]
+                merged.append(model)
             for model in self.draft_models:
                 if model["id"] not in result["models"]:
                     merged.append(model)
@@ -2728,12 +3155,7 @@ class CodexSotaApp(tk.Tk):
             results = payload["models"]
             repair = payload["repair"]
             if repair["changed"]:
-                if repair.get("protocol") == "messages":
-                    self.messages_path_var.set(repair["after"])
-                    label = "Messages"
-                else:
-                    self.responses_path_var.set(repair["after"])
-                    label = "Responses"
+                label = CodexSotaApp._apply_inference_path_repair(self, repair)
                 self._append_log(f"已自动修正 {label} 路径 — " + repair["reason"])
                 if not payload["persisted"]:
                     self._append_log("    这条修正还没写盘，记得点「保存并应用」")
@@ -2972,7 +3394,7 @@ class CodexSotaApp(tk.Tk):
             restart_router(workspace, force=True)
             return True
         try:
-            with urllib.request.urlopen(workspace.health_url, timeout=3) as response:
+            with LOCAL_HEALTH_OPENER.open(workspace.health_url, timeout=3) as response:
                 health = json.loads(response.read())
                 if router_health_matches_workspace(health, workspace):
                     return False
@@ -3027,7 +3449,7 @@ class CodexSotaApp(tk.Tk):
             registry = audit_registry(self.workspace)
             health = None
             try:
-                with urllib.request.urlopen(self.workspace.health_url, timeout=3) as response:
+                with LOCAL_HEALTH_OPENER.open(self.workspace.health_url, timeout=3) as response:
                     health = json.loads(response.read().decode("utf-8"))
             except Exception:
                 health = None
@@ -3119,10 +3541,10 @@ class CodexSotaApp(tk.Tk):
         if auth_problem:
             messagebox.showerror(
                 "启动失败",
-                "Tango Relay API key 不可用。这样启动的话，启动器会停在一个你看不见的"
-                "输入提示上，永远不返回。\n\n"
+                "本地 Codex 连接凭据未就绪。\n\n"
                 f"{auth_problem}\n\n"
-                "请在 PowerShell 里运行 codex-sota，按提示粘贴 key，然后再回来启动。",
+                "首次使用请添加供应商并点击「保存并应用」，会自动建立本地连接配置。"
+                "已有配置请检查凭据文件或从备份恢复。",
                 parent=self,
             )
             return
@@ -3229,7 +3651,9 @@ class CodexSotaApp(tk.Tk):
             return
 
         def worker() -> dict[str, Any]:
+            CodexSotaApp._task_progress(self, "正在关闭旧的 Claude Desktop")
             closed = close_running_claude()
+            CodexSotaApp._task_progress(self, "正在准备 Claude 第三方配置")
             migration = migrate_legacy_entry()
             deployment = ensure_deployment_mode()
             # Forced, because Claude is down as of the line above and the profile written on the
@@ -3240,31 +3664,71 @@ class CodexSotaApp(tk.Tk):
             # the new one.  This gap, between the close and the launch, is the one moment when
             # replacing it interrupts nothing.  The Codex router is a separate process on its own
             # port and is not touched.
+            CodexSotaApp._task_progress(self, "正在重启 Claude 路由器")
             started_router = self._ensure_router_running(CLAUDE, force=True)
+            CodexSotaApp._task_progress(self, "正在发布 Claude 模型并借用生效档")
             published = write_claude_profile(models, CLAUDE_GATEWAY_URL)
             target = resolve_claude_launch_target() or launch_target
             # The shared appliedId slot is taken here, not when the profile is written: Claude
             # reads it at startup, so it has to be ours before the process starts and can go
             # back to cc-switch as soon as this Claude exits.
-            claim = claim_claude_slot()
+            claim = claim_claude_slot(
+                launch_pending=True, launch_timeout_seconds=LAUNCH_WINDOW_WAIT_SECONDS + 120.0
+            )
+            claim_id = slot_claim_token(claim.get("claim") or {}) or None
+
+            def release_failed_launch() -> dict[str, Any]:
+                return release_claude_slot(
+                    expected_claim_id=claim_id, allow_pending=True,
+                    is_claude_running=lambda: bool(claude_pids()),
+                )
+
             try:
+                CodexSotaApp._task_progress(self, "正在打开 Claude Desktop")
                 launch = start_claude_process(target)
                 deadline = time.monotonic() + LAUNCH_WINDOW_WAIT_SECONDS
                 appeared = False
+                CodexSotaApp._task_progress(self, "正在等待 Claude Desktop 窗口")
                 while time.monotonic() < deadline:
                     if claude_window_present():
                         appeared = True
                         break
-                    time.sleep(LAUNCH_WINDOW_POLL_SECONDS)
-            except Exception:
-                release_claude_slot()
+                    time.sleep(min(LAUNCH_WINDOW_POLL_SECONDS, max(0.0, deadline - time.monotonic())))
+                if appeared and claim_id:
+                    CodexSotaApp._task_progress(self, "正在确认 Claude 生效档")
+                    confirmed = confirm_claude_slot_claim(claim_id, pids=claude_pids())
+                    if confirmed.get("status") != "confirmed":
+                        raise RuntimeError("Claude 启动期间生效档已被其他操作切换，请检查当前档案后重试。")
+            except Exception as launch_error:
+                try:
+                    cleanup = release_failed_launch()
+                except Exception as cleanup_error:
+                    raise RuntimeError(
+                        f"{launch_error}\n未能安全确认 Claude 已退出或交还生效档：{cleanup_error}。"
+                        "请检查进程状态，退出后刷新状态或手动交还。"
+                    ) from launch_error
+                if cleanup.get("status") in {"claude-running", "launch-pending", "superseded"}:
+                    raise RuntimeError(
+                        f"{launch_error}\nClaude 仍在运行、启动中或借用记录已更新；未改动当前生效档。"
+                        "请检查进程状态，退出后刷新状态或手动交还。"
+                    ) from launch_error
                 raise
             if appeared:
-                watcher = arm_claude_slot_release()
+                CodexSotaApp._task_progress(self, "正在建立 Claude 退出后的交还监视")
+                watcher = arm_claude_slot_release(claim_id)
             else:
-                # Nothing came up, so nothing is reading our profile.  Hand the slot straight
-                # back instead of leaving cc-switch pointed at our gateway.
-                watcher = {"status": "released-no-window", "detail": release_claude_slot()}
+                CodexSotaApp._task_progress(self, "正在安全检查未出现窗口的 Claude")
+                # A missing window does not prove the process is absent. Only
+                # hand back the slot after the final, lock-held Desktop check.
+                try:
+                    cleanup = release_failed_launch()
+                except Exception as error:
+                    cleanup = {"status": "failed", "detail": str(error)}
+                watcher = {
+                    "status": "released-no-window" if cleanup.get("status") == "released"
+                              else "retained-no-window",
+                    "detail": cleanup,
+                }
             return {
                 "router_started": started_router,
                 "published": published,
@@ -3293,12 +3757,26 @@ class CodexSotaApp(tk.Tk):
             self._refresh_claude_status()
             if result["window"]:
                 self.header_status_var.set("Claude 运行中")
+                if result["watcher"].get("status") != "armed":
+                    self._append_log("退出后自动交还的监视器未能建立；退出后请刷新状态或手动交还生效档。")
             else:
+                self.header_status_var.set("需要检查 Claude")
                 hint = result.get("launch_detail") or ""
+                cleanup = result["watcher"].get("detail") or {}
+                cleanup_note = {
+                    "released": "生效档已经交还给原来的管理器，cc-switch 不受影响。",
+                    "no-claim": "已没有借用记录；未改动当前生效档。",
+                    "no-previous": "没有可交还的前一个档，已清除借用记录；请手动选择生效档。",
+                    "previous-gone": "前一个档已不存在，已清除借用记录；请手动选择生效档。",
+                    "not-owner": "生效档已被其他操作切换，未改动它。",
+                    "superseded": "借用记录已被新的启动更新，未改动新的生效档。",
+                    "claude-running": "检测到 Claude Desktop 进程仍在运行，已保留借用记录。退出后请刷新状态或手动交还。",
+                    "launch-pending": "另一启动仍在进行，已保留借用记录。稍后请刷新状态。",
+                }.get(cleanup.get("status"), "未能确认自动交还成功。请检查 Claude 进程状态，退出后刷新状态或手动交还。")
                 messagebox.showwarning(
                     "已发布，但没等到窗口",
                     "配置和路由器都就绪了，但没在等待时间内看到 Claude Desktop 的窗口。\n\n"
-                    "生效档已经交还给原来的管理器，cc-switch 不受影响。\n\n"
+                    f"{cleanup_note}\n\n"
                     "请检查已检测到的 Claude 3P 入口是否仍可用："
                     f"{result['launch_target']['label']}。"
                     + (f"\n\n启动器输出：{hint}" if hint else ""),
@@ -3453,10 +3931,17 @@ class CodexSotaApp(tk.Tk):
         self.claude_entry_combo.configure(values=[e["name"] for e in status["entries"]])
         if status["applied_name"]:
             self.claude_entry_combo.set(status["applied_name"])
-        count = len(build_inference_models(self.registry))
+        try:
+            source = (
+                self.registry if getattr(self, "workspace", CLAUDE) is CLAUDE
+                else load_registry(CLAUDE.registry_path, allow_missing_secrets=True)
+            )
+            count_note = f"{len(build_inference_models(source))} 个"
+        except (OSError, ValueError):
+            count_note = "无法读取 Claude 工作区注册表"
         self.claude_status_var.set(
             f"当前生效的档：{status['applied_name'] or '（无）'}{self._claude_slot_note()}　|　"
-            f"可发布的 Messages 模型：{count} 个　|　共 {len(status['entries'])} 个档"
+            f"可发布的 Messages 模型：{count_note}　|　共 {len(status['entries'])} 个档"
         )
 
     def _reconcile_claude_slot(self) -> dict[str, Any]:
@@ -3465,7 +3950,9 @@ class CodexSotaApp(tk.Tk):
         except Exception:  # noqa: BLE001 - fail closed: unknown state means "leave it alone"
             return {"status": "unknown-process-state"}
         try:
-            result = reconcile_claude_slot(claude_running=running)
+            result = reconcile_claude_slot(
+                claude_running=running, is_claude_running=lambda: bool(claude_pids())
+            )
         except Exception as error:  # noqa: BLE001 - never break the tab over housekeeping
             return {"status": "failed", "detail": str(error)}
         if result.get("status") == "released":
@@ -3509,6 +3996,7 @@ class CodexSotaApp(tk.Tk):
             )
             return
         displaced = state.get("displaced_name") or state.get("displaced_id") or ""
+        claim_id = state.get("claim_id") or None
         if not displaced:
             messagebox.showwarning(
                 "没有记录前一个档",
@@ -3528,7 +4016,7 @@ class CodexSotaApp(tk.Tk):
             return
 
         def worker() -> dict[str, Any]:
-            return release_claude_slot(force=True)
+            return release_claude_slot(force=True, expected_claim_id=claim_id)
 
         def success(result: dict[str, Any]) -> None:
             outcome = result.get("status")
@@ -3543,6 +4031,7 @@ class CodexSotaApp(tk.Tk):
                 "no-previous": "借用记录里没有前一个档，只清掉了借用记录。",
                 "previous-gone": "前一个档已经不在配置库里了，只清掉了借用记录。",
                 "not-owner": f"生效档已经被别人切成「{result.get('applied_name')}」，没有动它。",
+                "superseded": "确认期间出现了新的启动记录，没有改动它；请刷新状态后重新确认。",
             }
             messagebox.showinfo("交还完成", messages.get(outcome, str(outcome)), parent=self)
 
@@ -3782,10 +4271,12 @@ class CodexSotaApp(tk.Tk):
                 raise ValueError("这个文件里没有 providers 列表，不像是备份或导出的配置。")
             current = load_registry(self.workspace.registry_path, allow_missing_secrets=True)
             candidate, report = merge_restored_registry(incoming, current, self.workspace.name)
-            # Validate before asking anything. This is the same gate write_registry applies, so
-            # a file that cannot be written never gets as far as a confirmation dialog, and a
-            # confirmed restore cannot then fail halfway through the write.
-            candidate = validate_registry(deepcopy(candidate), allow_missing_secrets=True)
+            # Validate the schema before asking anything. Credential ownership and the
+            # preview's registry digest are checked again under the write lock, because
+            # another editor may change the protected identity while this dialog is open.
+            candidate = validate_registry(
+                deepcopy(candidate), allow_missing_secrets=True, allow_shared_secrets=True
+            )
         except Exception as error:
             self._show_error("这个配置不能恢复", error)
             return
@@ -3836,6 +4327,11 @@ class CodexSotaApp(tk.Tk):
             )
         if report["needs_key"]:
             lines.append("恢复后还缺 API Key：" + "、".join(report["needs_key"]))
+        if report.get("independent_key_required"):
+            lines.append(
+                "新导入的 Codex 登录引用已改为独立密钥配置，不会借用现有账号："
+                + "、".join(report["independent_key_required"])
+            )
         lines += [
             "",
             "现在的 providers.json 会先备份到 backups\\pre-restore-*。",
@@ -3849,6 +4345,7 @@ class CodexSotaApp(tk.Tk):
         self, source: str, candidate: dict[str, Any], report: dict[str, Any]
     ) -> None:
         """Ask once, then back up and write under the registry lock."""
+        expected_registry_digest = report["registry_digest"]
         if not messagebox.askokcancel(
             "恢复配置", self._restore_summary(source, candidate, report), parent=self
         ):
@@ -3857,19 +4354,9 @@ class CodexSotaApp(tk.Tk):
         total = len(candidate["providers"])
 
         def worker() -> dict[str, Any]:
-            # Backup inside the lock, so nothing can slip between the copy and the write and
-            # leave a "backup" that never matched what was replaced.
-            with registry_write_lock(workspace=workspace):
-                target = workspace.root / "backups" / ("pre-restore-" + time.strftime("%Y%m%d-%H%M%S"))
-                target.mkdir(parents=True, exist_ok=True)
-                saved = []
-                for path in (workspace.registry_path, workspace.catalog_path):
-                    if path.exists():
-                        shutil.copy2(path, target / path.name)
-                        saved.append(path.name)
-                write_registry(candidate, workspace.registry_path, allow_missing_secrets=True)
-                catalog = rebuild_catalog(workspace)
-            return {"backup": target, "saved": saved, "catalog": catalog}
+            return restore_registry_transaction(
+                candidate, workspace, expected_registry_digest=expected_registry_digest,
+            )
 
         def success(result: dict[str, Any]) -> None:
             self.current_id = None
@@ -4024,17 +4511,18 @@ class CodexSotaApp(tk.Tk):
         ):
             return
         by_provider = {provider["id"]: deepcopy(provider) for provider in registry["providers"]}
+        endpoint_baselines = deepcopy(by_provider)
 
         def worker() -> dict[str, Any]:
             rows: list[dict[str, Any]] = []
-            repairs: list[str] = []
+            repairs: dict[str, str] = {}
             for provider_id in dict.fromkeys(pid for pid, _model in targets):
                 provider = by_provider[provider_id]
                 if provider.get("protected"):
                     continue
                 fix = auto_repair_active_inference_path(provider)
                 if fix["changed"]:
-                    repairs.append(f"{provider['name']}：{fix['reason']}")
+                    repairs[provider_id] = f"{provider['name']}：{fix['reason']}"
             for provider_id, model_id in targets:
                 provider = by_provider[provider_id]
                 try:
@@ -4070,23 +4558,35 @@ class CodexSotaApp(tk.Tk):
                     }
                 )
             saved, failed_saves = [], []
-            # One transaction, no router restart: these are probe verdicts rather than
-            # routing changes, and bouncing the router per provider used to abort whatever
-            # Codex requests were in flight.
+            # Persist verified path changes with a compare-and-swap against the
+            # pre-probe identity. The registry helper preserves concurrent edits
+            # and commits these narrow repairs together with probe bookkeeping.
+            endpoint_updates: list[str] = []
+            endpoint_conflicts: list[str] = []
             try:
-                saved = save_provider_bookkeeping(
-                    list(by_provider.values()), self.workspace
-                )["providers"]
+                stored = save_provider_bookkeeping(
+                    list(by_provider.values()), self.workspace,
+                    endpoint_baselines=endpoint_baselines,
+                )
+                saved = stored["providers"]
+                endpoint_updates = stored.get("endpoint_updates", [])
+                endpoint_conflicts = stored.get("endpoint_conflicts", [])
             except Exception as error:
                 failed_saves.append(str(error))
-            return {"rows": rows, "saved": saved, "failed_saves": failed_saves, "repairs": repairs}
+            return {
+                "rows": rows, "saved": saved, "failed_saves": failed_saves,
+                "repairs": [repairs[pid] for pid in endpoint_updates if pid in repairs],
+                "repair_conflicts": endpoint_conflicts,
+            }
 
         self._run_task("正在体检全部供应商", worker, self._checkup_finished)
 
     def _checkup_finished(self, result: dict[str, Any]) -> None:
         rows = result["rows"]
         for repair in result.get("repairs") or []:
-            self._append_log("已自动修正 Responses 路径 — " + repair)
+            self._append_log("已保存推理路径修正 — " + repair)
+        for provider_id in result.get("repair_conflicts") or []:
+            self._append_log(f"推理路径未覆盖：{provider_id} 的配置在体检期间发生变化，请刷新后重试。")
         ok_rows = [row for row in rows if row["ok"]]
         grouped: dict[str, list[dict[str, Any]]] = {}
         for row in rows:
@@ -4109,7 +4609,7 @@ class CodexSotaApp(tk.Tk):
             "体检完成",
             f"{len(ok_rows)} / {len(rows)} 个模型可用。\n"
             f"结果已写回 {len(result['saved'])} 家供应商。\n"
-            + (f"自动修正了 {len(repairs)} 家的 Responses 路径。\n" if repairs else "")
+            + (f"已保存 {len(repairs)} 家的推理路径修正。\n" if repairs else "")
             + "\n"
             + ("有问题的供应商：" + "、".join(dead) if dead else "所有已启用供应商都正常。")
             + "\n\n逐条明细见下方运行记录。",
@@ -4215,7 +4715,12 @@ class CodexSotaApp(tk.Tk):
     ) -> None:
         if self._busy:
             return
+        self._task_request_id = uuid4().hex
+        self._task_label = label
+        self._task_started = time.monotonic()
         self._set_busy(True, label)
+        request_id = self._task_request_id
+        self.after(1000, lambda: self._tick_task_status(request_id))
         secret_values = [value for value in (secrets or []) if value]
 
         def target() -> None:
@@ -4231,6 +4736,19 @@ class CodexSotaApp(tk.Tk):
 
         threading.Thread(target=target, daemon=True).start()
 
+    def _task_progress(self, label: str) -> None:
+        """Queue worker phases; only the Tk thread touches widgets or log text."""
+        events = getattr(self, "_task_events", None)
+        if events is not None:
+            events.put(("progress", label, None))
+
+    def _tick_task_status(self, request_id: str) -> None:
+        if self._closing or not self._busy or getattr(self, "_task_request_id", None) != request_id:
+            return
+        elapsed = int(time.monotonic() - self._task_started)
+        self.status_var.set(f"{self._task_label}（已等待 {elapsed} 秒）")
+        self.after(1000, lambda: self._tick_task_status(request_id))
+
     def _drain_task_events(self) -> None:
         if self._closing:
             return
@@ -4239,7 +4757,12 @@ class CodexSotaApp(tk.Tk):
                 kind, payload, result = self._task_events.get_nowait()
             except queue.Empty:
                 break
-            if kind == "success":
+            if kind == "progress":
+                if self._busy:
+                    self._task_label = str(payload)
+                    self.status_var.set(str(payload))
+                    self._append_log(str(payload))
+            elif kind == "success":
                 self._task_succeeded(payload, result)
             else:
                 self._task_failed(str(payload))
@@ -4260,6 +4783,10 @@ class CodexSotaApp(tk.Tk):
 
     def _set_busy(self, busy: bool, label: str) -> None:
         self._busy = busy
+        if not busy:
+            # A generic worker's due timer must not later follow a Codex launch
+            # that reuses _busy but has its own request-scoped supervision.
+            self._task_request_id = None
         self.status_var.set(label)
         if busy:
             self.progress.start(12)

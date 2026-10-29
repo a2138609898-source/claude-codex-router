@@ -69,18 +69,18 @@ BINARY_EXT = {
 
 def tracked_files() -> list[Path]:
     out = subprocess.run(
-        ["git", "-C", str(REPO), "ls-files"],
-        capture_output=True, text=True, check=True,
+        ["git", "-C", str(REPO), "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+        capture_output=True, text=True, encoding="utf-8", check=True,
     ).stdout
     files = []
-    for rel in out.splitlines():
-        rel = rel.strip()
+    for rel in dict.fromkeys(out.split("\0")):
         if not rel:
             continue
         path = REPO / rel
         if path.resolve() == SELF or path.suffix.lower() in BINARY_EXT:
             continue
-        files.append(path)
+        if path.is_file():
+            files.append(path)
     return files
 
 
@@ -149,7 +149,7 @@ def gitignore_present() -> bool:
 
 def main() -> int:
     files = tracked_files()
-    print(f"扫描 {len(files)} 个 git 跟踪文本文件（已排除本脚本与二进制）")
+    print(f"扫描 {len(files)} 个已跟踪及待发布文本文件（已排除忽略文件、本脚本与二进制）")
     results = [
         section("真实供应商标识残留", find_substrings(files, VENDOR_SUBSTRINGS)),
         section("真实供应商域名残留", find_substrings(files, VENDOR_DOMAINS)),

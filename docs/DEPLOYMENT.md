@@ -3,6 +3,15 @@
 本项目是 Windows 本地工具，不会把账号、供应商密钥或聊天记录打包进仓库。部署目录可以是任意路径；
 用户数据应该放在部署目录之外，并通过环境变量指向它们。
 
+## 直接下载安装包
+
+一般用户从 [Releases](https://github.com/a2138609898-source/claude-codex-router/releases/latest)
+下载 Windows x64 安装程序或便携 ZIP 即可，详见 [安装说明](WINDOWS-INSTALL.md)。安装包自带运行环境，
+无需另装 Python、Node.js、Git 或管理员权限。下面的前置条件与步骤用于从源码运行和构建。
+
+只使用本产品不需要安装 Cockpit 或 Plus。未建立这些可选 profile 时，跨 profile 历史同步会明确跳过，
+不会创建它们，也不会影响 Codex/Claude 的供应商管理和本地推理路由。
+
 ## 前置条件
 
 - Windows 10/11，PowerShell 5.1 或 PowerShell 7。
@@ -57,6 +66,7 @@ powershell -NoProfile -ExecutionPolicy Bypass `
 
 升级时先备份用户 profile，再拉取 GitHub 更新；不要用仓库内容覆盖任何 workspace 根目录。重新运行
 `setup.ps1` 只会更新本地构建环境，不会迁移或删除用户数据。打包发布使用
+根目录 `Build-Release.ps1`，它生成安装程序、便携包及校验值。开发安装仍可使用
 `CodexSotaManager\Build-Staged.ps1`，它会先验证再生成 staging 目录。
 自定义 `setup.ps1 -InstallRoot` 时，给构建脚本传 `-PythonExecutable` 指向该环境的
 `.venv-build\Scripts\python.exe`；默认 `.runtime` 和旧版管理器旁的 `.venv-build` 会自动识别。

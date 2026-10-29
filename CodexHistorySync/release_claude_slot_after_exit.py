@@ -62,29 +62,7 @@ def claude_pids() -> set[int]:
     Failing closed matters: if the query breaks, reporting "no Claude" would release the slot
     under a live Claude, which is the exact behaviour this watcher exists to prevent.
     """
-    tasklist = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "tasklist.exe"
-    completed = subprocess.run(
-        [str(tasklist), "/FI", f"IMAGENAME eq {CLAUDE_IMAGE}", "/FO", "CSV", "/NH"],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        creationflags=CREATE_NO_WINDOW,
-        check=False,
-    )
-    if completed.returncode != 0:
-        detail = (completed.stderr or completed.stdout or "unknown error").strip()
-        raise RuntimeError(f"无法查询 Claude 进程状态（退出码 {completed.returncode}）：{detail}")
-    pids: set[int] = set()
-    for line in completed.stdout.splitlines():
-        fields = [field.strip('"') for field in line.strip().split('","')]
-        if len(fields) < 2 or CLAUDE_IMAGE not in fields[0].lower():
-            continue
-        try:
-            pids.add(int(fields[1]))
-        except ValueError:
-            continue
-    return pids
+    return claude_desktop.claude_desktop_pids()
 
 
 def _kernel32() -> ctypes.WinDLL:
@@ -172,6 +150,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Give up waiting after this long instead of blocking indefinitely.",
     )
     parser.add_argument("--audit-only", action="store_true")
+    parser.add_argument("--claim-id", default=None, help="Only release this launch generation.")
     return parser
 
 
@@ -198,6 +177,10 @@ def main() -> int:
         if not claim:
             logging.info("no slot claim recorded; nothing to give back")
             return 0
+        claim_id = args.claim_id or claude_desktop.slot_claim_token(claim)
+        if claude_desktop.slot_claim_token(claim) != claim_id:
+            logging.info("slot claim superseded before watcher started")
+            return 0
         logging.info(
             "waiting for Claude Desktop to exit; slot will go back to %s",
             claim.get("previous_applied_name") or claim.get("previous_applied_id") or "<none>",
@@ -205,7 +188,9 @@ def main() -> int:
         if not wait_until_claude_exits(args.max_seconds):
             logging.info("gave up waiting after %s seconds; slot left claimed", args.max_seconds)
             return 0
-        result = claude_desktop.release_slot()
+        result = claude_desktop.release_slot(
+            expected_claim_id=claim_id, is_claude_running=lambda: bool(claude_pids())
+        )
         logging.info("release result: %s", json.dumps(result, ensure_ascii=False, default=str))
         return 0
     except Exception:

@@ -12,14 +12,16 @@ from __future__ import annotations
 from contextlib import contextmanager
 from copy import deepcopy
 from datetime import datetime, timezone
+import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 import re
 import secrets
 import shutil
 import tempfile
-from typing import Any
+import time
+from typing import Any, Callable
 from uuid import uuid4
 import urllib.parse
 
@@ -95,6 +97,140 @@ def _safe_entry_path(entry_id: str) -> Path | None:
         return entry_path(entry_id)
     except ValueError:
         return None
+
+
+def is_claude_desktop_executable(
+    executable: str, *, local_appdata: str | None = None, program_files: str | None = None,
+) -> bool:
+    """Recognize the Desktop installations supported by the launcher, not Claude Code."""
+    path = PureWindowsPath(executable)
+    if not path.is_absolute() or path.name.lower() != "claude.exe":
+        return False
+    local = PureWindowsPath(local_appdata or os.environ.get("LOCALAPPDATA")
+                            or str(Path.home() / "AppData" / "Local"))
+    if path.is_relative_to(local / "AnthropicClaude"):
+        return True
+    # Packaged Codex can redirect LOCALAPPDATA into its package's LocalCache.
+    # QueryFullProcessImageName reports that physical path, while LOCALAPPDATA
+    # still names C:\Users\...\AppData\Local. Resolve our known installation
+    # root; a substring match would also accept another app/account's executable.
+    if os.name == "nt":
+        physical_root = PureWindowsPath(str(Path(str(local / "AnthropicClaude")).resolve()))
+        if path.is_relative_to(physical_root):
+            return True
+    packages = PureWindowsPath(program_files or os.environ.get("ProgramFiles")
+                               or r"C:\Program Files") / "WindowsApps"
+    if path.is_relative_to(packages):
+        relative = path.relative_to(packages)
+        package = relative.parts[0].lower()
+        return (len(relative.parts) > 1 and package.startswith("claude_")
+                and package.endswith("_pzs8sxrjxfjjc"))
+    return False
+
+
+def _process_image_path(pid: int) -> str | None:
+    """Query identity without command lines, windows, or credential-bearing process data."""
+    import ctypes
+    from ctypes import wintypes
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel.OpenProcess.restype = wintypes.HANDLE
+    kernel.QueryFullProcessImageNameW.argtypes = [wintypes.HANDLE, wintypes.DWORD,
+                                                wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)]
+    kernel.QueryFullProcessImageNameW.restype = wintypes.BOOL
+    kernel.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    kernel.GetExitCodeProcess.restype = wintypes.BOOL
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel.CloseHandle.restype = wintypes.BOOL
+    handle = kernel.OpenProcess(0x1000, False, int(pid))  # QUERY_LIMITED_INFORMATION
+    if not handle:
+        error = ctypes.get_last_error()
+        if error == 87:  # process exited between the snapshot and OpenProcess
+            return None
+        raise OSError(error, "Cannot establish Claude process identity")
+    try:
+        buffer = ctypes.create_unicode_buffer(32768)
+        length = wintypes.DWORD(len(buffer))
+        if not kernel.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(length)):
+            image_error = ctypes.get_last_error()
+            exit_code = wintypes.DWORD()
+            if kernel.GetExitCodeProcess(handle, ctypes.byref(exit_code)) and exit_code.value != 259:
+                # A helper can exit after OpenProcess succeeds. A known exited
+                # process is absent, whereas a live/unknown identity still fails closed.
+                return None
+            raise OSError(image_error, "Cannot read Claude executable path")
+        return buffer.value
+    finally:
+        kernel.CloseHandle(handle)
+
+
+def image_process_pids(image_name: str) -> set[int]:
+    """Enumerate an image through Windows' process snapshot, without shell pipes.
+
+    Failure is distinct from a successful empty snapshot. The latter is the only
+    result that lets the slot watcher conclude Desktop has exited.
+    """
+    if os.name != "nt":
+        return set()
+    import ctypes
+    from ctypes import wintypes
+
+    wanted = str(image_name).casefold()
+    if not wanted or Path(wanted).name != wanted or any(ch in wanted for ch in "/\\"):
+        raise ValueError("Process image must be a filename")
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+
+    class PROCESSENTRY32W(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD),
+            ("th32ProcessID", wintypes.DWORD), ("th32DefaultHeapID", ctypes.c_size_t),
+            ("th32ModuleID", wintypes.DWORD), ("cntThreads", wintypes.DWORD),
+            ("th32ParentProcessID", wintypes.DWORD), ("pcPriClassBase", wintypes.LONG),
+            ("dwFlags", wintypes.DWORD), ("szExeFile", wintypes.WCHAR * 260),
+        ]
+
+    kernel.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    kernel.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    kernel.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+    kernel.Process32FirstW.restype = wintypes.BOOL
+    kernel.Process32NextW.argtypes = kernel.Process32FirstW.argtypes
+    kernel.Process32NextW.restype = wintypes.BOOL
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel.CloseHandle.restype = wintypes.BOOL
+    snapshot = kernel.CreateToolhelp32Snapshot(2, 0)  # TH32CS_SNAPPROCESS
+    if snapshot in (None, 0, ctypes.c_void_p(-1).value):
+        raise OSError(ctypes.get_last_error(), "Cannot enumerate process images")
+    try:
+        result = set()
+        entry = PROCESSENTRY32W()
+        entry.dwSize = ctypes.sizeof(entry)
+        more = kernel.Process32FirstW(snapshot, ctypes.byref(entry))
+        while more:
+            if entry.szExeFile.casefold() == wanted:
+                result.add(int(entry.th32ProcessID))
+            more = kernel.Process32NextW(snapshot, ctypes.byref(entry))
+        error = ctypes.get_last_error()
+        if error != 18:  # ERROR_NO_MORE_FILES is the only successful end marker.
+            raise OSError(error, "Process image enumeration did not complete")
+        return result
+    finally:
+        kernel.CloseHandle(snapshot)
+
+
+def claude_desktop_pids(
+    *, candidate_pids: Any = None, image_path: Callable[[int], str | None] | None = None,
+) -> set[int]:
+    """Desktop PIDs only; unknown identity fails closed instead of releasing a live slot."""
+    if candidate_pids is None:
+        candidate_pids = image_process_pids("claude.exe")
+    resolve = image_path or _process_image_path
+    desktop = set()
+    for pid in candidate_pids:
+        executable = resolve(int(pid))
+        if executable and is_claude_desktop_executable(executable):
+            desktop.add(int(pid))
+    return desktop
 
 
 def _library_lock_path() -> Path:
@@ -332,6 +468,37 @@ CLAUDE_THINKING_MODELS: dict[str, tuple[str, ...]] = {
 }
 _FABLE_FAMILY_RE = re.compile(r"^(?:claude-)?(?:fable|mythos)(?:-|$)")
 _FABLE_EFFORTS = ("low", "medium", "high", "xhigh", "max")
+# A release the app's table has never heard of still belongs to a line it *has* heard of:
+# `claude-opus-5-5` is a later member of the `claude-opus-*` family.  The tables above are a
+# snapshot lifted from one app build, so hardcoding every future release is a losing game --
+# that is exactly how `claude-opus-5-5` ended up with a 1M entry but no thinking control.
+# The lookup therefore falls back to the newest *known* member of the same family that is not
+# newer than the requested one.  This is an extrapolation, never a transcript, so every answer
+# is tagged with where it came from (`capability_source`) and the strings a user reads say so.
+_FAMILY_VERSION_RE = re.compile(r"^claude-(?P<family>[a-z]+)-(?P<version>\d+(?:-\d+)?)$")
+
+
+def _family_version(canonical: str) -> tuple[str, tuple[int, ...]] | None:
+    """Split `claude-opus-5-5` into ("opus", (5, 5)); None for anything not shaped like that."""
+    match = _FAMILY_VERSION_RE.match(canonical)
+    if match is None:
+        return None
+    return match.group("family"), tuple(int(part) for part in match.group("version").split("-"))
+
+
+def _newest_known_at_or_below(
+    table: Any, family: str, version: tuple[int, ...]
+) -> str | None:
+    """The newest key of `table` in `family` whose version is <= the requested one."""
+    best: str | None = None
+    best_version: tuple[int, ...] | None = None
+    for name in table:
+        parsed = _family_version(name)
+        if parsed is None or parsed[0] != family or parsed[1] > version:
+            continue
+        if best_version is None or parsed[1] > best_version:
+            best, best_version = name, parsed[1]
+    return best
 
 
 def canonical_model_id(model_id: str) -> str:
@@ -347,6 +514,27 @@ def canonical_model_id(model_id: str) -> str:
     return _DASH_DATE_SUFFIX_RE.sub("", _AT_DATE_SUFFIX_RE.sub("", result))
 
 
+def thinking_capability(model_id: str) -> tuple[tuple[str, ...] | None, str]:
+    """(levels, source) for a slug.  ``source`` is one of:
+
+    ``table``    an exact hit: transcribed from the app's own capability table.
+    ``fable``    the fable/mythos family, matched by prefix on purpose.
+    ``family``   **extrapolated** from the newest known member of the same family.
+    ``unknown``  nothing to go on; ``levels`` is None and the app shows no thinking UI.
+    """
+    canonical = canonical_model_id(model_id)
+    if canonical in CLAUDE_THINKING_MODELS:
+        return CLAUDE_THINKING_MODELS[canonical], "table"
+    if _FABLE_FAMILY_RE.match(canonical):
+        return _FABLE_EFFORTS, "fable"
+    parsed = _family_version(canonical)
+    if parsed is not None:
+        known = _newest_known_at_or_below(CLAUDE_THINKING_MODELS, parsed[0], parsed[1])
+        if known is not None:
+            return CLAUDE_THINKING_MODELS[known], "family"
+    return None, "unknown"
+
+
 def thinking_effort_levels(model_id: str) -> tuple[str, ...] | None:
     """The effort levels Claude Desktop will offer for a slug, or None for no thinking UI.
 
@@ -354,22 +542,20 @@ def thinking_effort_levels(model_id: str) -> tuple[str, ...] | None:
     thinking on/off switch.  Unlocking the picker is not a promise that the gateway honours
     the choice -- it only decides what the app is willing to show.
     """
-    canonical = canonical_model_id(model_id)
-    if canonical in CLAUDE_THINKING_MODELS:
-        return CLAUDE_THINKING_MODELS[canonical]
-    if _FABLE_FAMILY_RE.match(canonical):
-        return _FABLE_EFFORTS
-    return None
+    return thinking_capability(model_id)[0]
 
 
 def thinking_summary(model_id: str) -> str:
     """One short label for what thinking UI a published slug will get, for reports and dialogs."""
-    levels = thinking_effort_levels(model_id)
+    levels, source = thinking_capability(model_id)
     if levels is None:
         return "无思考控件"
     if not levels:
         return "仅扩展思考开关"
-    return "思考档 " + "/".join(levels)
+    label = "思考档 " + "/".join(levels)
+    # Say so when the answer is an extrapolation rather than a transcription: the user is
+    # entitled to know which of the two they are looking at before they trust the picker.
+    return label + "（按同家族外推）" if source == "family" else label
 
 
 # Which published slugs are offered with a 1M-token context window.  Unlike the thinking
@@ -385,9 +571,11 @@ CLAUDE_1M_CONTEXT_MODELS: frozenset[str] = frozenset(
         "claude-opus-4-7",
         "claude-opus-4-8",
         "claude-opus-5",
+        "claude-opus-5-5",
         "claude-sonnet-4-5",
         "claude-sonnet-4-6",
         "claude-sonnet-5",
+        "claude-sonnet-5-5",
     }
 )
 
@@ -395,14 +583,61 @@ CLAUDE_1M_CONTEXT_MODELS: frozenset[str] = frozenset(
 def supports_1m_context(model_id: str) -> bool:
     """Whether a published slug should also be offered as a 1M-context variant.
 
-    Haiku and anything unrecognised are left out.  A wrong claim here does not fail at write
-    time or at launch -- it fails much later, by letting a conversation grow past what the
-    upstream actually accepts and turning the next turn into an opaque 400.
+    Three ways to say yes: an exact entry in the table, the fable/mythos family, or a known
+    member of the same family at or below this release.  The last one is an extrapolation --
+    `claude-opus-6` inherits `claude-opus-5`'s claim -- and it can only ever extend a family
+    that already claims 1M, so `claude-haiku-*` (present in the thinking table, absent here)
+    is never let in by it.  Haiku and anything in no known family are left out.
+
+    A wrong "yes" costs the user one unused picker row: the app keeps the plain entry and adds
+    a `<slug>[1m]` one beside it.  A wrong "no" costs the whole feature, which is why the
+    fallback errs toward yes inside a family that already made the claim.
     """
     canonical = canonical_model_id(model_id)
     if canonical in CLAUDE_1M_CONTEXT_MODELS:
         return True
-    return bool(_FABLE_FAMILY_RE.match(canonical))
+    if _FABLE_FAMILY_RE.match(canonical):
+        return True
+    parsed = _family_version(canonical)
+    if parsed is not None:
+        known = _newest_known_at_or_below(CLAUDE_1M_CONTEXT_MODELS, parsed[0], parsed[1])
+        if known is not None:
+            return True
+    return False
+
+
+def model_supports_1m_context(model: dict[str, Any], published: str | None = None) -> bool:
+    """Whether one registry model should be offered with the extra 1M picker entry.
+
+    Only ``supports_1m_context = false`` can say no; everything else can only say yes:
+
+    * an explicit ``true``, or ``context_window_tokens >= 1_000_000`` -- the gateway advertised
+      the deployment's own limit;
+    * the **published slug** naming a 1M-capable Claude family;
+    * the real upstream id naming one.
+
+    The published slug has to count.  ``publish_as`` exists precisely so a vendor id the app
+    cannot look up -- ``claude-opus-5-thinking``, ``glm-5.3`` -- is offered under a name the app
+    *can* look up; the app then decides the 1M row from that name.  Testing the vendor id alone
+    silently removed the 1M row from every mapped model, which is the regression this function's
+    own test (`test_publish_as_reaches_claudes_thinking_table_without_renaming_the_upstream`)
+    pins down.  A reported context window is evidence *for* 1M and never against it: relays
+    routinely report the plain 200k window for a deployment that does accept 1M, and treating
+    that as proof of absence turned the metadata probe into a switch that disabled the very
+    feature it was added to enable.
+    """
+    explicit = model.get("supports_1m_context")
+    if explicit is False:
+        return False
+    if explicit is True:
+        return True
+    context_window = model.get("context_window_tokens")
+    if type(context_window) is int and context_window >= 1_000_000:
+        return True
+    for candidate in (published, model.get("id")):
+        if candidate and supports_1m_context(str(candidate)):
+            return True
+    return False
 
 
 def build_inference_models(registry: dict[str, Any]) -> list[dict[str, Any]]:
@@ -413,9 +648,10 @@ def build_inference_models(registry: dict[str, Any]) -> list[dict[str, Any]]:
     table. `labelOverride` is what the model picker shows, and it always carries the vendor
     and the real upstream id, so an overridden slug never hides which model is being called.
 
-    `supports1m` is set per CLAUDE_1M_CONTEXT_MODELS.  It is additive: the app keeps the plain
-    entry and adds a `<slug>[1m]` one beside it, so a relay that turns out to refuse 1M costs
-    the user one unused picker row rather than a broken default.
+    `supports1m` rides on the same renamed slug for the same reason the slider does: the app
+    derives the 1M picker entry from the name it can see, so a mapped model is judged by its
+    published name as well as by its real upstream id.  See `model_supports_1m_context`, which
+    also explains why a gateway-reported context window can only ever add this flag.
     """
     models: list[dict[str, Any]] = []
     for provider in registry.get("providers") or []:
@@ -431,7 +667,7 @@ def build_inference_models(registry: dict[str, Any]) -> list[dict[str, Any]]:
                 "name": slug,
                 "labelOverride": f"{provider.get('name') or provider['id']} · {model['id']}",
             }
-            if supports_1m_context(slug):
+            if model_supports_1m_context(model, slug):
                 entry["supports1m"] = True
             models.append(entry)
     return models
@@ -627,40 +863,38 @@ def migrate_legacy_entry() -> dict[str, Any]:
 def ensure_deployment_mode() -> dict[str, Any]:
     """Ensure Claude reads the canonical 3P tree, without touching any 1P profile."""
     with _library_lock():
-        migration = _migrate_legacy_3p_root()
-        paths = [CLAUDE_3P_ROOT / "claude_desktop_config.json"]
-        values: dict[Path, dict[str, Any]] = {}
-        for path in paths:
-            try:
-                value = json.loads(path.read_text(encoding="utf-8-sig")) if path.exists() else {}
-            except (OSError, ValueError) as error:
-                raise RuntimeError(f"Claude 配置文件无法解析：{path}：{error}") from error
-            if not isinstance(value, dict):
-                raise RuntimeError(f"Claude 配置文件不是 JSON 对象：{path}")
-            values[path] = value
+        return _ensure_deployment_mode_locked()
 
-        changing = [path for path, value in values.items() if value.get("deploymentMode") != "3p"]
-        if not changing:
-            return {
-                "status": "ready",
-                "changed": [],
-                "backup": None,
-                "paths": [str(path) for path in paths],
-                "migration": migration,
-            }
 
-        snapshot = _snapshot(changing)
-        backup = str(_backup(changing))
-        changed: list[str] = []
+def _ensure_deployment_mode_locked() -> dict[str, Any]:
+    """The deployment update for callers already holding the library lock."""
+    migration = _migrate_legacy_3p_root()
+    paths = [CLAUDE_3P_ROOT / "claude_desktop_config.json"]
+    values: dict[Path, dict[str, Any]] = {}
+    for path in paths:
         try:
-            for path in changing:
-                value = values[path]
-                value["deploymentMode"] = "3p"
-                _atomic_write_json(path, value)
-                changed.append(str(path))
-        except Exception:
-            _restore(snapshot)
-            raise
+            value = json.loads(path.read_text(encoding="utf-8-sig")) if path.exists() else {}
+        except (OSError, ValueError) as error:
+            raise RuntimeError(f"Claude 配置文件无法解析：{path}：{error}") from error
+        if not isinstance(value, dict):
+            raise RuntimeError(f"Claude 配置文件不是 JSON 对象：{path}")
+        values[path] = value
+    changing = [path for path, value in values.items() if value.get("deploymentMode") != "3p"]
+    if not changing:
+        return {"status": "ready", "changed": [], "backup": None,
+                "paths": [str(path) for path in paths], "migration": migration}
+    snapshot = _snapshot(changing)
+    backup = str(_backup(changing))
+    changed: list[str] = []
+    try:
+        for path in changing:
+            value = values[path]
+            value["deploymentMode"] = "3p"
+            _atomic_write_json(path, value)
+            changed.append(str(path))
+    except Exception:
+        _restore(snapshot)
+        raise
     return {
         "status": "ready",
         "changed": changed,
@@ -725,6 +959,8 @@ def write_profile(
         mine = entry_path(SOTA_ENTRY_ID)
         initial_meta = read_meta()
         transaction_paths = _migration_paths(initial_meta)
+        if apply:
+            transaction_paths.append(_slot_claim_path())
         snapshot = _snapshot(transaction_paths)
         conflict_snapshot = snapshot
         backup = _backup(transaction_paths)
@@ -773,6 +1009,9 @@ def write_profile(
             meta["entries"] = entries
             if apply:
                 meta["appliedId"] = SOTA_ENTRY_ID
+                # Write-ahead recovery: even an abrupt exit after the appliedId
+                # commit leaves the previous owner recorded on disk.
+                _record_claim_locked(meta, previous_applied)
             _assert_meta_revision(meta_revision)
             _atomic_write_json(META_PATH, meta)
         except ConcurrentClaudeConfigUpdate:
@@ -787,10 +1026,6 @@ def write_profile(
         except Exception:
             _restore(snapshot)
             raise
-        if apply:
-            # Taking the slot here also records who to give it back to, so an explicit
-            # apply=True can still be undone by release_slot().
-            _record_claim_locked(meta, previous_applied)
     return {
         "status": "ready",
         "entry_id": SOTA_ENTRY_ID,
@@ -837,12 +1072,51 @@ def read_slot_claim() -> dict[str, Any]:
 def _clear_slot_claim() -> None:
     try:
         _slot_claim_path().unlink()
-    except (FileNotFoundError, OSError):
+    except FileNotFoundError:
         pass
 
 
+def slot_claim_token(claim: dict[str, Any]) -> str:
+    """A stable generation, including for recoverable pre-token claim files."""
+    if not claim:
+        return ""
+    token = str(claim.get("claim_id") or "")
+    if token:
+        return token
+    data = json.dumps(claim, sort_keys=True, ensure_ascii=True, separators=(",", ":"))
+    return "legacy-" + hashlib.sha256(data.encode("utf-8")).hexdigest()
+
+
+@contextmanager
+def _slot_transaction_locked():
+    """Rollback index/profile/claim together without undoing external index edits."""
+    claim_path = _slot_claim_path()
+    snapshot = _snapshot(_migration_paths(read_meta()) + [claim_path])
+    try:
+        yield
+    except ConcurrentClaudeConfigUpdate:
+        # The inner index transaction already restored its own profile writes.
+        # Its optimistic conflict must never roll an external _meta.json back.
+        _restore({claim_path: snapshot[claim_path]})
+        raise
+    except Exception:
+        _restore(snapshot)
+        raise
+
+
+def _validated_launch_timeout(value: Any) -> float:
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("launch_timeout_seconds must be a positive finite number <= 3600") from error
+    if not 0 < seconds <= 3600:
+        raise ValueError("launch_timeout_seconds must be a positive finite number <= 3600")
+    return seconds
+
+
 def _record_claim_locked(
-    meta: dict[str, Any], previous_applied: Any, *, pids: Any = None
+    meta: dict[str, Any], previous_applied: Any, *, pids: Any = None,
+    launch_pending: bool = False, launch_timeout_seconds: float = 420.0,
 ) -> dict[str, Any]:
     """Note that codex-sota now holds the slot, and who has to get it back.
 
@@ -852,6 +1126,8 @@ def _record_claim_locked(
     """
     claim = read_slot_claim()
     previous_id = str(previous_applied or "")
+    if previous_id in _legacy_ids(meta):
+        previous_id = SOTA_ENTRY_ID
     if not previous_id or previous_id == SOTA_ENTRY_ID:
         previous_id = str(claim.get("previous_applied_id") or "")
         previous_name = str(claim.get("previous_applied_name") or "")
@@ -865,6 +1141,7 @@ def _record_claim_locked(
         claimed_pids = []
     payload = {
         "version": 1,
+        "claim_id": uuid4().hex,
         "owner": "codex-sota",
         "entry_id": SOTA_ENTRY_ID,
         "previous_applied_id": previous_id,
@@ -872,22 +1149,33 @@ def _record_claim_locked(
         "claimed_at": _utc_stamp(),
         "claimed_pids": claimed_pids,
     }
+    if launch_pending:
+        # A second Manager must not reconcile the claim away in the interval
+        # before the first process exists. A crashed launcher does not retain
+        # this protection indefinitely.
+        payload["launch_deadline"] = time.time() + _validated_launch_timeout(launch_timeout_seconds)
     _atomic_write_json(_slot_claim_path(), payload)
     return payload
 
 
-def claim_slot(*, pids: Any = None) -> dict[str, Any]:
+def claim_slot(
+    *, pids: Any = None, launch_pending: bool = False, launch_timeout_seconds: float = 420.0,
+) -> dict[str, Any]:
     """Take the shared slot for a codex-sota launch, remembering the neighbour displaced.
 
     Called from the launch path only.  Writing a profile no longer claims the slot, so
     cc-switch keeps whatever it applied until the user actually starts Claude from here.
     """
+    if launch_pending:
+        launch_timeout_seconds = _validated_launch_timeout(launch_timeout_seconds)
     deployment = ensure_deployment_mode()
     with _library_lock():
         meta = read_meta()
         current = str(meta.get("appliedId") or "")
         if current == SOTA_ENTRY_ID:
-            claim = _record_claim_locked(meta, "", pids=pids)
+            with _slot_transaction_locked():
+                claim = _record_claim_locked(meta, "", pids=pids, launch_pending=launch_pending,
+                                             launch_timeout_seconds=launch_timeout_seconds)
             return {
                 "status": "already-owned",
                 "applied_id": current,
@@ -897,8 +1185,12 @@ def claim_slot(*, pids: Any = None) -> dict[str, Any]:
                 "claim": claim,
                 "deployment": deployment,
             }
-        result = _set_applied_locked(SOTA_ENTRY_ID)
-        claim = _record_claim_locked(result.pop("meta"), result["previous_applied"], pids=pids)
+        with _slot_transaction_locked():
+            # Record restoration before publishing ownership, not afterwards.
+            claim = _record_claim_locked(meta, current, pids=pids, launch_pending=launch_pending,
+                                         launch_timeout_seconds=launch_timeout_seconds)
+            result = _set_applied_locked(SOTA_ENTRY_ID, expected_previous=current)
+            result.pop("meta", None)
     return {
         "status": "claimed",
         "applied_id": result["applied_id"],
@@ -911,22 +1203,54 @@ def claim_slot(*, pids: Any = None) -> dict[str, Any]:
     }
 
 
-def release_slot(*, force: bool = False) -> dict[str, Any]:
+def confirm_slot_claim(claim_id: str, *, pids: Any = None) -> dict[str, Any]:
+    """Finish a pending launch without changing its generation or previous owner."""
+    with _library_lock():
+        claim = read_slot_claim()
+        if not claim or slot_claim_token(claim) != claim_id:
+            return {"status": "superseded"}
+        if read_meta().get("appliedId") != SOTA_ENTRY_ID:
+            return {"status": "not-owner"}
+        claim.pop("launch_deadline", None)
+        if pids is not None:
+            claim["claimed_pids"] = sorted({int(pid) for pid in pids})
+        _atomic_write_json(_slot_claim_path(), claim)
+        return {"status": "confirmed", "claim": claim}
+
+
+def release_slot(
+    *, force: bool = False, expected_claim_id: str | None = None,
+    is_claude_running: Callable[[], bool] | None = None, allow_pending: bool = False,
+) -> dict[str, Any]:
     """Hand the shared slot back to whoever held it before codex-sota launched Claude.
 
     force=True skips the "are we still the applied profile" test, for the explicit
     "give it back to cc-switch" button.  Without it, a slot somebody else has since taken is
     left alone: stealing it back would be the exact bug this protocol exists to prevent.
     """
-    claim = read_slot_claim()
-    if not claim:
-        return {"status": "no-claim"}
-    target = str(claim.get("previous_applied_id") or "")
-    if not target or target == SOTA_ENTRY_ID:
-        _clear_slot_claim()
-        return {"status": "no-previous", "claim": claim}
-    deployment = ensure_deployment_mode()
     with _library_lock():
+        # Read and compare only after acquiring the same lock used by claims.
+        # No stale watcher may clear a newer launch's restoration record.
+        claim = read_slot_claim()
+        if not claim:
+            return {"status": "no-claim"}
+        if expected_claim_id is not None and slot_claim_token(claim) != expected_claim_id:
+            return {"status": "superseded"}
+        if not force:
+            if not allow_pending:
+                try:
+                    pending = float(claim.get("launch_deadline") or 0) > time.time()
+                except (TypeError, ValueError):
+                    pending = False
+                if pending:
+                    return {"status": "launch-pending", "claim": claim}
+            if is_claude_running is not None and is_claude_running():
+                return {"status": "claude-running", "claim": claim}
+        target = str(claim.get("previous_applied_id") or "")
+        if not target or target == SOTA_ENTRY_ID:
+            _clear_slot_claim()
+            return {"status": "no-previous", "claim": claim}
+        deployment = _ensure_deployment_mode_locked()
         meta = read_meta()
         current = str(meta.get("appliedId") or "")
         if current != SOTA_ENTRY_ID and not force:
@@ -948,9 +1272,10 @@ def release_slot(*, force: bool = False) -> dict[str, Any]:
                 "claim": claim,
                 "deployment": deployment,
             }
-        result = _set_applied_locked(target)
-        result.pop("meta", None)
-        _clear_slot_claim()
+        with _slot_transaction_locked():
+            result = _set_applied_locked(target, expected_previous=current)
+            result.pop("meta", None)
+            _clear_slot_claim()
     return {
         "status": "released",
         "applied_id": result["applied_id"],
@@ -961,7 +1286,9 @@ def release_slot(*, force: bool = False) -> dict[str, Any]:
     }
 
 
-def reconcile_slot(*, claude_running: bool) -> dict[str, Any]:
+def reconcile_slot(
+    *, claude_running: bool, is_claude_running: Callable[[], bool] | None = None,
+) -> dict[str, Any]:
     """Catch-all for a release that never happened (manager killed, watcher lost, reboot).
 
     Only releases when Claude Desktop is not running: flipping appliedId under a live Claude
@@ -972,7 +1299,8 @@ def reconcile_slot(*, claude_running: bool) -> dict[str, Any]:
         return {"status": "no-claim"}
     if claude_running:
         return {"status": "claude-running", "claim": claim}
-    return release_slot()
+    return release_slot(expected_claim_id=slot_claim_token(claim),
+                        is_claude_running=is_claude_running)
 
 
 def slot_state(*, claude_running: bool | None = None) -> dict[str, Any]:
@@ -989,6 +1317,7 @@ def slot_state(*, claude_running: bool | None = None) -> dict[str, Any]:
         "applied_name": _entry_name(meta, applied),
         "mine": applied == SOTA_ENTRY_ID,
         "claimed": bool(claim),
+        "claim_id": slot_claim_token(claim),
         "displaced_id": str(claim.get("previous_applied_id") or ""),
         "displaced_name": str(claim.get("previous_applied_name") or ""),
         "claimed_at": str(claim.get("claimed_at") or ""),
@@ -997,7 +1326,7 @@ def slot_state(*, claude_running: bool | None = None) -> dict[str, Any]:
     }
 
 
-def _set_applied_locked(entry_id: str) -> dict[str, Any]:
+def _set_applied_locked(entry_id: str, *, expected_previous: Any = ...) -> dict[str, Any]:
     """Flip appliedId inside an already-held library lock.
 
     Split out of apply_entry so the slot claim/release protocol can reuse exactly the same
@@ -1018,6 +1347,9 @@ def _set_applied_locked(entry_id: str) -> dict[str, Any]:
             migration["backup"] = str(backup)
         meta, meta_revision = _read_meta_with_revision()
         conflict_snapshot = _snapshot(transaction_paths)
+        expected = SOTA_ENTRY_ID if expected_previous in legacy else expected_previous
+        if expected_previous is not ... and str(meta.get("appliedId") or "") != str(expected or ""):
+            raise ConcurrentClaudeConfigUpdate("Claude 生效档刚被其他程序切换，本次认领或交还已取消")
         known = {str(e.get("id")) for e in meta["entries"] if isinstance(e, dict)}
         if wanted_id not in known:
             raise ValueError(f"配置库里没有这个档：{wanted_id}")
@@ -1052,15 +1384,17 @@ def apply_entry(entry_id: str) -> dict[str, Any]:
     """Switch which profile Claude Desktop uses, e.g. back to cc-switch's own entry."""
     deployment = ensure_deployment_mode()
     with _library_lock():
-        result = _set_applied_locked(entry_id)
-        meta = result.pop("meta")
-        # An explicit switch redefines who owns the shared slot, so the launch-time claim from
-        # a previous codex-sota launch must not survive it: releasing later would otherwise
-        # yank the slot away from whatever the user just chose here.
-        if result["applied_id"] == SOTA_ENTRY_ID:
-            _record_claim_locked(meta, result["previous_applied"])
-        else:
-            _clear_slot_claim()
+        with _slot_transaction_locked():
+            meta = read_meta()
+            wanted = SOTA_ENTRY_ID if entry_id in _legacy_candidates(meta) else entry_id
+            if wanted == SOTA_ENTRY_ID:
+                _record_claim_locked(meta, meta.get("appliedId"))
+            result = _set_applied_locked(
+                entry_id, expected_previous=meta.get("appliedId") if wanted == SOTA_ENTRY_ID else ...,
+            )
+            result.pop("meta", None)
+            # An explicit switch invalidates the old launch's watcher generation.
+            if result["applied_id"] != SOTA_ENTRY_ID:
+                _clear_slot_claim()
     result["deployment"] = deployment
     return result
-

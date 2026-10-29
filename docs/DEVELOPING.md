@@ -141,3 +141,17 @@ powershell -NoProfile -ExecutionPolicy Bypass -File CodexSotaManager\Run-ThreeRo
 - **运行时状态和日志**：`providers.json`、`active-profile.json`、`last-result.json`、`*.log`、
   `sync.lock`。`.gitignore` 里都拦了。
 - **GUI 截图**，除非确认里面没有真实供应商清单、地址和用量数字。
+
+## 安装包与独立验证
+
+常规分发使用根目录 `Build-Release.ps1`。它将 GUI 和后台脚本解释器打入同一 onedir，共用标准库、
+TLS、SQLite 和 Tcl/Tk 数据。`codex-sota-runtime.exe` 是辅助脚本执行入口；发行版不能依赖系统 Python。
+`codex-sota.spec` 的显式白名单必须包含运行脚本实际引用的每个本地 helper，包回归会检查依赖闭包。
+
+构建先检查全部回归，再记录源码指纹、验证完整包清单和离线运行探针，最后生成 ZIP/安装程序及 SHA-256。
+测试不得通过关闭安全校验或复制开发者私人文件来掩盖打包缺件。使用临时 profile 和本地假上游验证
+映射、凭据替换及请求转发；不需要真实密钥，也不能使用维护者正在工作的 profile。
+
+Windows 的长路径、8.3 路径和扩展路径前缀可能指向同一对象。比较文件身份需要统一这些表示；
+不能因修兼容性而放宽软链接、junction 或未授权目录的边界。CI 在干净 Windows 用户中运行，
+本机通过的测试仍应等待 GitHub 检查后才认定发布完成。

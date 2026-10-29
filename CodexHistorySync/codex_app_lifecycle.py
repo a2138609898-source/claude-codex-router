@@ -13,13 +13,20 @@ import ntpath
 import os
 from pathlib import Path
 import re
+import threading
 import time
+import uuid
 
 INSTALL_DIR = Path(__file__).resolve().parent
 WORK_DIR = INSTALL_DIR / "work"
 LIFECYCLE_LOCK_PATH = WORK_DIR / "codex-app-lifecycle.lock"
 WATCHER_LOCK_PATH = WORK_DIR / "codex-history-watcher.lock"
 LAUNCH_REQUEST_PATH = WORK_DIR / "codex-launch-request.json"
+LAUNCH_REQUEST_DIR = WORK_DIR / "codex-launch-requests"
+LAUNCH_REQUEST_GUARD_PATH = WORK_DIR / "codex-launch-requests.lock"
+LAUNCH_REQUEST_LEASE_SECONDS = 90.0
+LAUNCH_REQUEST_REFRESH_SECONDS = 10.0
+_checkpoint_state = threading.local()
 
 
 class LifecycleBusy(RuntimeError):
@@ -262,9 +269,14 @@ def detect_codex_app_processes() -> list[dict]:
                     # crashing and accidentally proceeding later.
                     if code in (6, 87, 1168):
                         identity = None
-                    elif code == 5:
+                    elif code in (5, 31):
+                        # 31 (ERROR_GEN_FAILURE) surfaced on 2026-09-30 from the
+                        # image-name/time queries against a half-dead process and crashed
+                        # the post-exit watcher mid-loop. Every uninspectable row must
+                        # stay fail-closed (busy) instead of aborting the watcher.
                         result.append(_unknown_process(
-                            item.th32ProcessID, item.szExeFile, "access_denied"
+                            item.th32ProcessID, item.szExeFile,
+                            "access_denied" if code == 5 else "probe_failed",
                         ))
                         identity = None
                     else:
@@ -276,9 +288,10 @@ def detect_codex_app_processes() -> list[dict]:
                             command_line = _process_command_line(identity["pid"])
                         except OSError as error:
                             code = getattr(error, "winerror", None) or getattr(error, "errno", None)
-                            if code == 5:
+                            if code in (5, 31):
                                 result.append(_unknown_process(
-                                    identity["pid"], item.szExeFile, "access_denied"
+                                    identity["pid"], item.szExeFile,
+                                    "access_denied" if code == 5 else "probe_failed",
                                 ))
                                 identity = None
                                 command_line = ""
@@ -326,17 +339,17 @@ def app_running() -> bool:
     return bool(detect_codex_app_processes())
 
 
-def _retire_launch_request(raw: bytes) -> None:
+def _retire_launch_request(raw: bytes, path: Path | None = None) -> None:
     """Remove a request only when the file has not been replaced meanwhile.
 
-    Launchers publish requests with an atomic rename.  Re-reading the bytes before
-    unlinking prevents a stale observer from deleting a newer request written by a
-    concurrently starting launcher.
+    Writers and production readers hold the publication byte lock. Re-reading
+    the bytes also protects direct callers retiring an older file snapshot.
     """
+    path = LAUNCH_REQUEST_PATH if path is None else Path(path)
     try:
-        if LAUNCH_REQUEST_PATH.read_bytes() != raw:
+        if path.read_bytes() != raw:
             return
-        LAUNCH_REQUEST_PATH.unlink()
+        path.unlink()
     except OSError:
         return
 
@@ -365,25 +378,115 @@ def _request_launcher_is_live(payload: dict) -> bool:
     return True
 
 
-def launch_pending() -> bool:
+def _launch_request_pending_at(path: Path) -> bool:
     raw = None
     try:
-        raw = LAUNCH_REQUEST_PATH.read_bytes()
+        with path.open("rb") as handle:
+            raw = handle.read(65537)
+        if len(raw) > 65536:
+            _retire_launch_request(raw, path)
+            return False
         payload = json.loads(raw.decode("utf-8-sig"))
         if not isinstance(payload, dict):
-            _retire_launch_request(raw)
+            _retire_launch_request(raw, path)
             return False
         if float(payload.get("expires_at", 0)) <= time.time():
-            _retire_launch_request(raw)
+            _retire_launch_request(raw, path)
             return False
         if not _request_launcher_is_live(payload):
-            _retire_launch_request(raw)
+            _retire_launch_request(raw, path)
             return False
         return True
-    except (OSError, ValueError, TypeError):
+    except (OSError, ValueError, TypeError, UnicodeError):
         if raw is not None:
-            _retire_launch_request(raw)
+            _retire_launch_request(raw, path)
         return False
+
+
+def launch_pending() -> bool:
+    """Include legacy shells and persistent controller-owned retry requests.
+
+    Each new launcher owns a separate file. A second launcher cannot erase the
+    first launcher's intent, and a deferred child exiting does not cancel the
+    manager's still-active request. Publication and retirement share a short
+    byte lock so an expiry observer cannot unlink a freshly renewed lease.
+    """
+    has_requests = LAUNCH_REQUEST_DIR.is_dir()
+    if not has_requests and not LAUNCH_REQUEST_PATH.exists():
+        return False
+    guard_path = (LAUNCH_REQUEST_GUARD_PATH if has_requests else
+                  LAUNCH_REQUEST_PATH.parent / "codex-launch-requests.lock")
+    try:
+        with FileLock(guard_path):
+            if _launch_request_pending_at(LAUNCH_REQUEST_PATH):
+                return True
+            if has_requests:
+                for path in LAUNCH_REQUEST_DIR.glob("*.json"):
+                    if _launch_request_pending_at(path):
+                        return True
+        return False
+    except (LifecycleBusy, OSError):
+        # A publisher holds this lock only during an atomic, small-file write.
+        # Unavailable coordination state must not authorize history mutation.
+        return True
+
+
+class LaunchRequestLease:
+    """Renewable intent owned by the manager, independent of its child shells."""
+
+    def __init__(self, core_root: Path, request_id: str, *,
+                 clock=time.monotonic, wall_clock=time.time):
+        if not re.fullmatch(r"[a-zA-Z0-9_-]{1,80}", request_id):
+            raise ValueError("Invalid launch request id")
+        work = Path(core_root) / "work"
+        self.directory = work / "codex-launch-requests"
+        self.guard_path = work / "codex-launch-requests.lock"
+        self.path = self.directory / f"controller-{request_id}.json"
+        self.request_id = request_id
+        self.owner_token = uuid.uuid4().hex
+        self.clock = clock
+        self.wall_clock = wall_clock
+        self.next_refresh = 0.0
+        self.owner_identity = None
+        self.published = False
+
+    def refresh(self) -> None:
+        now = self.clock()
+        if self.published and now < self.next_refresh:
+            return
+        if self.owner_identity is None:
+            self.owner_identity = process_identity(os.getpid())
+            if os.name == "nt" and self.owner_identity is None:
+                raise OSError("Cannot establish the launch controller's process identity")
+        payload = {
+            "request_id": self.request_id, "request_source": "controller",
+            "owner_token": self.owner_token, "launcher_pid": os.getpid(),
+            "launcher_creation_ticks": (self.owner_identity or {}).get("creation_ticks"),
+            "expires_at": self.wall_clock() + LAUNCH_REQUEST_LEASE_SECONDS,
+        }
+        self.directory.mkdir(parents=True, exist_ok=True)
+        temporary = self.path.with_name(self.path.name + ".new-" + self.owner_token)
+        with FileLock(self.guard_path, wait_timeout=1.0):
+            try:
+                temporary.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+                os.replace(temporary, self.path)
+            finally:
+                temporary.unlink(missing_ok=True)
+        self.published = True
+        self.next_refresh = now + LAUNCH_REQUEST_REFRESH_SECONDS
+
+    def release(self) -> None:
+        if not self.published:
+            return
+        with FileLock(self.guard_path, wait_timeout=1.0):
+            try:
+                raw = self.path.read_bytes()
+                payload = json.loads(raw.decode("utf-8-sig"))
+                if isinstance(payload, dict) and payload.get("owner_token") == self.owner_token:
+                    _retire_launch_request(raw, self.path)
+            except (OSError, ValueError, TypeError, UnicodeError):
+                pass
+        self.published = False
 
 
 def assert_quiescent() -> None:
@@ -391,3 +494,21 @@ def assert_quiescent() -> None:
         raise AppNotQuiescent("launch_requested")
     if app_running():
         raise AppNotQuiescent("app_running")
+    _checkpoint_state.last_app_probe = time.monotonic()
+
+
+def quiescence_checkpoint() -> None:
+    """Check launch intent promptly while throttling repeated process scans.
+
+    Call assert_quiescent() at lock acquisition and immediately before writes.
+    This cheaper callback is for long offline scanning/copying loops that must
+    yield to a launch before entering, or after safely restoring, a write phase.
+    """
+    if launch_pending():
+        raise AppNotQuiescent("launch_requested")
+    now = time.monotonic()
+    previous = getattr(_checkpoint_state, "last_app_probe", None)
+    if previous is None or now < previous or now - previous >= 1.0:
+        if app_running():
+            raise AppNotQuiescent("app_running")
+        _checkpoint_state.last_app_probe = now

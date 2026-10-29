@@ -58,6 +58,7 @@ dist-candidate-*/
 build-candidate-*/
 codex-sota.old-*/
 build/
+release/
 .venv/
 .venv-build/
 .runtime/

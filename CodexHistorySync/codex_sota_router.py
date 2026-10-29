@@ -5,8 +5,10 @@ from __future__ import annotations
 
 import argparse
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from hashlib import sha256
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from io import BytesIO
 import json
 import os
 import re
@@ -22,6 +24,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+from sota_network import build_network_opener
+from sota_compaction import protect_summary, restore_payload as restore_compaction_payload
 from sota_registry import (
     auth_headers,
     endpoint_url,
@@ -42,7 +46,7 @@ from sota_registry import (
 # 17 makes *all* billable generation requests single-shot. A third-party gateway may ignore an
 # Idempotency-Key, and separate vendors never share an idempotency ledger, so the key cannot be
 # treated as permission to replay a request that may already have been accepted and billed.
-ROUTER_VERSION = "18"
+ROUTER_VERSION = "20"
 HOP_BY_HOP_HEADERS = {
     "connection",
     "keep-alive",
@@ -55,6 +59,11 @@ HOP_BY_HOP_HEADERS = {
 }
 REQUEST_HEADERS_TO_DROP = HOP_BY_HOP_HEADERS | {
     "authorization",
+    "x-api-key",
+    "api-key",
+    "x-goog-api-key",
+    "cookie",
+    "cookie2",
     "content-length",
     "host",
 }
@@ -89,10 +98,12 @@ INFERENCE_PATHS: dict[str, tuple[str, str]] = {
     "/v1/messages/count_tokens": ("messages", "/count_tokens"),
 }
 COUNT_TOKENS_PATHS = frozenset({"/messages/count_tokens", "/v1/messages/count_tokens"})
-# Responses compact is a distinct state-changing/metadata operation.  The juno adapter
-# only translates ordinary Responses generations to Anthropic Messages; mapping compact onto
-# /v1/messages would silently turn a non-generation request into a billable generation.
+# Compact uses a dedicated summary request on bridged providers, never a replay of the
+# original generation. Native Responses providers keep their own /responses/compact route.
 COMPACT_PATHS = frozenset({"/responses/compact", "/v1/responses/compact"})
+# Ordinary Responses generations.  The Codex App never fills max_output_tokens, so a
+# per-model budget configured in the manager is added to these outbound requests.
+RESPONSES_GENERATION_PATHS = frozenset({"/responses", "/v1/responses"})
 # Statuses that mean "this gateway has no count_tokens route" rather than "not right now".
 # Every one of them is an answer about the route itself, so it is safe to remember: 404 no
 # such path, 405 wrong method for a path that exists, 501 not implemented.
@@ -105,10 +116,10 @@ SAME_VENDOR_RETRY_BACKOFF = (0.4, 1.2)
 # refused the connection or DNS failed. No generation was started, so retrying them cannot
 # double-bill. An SSLError is NOT unambiguously pre-request: urllib raises it both when the
 # TLS handshake dies (nothing sent) and when the gateway closes the connection after
-# processing the request while we wait for headers (sent, possibly billed — observed dying
-# 16 s in on this install's flakiest gateway). Only a fast SSLError, inside the handshake
-# window below, is treated as safe to retry; a slow one is treated as sent.
+# processing the request while we wait for headers (sent, possibly billed). Elapsed time
+# cannot prove which phase failed, so an unclassified TLS failure is never replayed.
 PRE_REQUEST_FAILURE_CLASSES = (ConnectionRefusedError, socket.gaierror)
+# Kept for callers that import this old tuning constant; it no longer decides replay safety.
 PRE_REQUEST_SSL_HANDSHAKE_WINDOW = 3.0
 
 # Events that make a relayed SSE stream "state-bearing" for the client: once any of these
@@ -215,9 +226,9 @@ REASONING_EFFORT_BUDGETS = {
 
 
 def is_juno_adapter(provider: dict[str, Any]) -> bool:
+    """Legacy helper name; select Messages conversion by configuration, not vendor ID."""
     return (
-        str(provider.get("id") or "").lower() == "juno"
-        and provider.get("request_adapter") == JUNO_ADAPTER
+        str(provider.get("request_adapter") or "").strip() == JUNO_ADAPTER
     )
 
 
@@ -231,6 +242,25 @@ def is_messages_to_chat_adapter(provider: dict[str, Any]) -> bool:
         str(provider.get("request_adapter") or "").strip()
         == MESSAGES_TO_CHAT_COMPLETIONS_ADAPTER
     )
+
+
+def configured_max_output_tokens(
+    provider: dict[str, Any], upstream_model: str
+) -> int | None:
+    """The manager's per-model output budget, or None when unset.
+
+    The Codex App does not put ``max_output_tokens`` in its Responses request.  A gateway
+    that answers with a small server-side default (4096 on some relays) then ends every long
+    answer with ``response.incomplete`` / ``max_output_tokens``.  This value is the upstream
+    model's real output ceiling, written into the registry by the manager.
+    """
+    for model in provider.get("models") or []:
+        if str(model.get("id") or "") != str(upstream_model):
+            continue
+        value = model.get("max_output_tokens")
+        if type(value) is int and 0 < value <= 100_000_000:
+            return value
+    return None
 
 
 def is_chat_completions_adapter(provider: dict[str, Any]) -> bool:
@@ -262,6 +292,12 @@ def _text_from_content(value: Any) -> str:
 
 
 def _anthropic_image_block(block: dict[str, Any]) -> dict[str, Any] | None:
+    source = block.get("source")
+    if block.get("type") == "image" and isinstance(source, dict):
+        if source.get("type") == "base64" and source.get("data"):
+            return {"type": "image", "source": dict(source)}
+        if source.get("type") == "url" and source.get("url"):
+            return {"type": "image", "source": dict(source)}
     url = block.get("image_url") or block.get("url")
     if isinstance(url, dict):
         url = url.get("url")
@@ -275,6 +311,71 @@ def _anthropic_image_block(block: dict[str, Any]) -> dict[str, Any] | None:
             "source": {"type": "base64", "media_type": media_type, "data": data},
         }
     return {"type": "image", "source": {"type": "url", "url": url}}
+
+
+def _responses_chat_content(content: Any) -> Any:
+    """Keep multimodal message parts, with the existing string form for text-only turns."""
+    items = content if isinstance(content, list) else [content]
+    parts: list[dict[str, Any]] = []
+    has_image = False
+    for item in items:
+        if isinstance(item, dict) and item.get("type") in {"input_image", "image_url"}:
+            image_url = item.get("image_url") or item.get("url")
+            image_url = dict(image_url) if isinstance(image_url, dict) else {"url": image_url}
+            if isinstance(image_url.get("url"), str) and image_url["url"]:
+                if item.get("detail") is not None:
+                    image_url.setdefault("detail", item["detail"])
+                parts.append({"type": "image_url", "image_url": image_url})
+                has_image = True
+        else:
+            text = _text_from_content(item)
+            if text:
+                parts.append({"type": "text", "text": text})
+    return parts if has_image else _text_from_content(content)
+
+
+def _response_output_text(output: list[dict[str, Any]]) -> str:
+    """The convenience text field excludes independently surfaced reasoning summaries."""
+    return "".join(
+        str(part.get("text") or "")
+        for item in output if item.get("type") == "message"
+        for part in item.get("content", [])
+        if isinstance(part, dict) and part.get("type") == "output_text"
+    )
+
+
+def _decode_custom_tool_input(arguments: str) -> str:
+    """Decode a complete bridge wrapper, never an arbitrary JSON stream fragment."""
+    value = json.loads(arguments)
+    if isinstance(value, dict):
+        value = value.get("input")
+    if not isinstance(value, str):
+        raise ValueError("Custom tool arguments must contain a string input")
+    return value
+
+
+def _upstream_stream_error(data: dict[str, Any]) -> dict[str, str]:
+    error = data.get("error", data)
+    if not isinstance(error, dict):
+        return {"code": "upstream_error", "message": str(error or "Upstream stream failed")}
+    return {
+        "code": str(error.get("code") or error.get("type") or "upstream_error"),
+        "message": str(error.get("message") or "Upstream stream failed"),
+    }
+
+
+def _response_stream_failure(response_id: str, error: dict[str, str]) -> bytes:
+    return _sse_frame(
+        "response.failed",
+        {
+            "type": "response.failed",
+            "response": {
+                "id": response_id, "object": "response", "created_at": int(time.time()),
+                "status": "failed", "error": error, "output": [],
+            },
+        },
+        response_id,
+    )
 
 
 def _anthropic_content_blocks(content: Any) -> list[dict[str, Any]]:
@@ -312,13 +413,18 @@ def _anthropic_content_blocks(content: Any) -> list[dict[str, Any]]:
                 }
             )
         elif kind == "tool_result":
-            blocks.append(
-                {
-                    "type": "tool_result",
-                    "tool_use_id": str(item.get("tool_use_id") or ""),
-                    "content": str(item.get("content") or ""),
-                }
-            )
+            result_content = item.get("content", "")
+            if not isinstance(result_content, str):
+                converted = _anthropic_content_blocks(result_content)
+                result_content = converted or json.dumps(result_content, ensure_ascii=False, separators=(",", ":"))
+            result = {
+                "type": "tool_result",
+                "tool_use_id": str(item.get("tool_use_id") or ""),
+                "content": result_content,
+            }
+            if "is_error" in item:
+                result["is_error"] = bool(item["is_error"])
+            blocks.append(result)
         elif kind in {"input_file", "file"}:
             # Anthropic gateways vary in document support.  Keep the useful filename/text
             # rather than sending an OpenAI-only block that makes the whole request invalid.
@@ -798,11 +904,40 @@ def messages_to_chat_payload(payload: dict[str, Any], upstream_model: str) -> di
                 result["tool_choice"] = "auto"
         else:
             result["tool_choice"] = "auto"
+    if result.get("tools") and isinstance(payload.get("tool_choice"), dict):
+        disabled = payload["tool_choice"].get("disable_parallel_tool_use")
+        if type(disabled) is bool:
+            result["parallel_tool_calls"] = not disabled
     return result
+
+
+def _coalesce_chat_assistant_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep one assistant turn's text and parallel calls in one Chat message."""
+    combined: list[dict[str, Any]] = []
+    for message in messages:
+        if message.get("role") != "assistant" or not combined or combined[-1].get("role") != "assistant":
+            combined.append(message)
+            continue
+        previous = combined[-1]
+        left, right = previous.get("content"), message.get("content")
+        if right:
+            if not left:
+                previous["content"] = right
+            elif isinstance(left, str) and isinstance(right, str):
+                previous["content"] = left + "\n" + right
+            else:
+                previous["content"] = (
+                    (left if isinstance(left, list) else [{"type": "text", "text": str(left)}])
+                    + (right if isinstance(right, list) else [{"type": "text", "text": str(right)}])
+                )
+        if message.get("tool_calls"):
+            previous.setdefault("tool_calls", []).extend(message["tool_calls"])
+    return combined
 
 
 def responses_to_chat_payload(payload: dict[str, Any], upstream_model: str) -> dict[str, Any]:
     """Translate one Codex Responses request into an OpenAI Chat Completions request."""
+    payload = restore_compaction_payload(payload, require_local=True)
     messages: list[dict[str, Any]] = []
     instructions = payload.get("instructions")
     if instructions:
@@ -827,7 +962,7 @@ def responses_to_chat_payload(payload: dict[str, Any], upstream_model: str) -> d
                     messages.append({"role": "system", "content": text})
             else:
                 messages.append(
-                    {"role": "assistant" if role == "assistant" else "user", "content": text}
+                    {"role": "assistant" if role == "assistant" else "user", "content": _responses_chat_content(item.get("content"))}
                 )
         elif kind in {"input_text", "text"}:
             messages.append({"role": "user", "content": str(item.get("text") or "")})
@@ -870,9 +1005,8 @@ def responses_to_chat_payload(payload: dict[str, Any], upstream_model: str) -> d
             # safe to drop (the upstream never sees a plain text echo of its own thoughts).
             continue
         elif "content" in item:
-            text = _text_from_content(item["content"])
             messages.append(
-                {"role": "assistant" if role == "assistant" else "user", "content": text}
+                {"role": "assistant" if role == "assistant" else "user", "content": _responses_chat_content(item["content"])}
             )
 
     if not messages:
@@ -883,7 +1017,7 @@ def responses_to_chat_payload(payload: dict[str, Any], upstream_model: str) -> d
     )
     result: dict[str, Any] = {
         "model": upstream_model,
-        "messages": messages,
+        "messages": _coalesce_chat_assistant_messages(messages),
         "max_tokens": max_tokens,
         "stream": bool(payload.get("stream")),
     }
@@ -921,11 +1055,14 @@ def responses_to_chat_payload(payload: dict[str, Any], upstream_model: str) -> d
             )
         else:
             result["tool_choice"] = "auto"
+        if result.get("tools") and type(payload.get("parallel_tool_calls")) is bool:
+            result["parallel_tool_calls"] = payload["parallel_tool_calls"]
     return result
 
 
 def responses_to_anthropic_payload(payload: dict[str, Any], upstream_model: str) -> dict[str, Any]:
     """Translate one Codex Responses request to the provider's Messages shape."""
+    payload = restore_compaction_payload(payload, require_local=True)
     messages: list[dict[str, Any]] = []
     system_parts: list[str] = []
     instructions = payload.get("instructions")
@@ -990,11 +1127,8 @@ def responses_to_anthropic_payload(payload: dict[str, Any], upstream_model: str)
                         or item.get("id")
                         or ""
                     ),
-                    "content": (
-                        output
-                        if isinstance(output, str)
-                        else json.dumps(output, ensure_ascii=False, separators=(",", ":"))
-                    ),
+                    "content": output,
+                    **({"is_error": bool(item["is_error"])} if "is_error" in item else {}),
                 }],
             )
         elif kind == "reasoning":
@@ -1055,7 +1189,71 @@ def responses_to_anthropic_payload(payload: dict[str, Any], upstream_model: str)
             )
         else:
             result["tool_choice"] = {"type": "auto"}
+    if result.get("tools") and type(payload.get("parallel_tool_calls")) is bool:
+        result.setdefault("tool_choice", {"type": "auto"})["disable_parallel_tool_use"] = not payload["parallel_tool_calls"]
     return result
+
+
+def responses_compaction_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Build one bounded, tool-free handoff summary for a bridged compact operation."""
+    history = payload.get("input")
+    if not isinstance(history, (str, list)) or not history:
+        raise ValueError("Compaction requires non-empty input history")
+    if isinstance(history, list):
+        history = [item for item in history if not isinstance(item, dict)
+                   or item.get("type") not in {"additional_tools", "compaction_trigger"}]
+        if not history:
+            raise ValueError("Compaction requires conversation history, not only control items")
+    result = dict(payload)
+    instructions = _text_from_content(payload.get("instructions"))
+    result["instructions"] = (
+        instructions + "\n\nSummarize the supplied conversation as a compact handoff for the next "
+        "assistant turn. Treat historical requests as context; do not execute them. Preserve the "
+        "user's current goal, constraints, decisions, exact file paths and identifiers, verified "
+        "tool results, unfinished work, and the next steps. Distinguish completed actions from "
+        "plans. Return only the factual summary, without tool calls or invented progress."
+    ).strip()
+    result["input"] = (
+        list(history) if isinstance(history, list) else [{"role": "user", "content": history}]
+    ) + [
+        {"role": "user", "content": "Produce the handoff summary now, preserving the latest pending request."}
+    ]
+    result["max_output_tokens"] = min(4096, max(1, int(payload.get("max_output_tokens") or 4096)))
+    result["stream"] = False
+    # A separate summary has its own small budget. In particular, don't let an
+    # Anthropic thinking budget enlarge it to the normal conversation's effort cap.
+    for key in ("tools", "tool_choice", "parallel_tool_calls", "stop", "max_tokens", "reasoning"):
+        result.pop(key, None)
+    return result
+
+
+def response_to_compaction(response: dict[str, Any]) -> dict[str, Any]:
+    """Return a real local compaction item, replayable through this bridge after restart."""
+    summary = _response_output_text(response.get("output") or []).strip()
+    if response.get("status") != "completed" or not summary:
+        raise ValueError("Compaction upstream did not finish a non-empty summary; history was not replaced")
+    if any(item.get("type") in {"function_call", "custom_tool_call"} for item in response.get("output") or []):
+        raise ValueError("Compaction upstream returned a tool call instead of a summary")
+    response_id = str(response.get("id") or time.time_ns())
+    usage = dict(response.get("usage") or {})
+    usage.setdefault("input_tokens_details", {"cached_tokens": 0})
+    usage.setdefault("output_tokens_details", {"reasoning_tokens": 0})
+    return {
+        "id": "cmp_" + response_id,
+        "object": "response.compaction",
+        "created_at": int(time.time()),
+        "output": [{"id": "cmp_" + response_id, "type": "compaction", "encrypted_content": protect_summary(summary)}],
+        "usage": usage,
+    }
+
+
+def is_compaction_request(path: str, payload: Any) -> bool:
+    if path in COMPACT_PATHS:
+        return True
+    history = payload.get("input") if isinstance(payload, dict) else None
+    return path in RESPONSES_GENERATION_PATHS and isinstance(history, list) and any(
+        isinstance(item, dict) and item.get("type") == "compaction_trigger" for item in history
+    )
 
 
 def _response_usage(usage: Any) -> dict[str, int]:
@@ -1098,6 +1296,11 @@ def chat_completion_to_anthropic_message(
     client asked for thinking; it is dropped otherwise, so a client that never requested
     reasoning cannot receive a block it did not expect.
     """
+    if not isinstance(completion, dict):
+        raise ValueError("Upstream Chat response must be an object")
+    if "error" in completion or completion.get("type") == "error":
+        error = _upstream_stream_error(completion)
+        raise ValueError(f"Upstream {error['code']}: {error['message']}")
     choices = completion.get("choices") if isinstance(completion.get("choices"), list) else []
     choice = choices[0] if choices and isinstance(choices[0], dict) else {}
     message = choice.get("message") if isinstance(choice.get("message"), dict) else {}
@@ -1143,7 +1346,7 @@ def chat_completion_to_anthropic_message(
     stop_reason = _CHAT_STOP_REASONS_TO_ANTHROPIC.get(
         str(choice.get("finish_reason") or "").strip().lower(), "end_turn"
     )
-    if has_tool_use:
+    if has_tool_use and stop_reason == "end_turn":
         stop_reason = "tool_use"
     return {
         "id": "msg_" + str(completion.get("id") or int(time.time() * 1000)).removeprefix("chatcmpl-"),
@@ -1165,12 +1368,19 @@ def chat_message_to_response(
     model: str = "",
     tool_namespaces: dict[str, str] | None = None,
     tool_kinds: dict[str, str] | None = None,
+    parallel_tool_calls: bool = True,
 ) -> dict[str, Any]:
     """Translate one Chat Completions response into a Responses-API object."""
+    if not isinstance(completion, dict):
+        raise ValueError("Upstream Chat response must be an object")
+    if "error" in completion or completion.get("type") == "error":
+        error = _upstream_stream_error(completion)
+        raise ValueError(f"Upstream {error['code']}: {error['message']}")
     choices = completion.get("choices") if isinstance(completion.get("choices"), list) else []
     choice = choices[0] if choices and isinstance(choices[0], dict) else {}
     message = choice.get("message") if isinstance(choice.get("message"), dict) else {}
     finish_reason = str(choice.get("finish_reason") or "").strip().lower()
+    status = "incomplete" if finish_reason in OUTPUT_LIMIT_STOP_REASONS else "completed"
     response_id = "resp_" + str(
         completion.get("id") or int(time.time() * 1000)
     ).removeprefix("chatcmpl-")
@@ -1215,17 +1425,13 @@ def chat_message_to_response(
         namespace = (tool_namespaces or {}).get(tool_name, "")
         is_custom = (tool_kinds or {}).get(tool_name) == "custom"
         if is_custom:
-            try:
-                parsed = json.loads(arguments)
-                custom_input = parsed.get("input", arguments) if isinstance(parsed, dict) else arguments
-            except (ValueError, TypeError):
-                custom_input = arguments
-            if not isinstance(custom_input, str):
-                custom_input = json.dumps(custom_input, ensure_ascii=False, separators=(",", ":"))
+            # Match the streaming bridge: a truncated wrapper is not custom-tool text,
+            # and malformed completed input must fail before any executable event.
+            custom_input = _decode_custom_tool_input(arguments) if status == "completed" else ""
             item: dict[str, Any] = {
                 "id": f"ctc_{response_id.removeprefix('resp_')}_{index}",
                 "type": "custom_tool_call",
-                "status": "completed",
+                "status": status,
                 "call_id": call_id,
                 "name": tool_name,
                 "input": custom_input,
@@ -1234,7 +1440,7 @@ def chat_message_to_response(
             item = {
                 "id": f"fc_{response_id.removeprefix('resp_')}_{index}",
                 "type": "function_call",
-                "status": "completed",
+                "status": status,
                 "call_id": call_id,
                 "name": tool_name,
                 "arguments": arguments,
@@ -1244,7 +1450,6 @@ def chat_message_to_response(
         output.append(item)
 
     usage = _response_usage(completion.get("usage"))
-    status = "incomplete" if finish_reason in OUTPUT_LIMIT_STOP_REASONS else "completed"
     result: dict[str, Any] = {
         "id": response_id,
         "object": "response",
@@ -1252,7 +1457,7 @@ def chat_message_to_response(
         "model": model or str(completion.get("model") or ""),
         "status": status,
         "output": output,
-        "parallel_tool_calls": True,
+        "parallel_tool_calls": parallel_tool_calls,
         "tool_choice": "auto",
         "output_text": "".join(text_parts),
         "usage": usage,
@@ -1267,7 +1472,15 @@ def anthropic_message_to_response(
     model: str = "",
     tool_namespaces: dict[str, str] | None = None,
     tool_kinds: dict[str, str] | None = None,
+    parallel_tool_calls: bool = True,
 ) -> dict[str, Any]:
+    if not isinstance(message, dict):
+        raise ValueError("Upstream Messages response must be an object")
+    if "error" in message or message.get("type") == "error":
+        error = _upstream_stream_error(message)
+        raise ValueError(f"Upstream {error['code']}: {error['message']}")
+    stop_reason = str(message.get("stop_reason") or "").strip().lower()
+    status = "incomplete" if stop_reason in OUTPUT_LIMIT_STOP_REASONS else "completed"
     response_id = str(message.get("id") or ("msg_" + str(int(time.time() * 1000))))
     response_id = response_id if response_id.startswith("resp_") else "resp_" + response_id
     output: list[dict[str, Any]] = []
@@ -1319,16 +1532,14 @@ def anthropic_message_to_response(
             namespace = (tool_namespaces or {}).get(tool_name, "")
             is_custom = (tool_kinds or {}).get(tool_name) == "custom"
             if is_custom:
-                if isinstance(raw_input, dict) and "input" in raw_input:
-                    custom_input = raw_input.get("input")
-                else:
-                    custom_input = raw_input
-                if not isinstance(custom_input, str):
-                    custom_input = json.dumps(custom_input, ensure_ascii=False, separators=(",", ":"))
+                arguments = raw_input if isinstance(raw_input, str) else json.dumps(
+                    raw_input, ensure_ascii=False, separators=(",", ":")
+                )
+                custom_input = _decode_custom_tool_input(arguments) if status == "completed" else ""
                 output_item = {
                     "id": f"ctc_{response_id.removeprefix('resp_')}_{index}",
                     "type": "custom_tool_call",
-                    "status": "completed",
+                    "status": status,
                     "call_id": call_id,
                     "name": tool_name,
                     "input": custom_input,
@@ -1340,7 +1551,7 @@ def anthropic_message_to_response(
                 output_item = {
                     "id": f"fc_{response_id.removeprefix('resp_')}_{index}",
                     "type": "function_call",
-                    "status": "completed",
+                    "status": status,
                     "call_id": call_id,
                     "name": tool_name,
                     "arguments": arguments,
@@ -1351,8 +1562,6 @@ def anthropic_message_to_response(
                 output_item
             )
     usage = _response_usage(message.get("usage"))
-    stop_reason = str(message.get("stop_reason") or "").strip().lower()
-    status = "incomplete" if stop_reason in OUTPUT_LIMIT_STOP_REASONS else "completed"
     result: dict[str, Any] = {
         "id": response_id,
         "object": "response",
@@ -1360,7 +1569,7 @@ def anthropic_message_to_response(
         "model": model or message.get("model") or "",
         "status": status,
         "output": output,
-        "parallel_tool_calls": True,
+        "parallel_tool_calls": parallel_tool_calls,
         "tool_choice": "auto",
         "output_text": "".join(text_parts),
         "usage": usage,
@@ -1439,6 +1648,14 @@ def response_to_sse(response: dict[str, Any]) -> list[bytes]:
     with ``status=incomplete`` leaves Codex thinking the stream disconnected
     before its terminal event arrived.
     """
+    # A gateway may ignore stream=True and return JSON. That fallback must obey
+    # the same tool-completion gate as live SSE, without mutating the caller's data.
+    response = dict(response)
+    response["output"] = [dict(item) for item in (response.get("output") or [])]
+    response_complete = str(response.get("status") or "completed") == "completed"
+    for item in response["output"]:
+        if item.get("type") in {"function_call", "custom_tool_call"} and not response_complete:
+            item["status"] = "incomplete"
     events: list[bytes] = []
     response_id = str(response.get("id") or "resp_local")
     created = dict(response)
@@ -1452,6 +1669,7 @@ def response_to_sse(response: dict[str, Any]) -> list[bytes]:
         )
     )
     for output_index, item in enumerate(response.get("output") or []):
+        tool_complete = response_complete and str(item.get("status") or "completed") == "completed"
         item_copy = dict(item)
         item_copy["status"] = "in_progress"
         if item_copy.get("type") == "function_call":
@@ -1539,7 +1757,7 @@ def response_to_sse(response: dict[str, Any]) -> list[bytes]:
                         response_id,
                     )
                 )
-        elif item.get("type") == "function_call":
+        elif item.get("type") == "function_call" and tool_complete:
             item_id = str(item.get("id") or f"fc_{output_index}")
             arguments = str(item.get("arguments") or "")
             if arguments:
@@ -1567,7 +1785,7 @@ def response_to_sse(response: dict[str, Any]) -> list[bytes]:
                     response_id,
                 )
             )
-        elif item.get("type") == "custom_tool_call":
+        elif item.get("type") == "custom_tool_call" and tool_complete:
             item_id = str(item.get("id") or f"ctc_{output_index}")
             custom_input = str(item.get("input") or "")
             if custom_input:
@@ -1596,7 +1814,7 @@ def response_to_sse(response: dict[str, Any]) -> list[bytes]:
                 )
             )
         done = dict(item)
-        done["status"] = "completed"
+        done["status"] = item.get("status") or "completed"
         events.append(
             _sse_frame(
                 "response.output_item.done",
@@ -1674,19 +1892,31 @@ def chat_sse_to_anthropic_sse(
             None,
         )
 
+    event_name = ""
+    data_lines: list[str] = []
     with upstream:
         reader = BoundedSSEReader(upstream)
         while True:
             line = reader.readline()
             if not line:
-                break
+                if data_lines:
+                    line = b"\n"
+                else:
+                    break
             decoded = line.decode("utf-8", "replace").rstrip("\r\n")
-            if not decoded.startswith("data:"):
+            if decoded:
+                if decoded.startswith("event:"):
+                    event_name = decoded[6:].strip()
+                elif decoded.startswith("data:"):
+                    data_lines.append(decoded[5:].lstrip())
                 continue
-            raw_payload = decoded[5:].strip()
-            if not raw_payload:
+            if not data_lines:
+                event_name = ""
                 continue
-            if raw_payload == "[DONE]":
+            raw_payload = "\n".join(data_lines)
+            frame_event = event_name
+            data_lines, event_name = [], ""
+            if raw_payload.strip() == "[DONE]":
                 saw_completion = True
                 break
             try:
@@ -1695,6 +1925,14 @@ def chat_sse_to_anthropic_sse(
                 continue
             if not isinstance(data, dict):
                 continue
+            if frame_event == "error" or "error" in data or data.get("type") == "error":
+                if outcome is not None:
+                    outcome["failed"] = True
+                error = _upstream_stream_error(data)
+                yield _sse_frame("error", {"type": "error", "error": {
+                    "type": error["code"], "message": error["message"],
+                }}, None)
+                return
             if data.get("usage"):
                 usage.update(data.get("usage") or {})
             if data.get("model"):
@@ -1817,7 +2055,8 @@ def chat_sse_to_anthropic_sse(
             return
         if not started:
             yield message_start()
-        # Close every open block, text first, then the terminal delta.
+        # A block stop can publish a tool to a client. Only close blocks after
+        # upstream completion evidence, never on an unconfirmed EOF.
         stop_order = sorted(
             [
                 index
@@ -1825,11 +2064,11 @@ def chat_sse_to_anthropic_sse(
                 if index is not None
             ]
         )
-        for index in stop_order:
-            yield _sse_frame(
-                "content_block_stop", {"type": "content_block_stop", "index": index}, None
-            )
         if saw_completion:
+            for index in stop_order:
+                yield _sse_frame(
+                    "content_block_stop", {"type": "content_block_stop", "index": index}, None
+                )
             if open_tool_blocks and stop_reason == "end_turn":
                 # Same contract as the non-stream path: tool_use blocks mean the turn
                 # stopped to run a tool, whatever inconsistent finish_reason the gateway
@@ -1870,6 +2109,7 @@ def chat_sse_to_responses(
     tool_namespaces: dict[str, str] | None = None,
     tool_kinds: dict[str, str] | None = None,
     outcome: dict[str, Any] | None = None,
+    parallel_tool_calls: bool = True,
 ) -> Any:
     """Yield Responses SSE frames while consuming an OpenAI Chat Completions SSE stream.
 
@@ -1898,7 +2138,7 @@ def chat_sse_to_responses(
         response = {
             "id": response_id, "object": "response", "created_at": int(time.time()),
             "model": response_model, "status": "in_progress", "output": [],
-            "parallel_tool_calls": True, "tool_choice": "auto", "usage": None,
+            "parallel_tool_calls": parallel_tool_calls, "tool_choice": "auto", "usage": None,
         }
         return _sse_frame(
             "response.created",
@@ -1996,8 +2236,8 @@ def chat_sse_to_responses(
         response = {
             "id": response_id, "object": "response", "created_at": int(time.time()),
             "model": response_model, "status": status, "output": clean_output,
-            "parallel_tool_calls": True, "tool_choice": "auto",
-            "output_text": "".join(text_buffers.values()),
+            "parallel_tool_calls": parallel_tool_calls, "tool_choice": "auto",
+            "output_text": _response_output_text(clean_output),
             "usage": _response_usage(usage),
         }
         if status == "incomplete":
@@ -2031,6 +2271,7 @@ def chat_sse_to_responses(
                 event_name = ""
                 continue
             raw_payload = "\n".join(data_lines)
+            frame_event = event_name
             data_lines, event_name = [], ""
             if raw_payload.strip() == "[DONE]":
                 saw_completion = True
@@ -2041,6 +2282,13 @@ def chat_sse_to_responses(
                 continue
             if not isinstance(data, dict):
                 continue
+            if frame_event == "error" or "error" in data or data.get("type") == "error":
+                if outcome is not None:
+                    outcome["failed"] = True
+                yield ensure_created()
+                yield _response_stream_failure(response_id, _upstream_stream_error(data))
+                yield b"data: [DONE]\n\n"
+                return
             if data.get("usage"):
                 usage.update(data.get("usage") or {})
             if data.get("model"):
@@ -2139,26 +2387,9 @@ def chat_sse_to_responses(
                         continue
                     record["arguments"] += arguments_fragment
                     if record["custom"]:
-                        # Custom tools are bridged as {"input": <string>}; unwrap on the fly
-                        # when a fragment happens to be complete JSON, else pass it through.
-                        try:
-                            parsed = json.loads(arguments_fragment)
-                            piece = parsed.get("input", arguments_fragment) if isinstance(parsed, dict) else arguments_fragment
-                        except (ValueError, TypeError):
-                            piece = arguments_fragment
-                        if not isinstance(piece, str):
-                            piece = json.dumps(piece, ensure_ascii=False, separators=(",", ":"))
-                        item["input"] = str(item.get("input") or "") + piece
-                        yield _sse_frame(
-                            "response.custom_tool_call_input.delta",
-                            {
-                                "type": "response.custom_tool_call_input.delta",
-                                "item_id": item["id"],
-                                "output_index": item["_output_index"],
-                                "delta": piece,
-                            },
-                            response_id,
-                        )
+                        # The JSON wrapper may split inside an escape or field name.
+                        # Buffer it until completion, then emit only the decoded text.
+                        continue
                     else:
                         item["arguments"] = str(item.get("arguments") or "") + arguments_fragment
                         yield _sse_frame(
@@ -2172,7 +2403,38 @@ def chat_sse_to_responses(
                             response_id,
                         )
 
-        # Close every open item in order, then emit the terminal events.
+        if not output and not saw_completion:
+            if outcome is not None:
+                outcome["retryable"] = True
+            return
+        if not saw_completion:
+            if outcome is not None:
+                outcome["truncated"] = True
+            # A done marker is executable to some clients. Never mark partial tool
+            # arguments done before establishing that the upstream completed.
+            yield ensure_created()
+            yield _response_stream_failure(response_id, {
+                "code": "upstream_stream_truncated",
+                "message": "上游截断了响应流（未收到完成事件）",
+            })
+            yield b"data: [DONE]\n\n"
+            return
+        incomplete = finish_reason in OUTPUT_LIMIT_STOP_REASONS
+        if not incomplete:
+            try:
+                for record in tool_items.values():
+                    if record["custom"]:
+                        record["item"]["input"] = _decode_custom_tool_input(record["arguments"])
+            except (ValueError, TypeError) as error:
+                if outcome is not None:
+                    outcome["failed"] = True
+                yield _response_stream_failure(response_id, {
+                    "code": "invalid_custom_tool_arguments", "message": str(error),
+                })
+                yield b"data: [DONE]\n\n"
+                return
+
+        # Close every complete item in order, then emit the terminal events.
         for item in output:
             output_index = item["_output_index"]
             if item["type"] == "message":
@@ -2223,7 +2485,7 @@ def chat_sse_to_responses(
                     },
                     response_id,
                 )
-            elif item["type"] == "function_call":
+            elif item["type"] == "function_call" and not incomplete:
                 yield _sse_frame(
                     "response.function_call_arguments.done",
                     {
@@ -2234,7 +2496,13 @@ def chat_sse_to_responses(
                     },
                     response_id,
                 )
-            elif item["type"] == "custom_tool_call":
+            elif item["type"] == "custom_tool_call" and not incomplete:
+                if item.get("input"):
+                    yield _sse_frame(
+                        "response.custom_tool_call_input.delta",
+                        {"type": "response.custom_tool_call_input.delta", "item_id": item["id"],
+                         "output_index": output_index, "delta": item["input"]}, response_id,
+                    )
                 yield _sse_frame(
                     "response.custom_tool_call_input.done",
                     {
@@ -2245,7 +2513,7 @@ def chat_sse_to_responses(
                     },
                     response_id,
                 )
-            item["status"] = "completed"
+            item["status"] = "incomplete" if incomplete else "completed"
             yield _sse_frame(
                 "response.output_item.done",
                 {
@@ -2300,6 +2568,7 @@ def anthropic_sse_to_responses(
     tool_namespaces: dict[str, str] | None = None,
     tool_kinds: dict[str, str] | None = None,
     outcome: dict[str, Any] | None = None,
+    parallel_tool_calls: bool = True,
 ) -> Any:
     """Yield Responses SSE frames while consuming Anthropic Messages SSE.
 
@@ -2313,6 +2582,9 @@ def anthropic_sse_to_responses(
     blocks: dict[int, dict[str, Any]] = {}
     output_indices: dict[int, int] = {}
     text_buffers: dict[int, str] = {}
+    tool_arguments: dict[int, str] = {}
+    streamed_arguments: set[int] = set()
+    closed_tools: set[int] = set()
     usage: dict[str, int] = {}
     created_sent = False
     completed_sent = False
@@ -2330,7 +2602,7 @@ def anthropic_sse_to_responses(
         response = {
             "id": response_id, "object": "response", "created_at": int(time.time()),
             "model": response_model, "status": "in_progress", "output": [],
-            "parallel_tool_calls": True, "tool_choice": "auto", "usage": None,
+            "parallel_tool_calls": parallel_tool_calls, "tool_choice": "auto", "usage": None,
         }
         return _sse_frame(
             "response.created",
@@ -2347,7 +2619,7 @@ def anthropic_sse_to_responses(
         response = {
             "id": response_id, "object": "response", "created_at": int(time.time()),
             "model": response_model, "status": status, "output": output,
-            "parallel_tool_calls": True, "tool_choice": "auto", "output_text": "".join(text_buffers.values()),
+            "parallel_tool_calls": parallel_tool_calls, "tool_choice": "auto", "output_text": _response_output_text(output),
             "usage": _response_usage(usage),
         }
         if status == "incomplete":
@@ -2358,6 +2630,37 @@ def anthropic_sse_to_responses(
             {"type": terminal_event, "response": response},
             response_id,
         )
+
+    def append_text(block_index: int, text: str) -> bytes:
+        if not text:
+            return b""
+        frames = ensure_created()
+        output_index = output_indices.get(block_index)
+        if output_index is None:
+            output_index = len(output)
+            output_indices[block_index] = output_index
+            item = {
+                "id": f"msg_{response_id.removeprefix('resp_')}_{block_index}",
+                "type": "message", "status": "in_progress", "role": "assistant",
+                "content": [{"type": "output_text", "text": "", "annotations": []}],
+            }
+            output.append(item)
+            frames += _sse_frame("response.output_item.added", {
+                "type": "response.output_item.added", "output_index": output_index,
+                "item": item,
+            }, response_id)
+            frames += _sse_frame("response.content_part.added", {
+                "type": "response.content_part.added", "item_id": item["id"],
+                "output_index": output_index, "content_index": 0,
+                "part": {"type": "output_text", "text": "", "annotations": []},
+            }, response_id)
+        item = output[output_index]
+        text_buffers[block_index] = text_buffers.get(block_index, "") + text
+        item["content"][0]["text"] = text_buffers[block_index]
+        return frames + _sse_frame("response.output_text.delta", {
+            "type": "response.output_text.delta", "item_id": item["id"],
+            "output_index": output_index, "content_index": 0, "delta": text,
+        }, response_id)
 
     event_name = ""
     data_lines: list[str] = []
@@ -2389,7 +2692,15 @@ def anthropic_sse_to_responses(
                 data_lines, event_name = [], ""
                 continue
             kind = str(data.get("type") or event_name)
+            is_error = "error" in data or kind == "error" or event_name == "error"
             data_lines, event_name = [], ""
+            if is_error:
+                if outcome is not None:
+                    outcome["failed"] = True
+                yield ensure_created()
+                yield _response_stream_failure(response_id, _upstream_stream_error(data))
+                yield b"data: [DONE]\n\n"
+                return
             if kind == "message_start":
                 message = data.get("message") if isinstance(data.get("message"), dict) else {}
                 response_id = "resp_" + str(message.get("id") or response_id.replace("resp_", ""))
@@ -2412,6 +2723,12 @@ def anthropic_sse_to_responses(
                     # the item only exists once an actual text delta arrives.
                     blocks[block_index] = block
                     text_buffers[block_index] = ""
+                    # A lazy block does not own an output slot until it has text.
+                    # Another block may be materialized first (or this one stays empty).
+                    output_indices.pop(block_index, None)
+                    initial_text = str(block.get("text") or "")
+                    if initial_text:
+                        yield append_text(block_index, initial_text)
                 elif block_type in {"thinking", "redacted_thinking"}:
                     # Extended thinking arrives as its own block kind.  Translate it to a
                     # Responses reasoning item with one summary part so the client can show
@@ -2455,19 +2772,14 @@ def anthropic_sse_to_responses(
                     is_custom = (tool_kinds or {}).get(tool_name) == "custom"
                     item_id = f"{'ctc' if is_custom else 'fc'}_{response_id.removeprefix('resp_')}_{output_index}"
                     initial_input = block.get("input")
+                    tool_arguments[block_index] = (
+                        json.dumps(initial_input, ensure_ascii=False, separators=(",", ":"))
+                        if initial_input not in (None, {}) else ""
+                    )
                     if is_custom:
-                        initial_value = (
-                            initial_input.get("input")
-                            if isinstance(initial_input, dict) and "input" in initial_input
-                            else initial_input
-                        )
-                        initial_arguments = initial_value if isinstance(initial_value, str) else (
-                            json.dumps(initial_value, ensure_ascii=False, separators=(",", ":"))
-                            if initial_value is not None else ""
-                        )
                         item = {
                             "id": item_id, "type": "custom_tool_call", "status": "in_progress",
-                            "call_id": call_id, "name": tool_name, "input": initial_arguments,
+                            "call_id": call_id, "name": tool_name, "input": "",
                         }
                     else:
                         initial_arguments = (
@@ -2495,65 +2807,14 @@ def anthropic_sse_to_responses(
                     )
             elif kind == "content_block_delta":
                 block_index = int(data.get("index") or 0)
-                output_index = output_indices.get(block_index, 0)
-                item = output[output_index] if output and output_index < len(output) else None
+                output_index = output_indices.get(block_index, -1)
+                item = output[output_index] if 0 <= output_index < len(output) else None
                 delta = data.get("delta") if isinstance(data.get("delta"), dict) else {}
                 delta_type = delta.get("type")
                 if delta_type == "text_delta":
                     text = str(delta.get("text") or "")
-                    text_buffers[block_index] = text_buffers.get(block_index, "") + text
-                    if item is None and output_index >= len(output):
-                        # First real text on a lazily-tracked block: create the message item
-                        # now, so gateways that open with an empty text block never produce
-                        # an empty assistant bubble on the client.
-                        item = {
-                            "id": response_id.replace("resp_", "msg_", 1),
-                            "type": "message",
-                            "status": "in_progress",
-                            "role": "assistant",
-                            "content": [],
-                        }
-                        output.append(item)
-                        output_indices[block_index] = output_index
-                        yield ensure_created()
-                        yield _sse_frame(
-                            "response.output_item.added",
-                            {
-                                "type": "response.output_item.added",
-                                "output_index": output_index,
-                                "item": item,
-                            },
-                            response_id,
-                        )
-                        yield _sse_frame(
-                            "response.content_part.added",
-                            {
-                                "type": "response.content_part.added",
-                                "item_id": item["id"],
-                                "output_index": output_index,
-                                "content_index": 0,
-                                "part": {
-                                    "type": "output_text",
-                                    "text": "",
-                                    "annotations": [],
-                                },
-                            },
-                            response_id,
-                        )
-                        item["content"].append({"type": "output_text", "text": "", "annotations": []})
-                    if item and item.get("content"):
-                        item["content"][0]["text"] = text_buffers[block_index]
-                    yield _sse_frame(
-                        "response.output_text.delta",
-                        {
-                            "type": "response.output_text.delta",
-                            "item_id": item.get("id") if item else response_id,
-                            "output_index": output_index,
-                            "content_index": 0,
-                            "delta": text,
-                        },
-                        response_id,
-                    )
+                    if text:
+                        yield append_text(block_index, text)
                 elif delta_type == "thinking_delta":
                     thinking = str(delta.get("thinking") or "")
                     text_buffers[block_index] = text_buffers.get(block_index, "") + thinking
@@ -2574,15 +2835,19 @@ def anthropic_sse_to_responses(
                     )
                 elif delta_type == "input_json_delta":
                     partial = str(delta.get("partial_json") or "")
+                    if not item or item.get("type") not in {"function_call", "custom_tool_call"}:
+                        raise ValueError("Tool arguments have no matching tool block")
+                    if block_index not in streamed_arguments:
+                        # The stream contains the complete JSON value; input={} on the
+                        # start event is a placeholder, not an argument prefix.
+                        streamed_arguments.add(block_index)
+                        tool_arguments[block_index] = ""
+                        if item.get("type") == "function_call":
+                            item["arguments"] = ""
+                    tool_arguments[block_index] += partial
                     if item:
                         if item.get("type") == "custom_tool_call":
-                            try:
-                                part_obj = json.loads(partial)
-                                partial_value = part_obj.get("input", "") if isinstance(part_obj, dict) else part_obj
-                            except (ValueError, TypeError):
-                                partial_value = partial
-                            partial = partial_value if isinstance(partial_value, str) else str(partial_value)
-                            item["input"] = str(item.get("input") or "") + partial
+                            continue
                         else:
                             item["arguments"] = str(item.get("arguments") or "") + partial
                         item_id = item.get("id")
@@ -2602,8 +2867,13 @@ def anthropic_sse_to_responses(
                     yield _sse_frame(event_type, event_payload, response_id)
             elif kind == "content_block_stop":
                 block_index = int(data.get("index") or 0)
-                output_index = output_indices.get(block_index, 0)
-                item = output[output_index] if output and output_index < len(output) else None
+                output_index = output_indices.get(block_index, -1)
+                item = output[output_index] if 0 <= output_index < len(output) else None
+                if item and item.get("type") in {"function_call", "custom_tool_call"}:
+                    closed_tools.add(block_index)
+                    # Completion of a block does not establish completion of the turn.
+                    # A subsequent max_tokens/error/EOF must not run a partial tool.
+                    continue
                 if item and item.get("type") == "message":
                     text = str(text_buffers.get(block_index) or "")
                     yield _sse_frame(
@@ -2697,17 +2967,54 @@ def anthropic_sse_to_responses(
                     stop_reason = str(delta.get("stop_reason")).strip().lower()
                 usage.update(data.get("usage") or {})
             elif kind == "message_stop":
+                incomplete = stop_reason in OUTPUT_LIMIT_STOP_REASONS
+                try:
+                    # Validate all tool endings before publishing any executable done.
+                    for block_index, arguments in tool_arguments.items():
+                        item = output[output_indices[block_index]]
+                        if not incomplete:
+                            if block_index not in closed_tools:
+                                raise ValueError("Tool block ended without content_block_stop")
+                            if item["type"] == "custom_tool_call":
+                                item["input"] = _decode_custom_tool_input(arguments)
+                            elif not item.get("arguments"):
+                                item["arguments"] = "{}"
+                except (ValueError, TypeError) as error:
+                    if outcome is not None:
+                        outcome["failed"] = True
+                    yield _response_stream_failure(response_id, {
+                        "code": "invalid_tool_arguments", "message": str(error),
+                    })
+                    yield b"data: [DONE]\n\n"
+                    return
+                for block_index in tool_arguments:
+                    output_index = output_indices[block_index]
+                    item = output[output_index]
+                    if not incomplete:
+                        if item["type"] == "custom_tool_call":
+                            if item["input"]:
+                                yield _sse_frame("response.custom_tool_call_input.delta", {
+                                    "type": "response.custom_tool_call_input.delta", "item_id": item["id"],
+                                    "output_index": output_index, "delta": item["input"],
+                                }, response_id)
+                            yield _sse_frame("response.custom_tool_call_input.done", {
+                                "type": "response.custom_tool_call_input.done", "item_id": item["id"],
+                                "output_index": output_index, "input": item["input"],
+                            }, response_id)
+                        else:
+                            yield _sse_frame("response.function_call_arguments.done", {
+                                "type": "response.function_call_arguments.done", "item_id": item["id"],
+                                "output_index": output_index, "arguments": item["arguments"],
+                            }, response_id)
+                    item["status"] = "incomplete" if incomplete else "completed"
+                    yield _sse_frame("response.output_item.done", {
+                        "type": "response.output_item.done", "output_index": output_index, "item": item,
+                    }, response_id)
                 saw_message_stop = True
                 final = finish()
                 if final:
                     yield final
                 break
-            elif kind == "error":
-                yield _sse_frame(
-                    "error",
-                    {"type": "error", "error": data.get("error", data)},
-                    response_id,
-                )
         if not created_sent and not output:
             # The upstream stream produced nothing observable: no created, no blocks, no
             # usage.  Yield not a single byte (not even [DONE]) so the relaying caller can
@@ -3031,6 +3338,9 @@ class RouterState:
         # regression harness can zero it and keep hot reloads deterministic without sleeps.
         self.signature_throttle_seconds = 0.5
         self._routing: RoutingSnapshot | None = None
+        # Remember only the fingerprint of a credential rejected by this provider. A
+        # registry reload must not revive it; replacing the key permits another attempt.
+        self._rejected_credentials: dict[str, str] = {}
         # Why the last reload was refused, if it was.  A rejected providers.json leaves the
         # previous table serving, which is the right call for availability but used to be
         # completely invisible: no log line, nothing in /healthz, and a manager that could
@@ -3116,7 +3426,19 @@ class RouterState:
                 return
             rebuilt = self._rebuild_routing()
             if rebuilt is None:
-                # Keep serving the last known-good configuration and retry on the next request.
+                # Retain valid routes, but never retain a deleted/unreadable credential
+                # just because providers.json is malformed at the same time.
+                with self.lock:
+                    previous = self._routing
+                if previous is not None:
+                    keys = self._read_routing_keys(previous.providers)
+                    # Revoke changed keys too. Bind a new credential to routes only after
+                    # providers.json validates, rather than combining two generations.
+                    keys = {vendor: key for vendor, key in keys.items()
+                            if previous.keys.get(vendor) == key}
+                    with self.lock:
+                        self._routing = replace(previous, keys=keys)
+                        self.keys = keys
                 return
             registry, providers, routes, keys = rebuilt
             forced: set[str] = set()
@@ -3174,6 +3496,14 @@ class RouterState:
                 self.failover_vendors = set(routing.failover_vendors)
                 self.failover_registry = routing.registry
                 self._config_signature = signature
+                self._rejected_credentials = {
+                    vendor: fingerprint
+                    for vendor, fingerprint in self._rejected_credentials.items()
+                    if vendor in providers and (
+                        vendor not in keys
+                        or sha256(keys[vendor].encode()).hexdigest() == fingerprint
+                    )
+                }
 
     def routing_snapshot(self) -> RoutingSnapshot:
         """Return one live generation without invalidating requests using the old one."""
@@ -3191,7 +3521,9 @@ class RouterState:
     def _rebuild_routing(self) -> tuple[Any, Any, Any, Any] | None:
         """Build a fresh routing table, or None when the file cannot be trusted yet."""
         try:
-            registry = load_registry(self.registry_path)
+            # Credential readiness is per provider. A missing secret must not prevent
+            # unrelated routing edits from loading, or preserve an old key in memory.
+            registry = load_registry(self.registry_path, allow_missing_secrets=True)
             providers = {
                 provider["id"]: provider
                 for provider in registry["providers"]
@@ -3214,21 +3546,61 @@ class RouterState:
                             provider["id"],
                             model["id"],
                         )
-            keys: dict[str, str] = {}
-            for provider_id, provider in providers.items():
-                if provider.get("auth_type") == "codex_auth":
-                    value = read_codex_auth_key(self.auth_path)
-                else:
-                    value = provider_key(provider)
-                if not value:
-                    return self._refuse(f"provider {provider_id!r} has no usable credential")
-                keys[provider_id] = value
+            keys = self._read_routing_keys(providers)
         except Exception as error:  # noqa: BLE001 - keep serving with the config we already have
             return self._refuse(f"{type(error).__name__}: {error}")
         with self.lock:
             self.config_error = ""
             self.config_error_at = 0.0
         return registry, providers, routes, keys
+
+    def _read_routing_keys(self, providers: dict[str, Any]) -> dict[str, str]:
+        keys: dict[str, str] = {}
+        for vendor, provider in providers.items():
+            try:
+                value = (
+                    read_codex_auth_key(self.auth_path)
+                    if provider.get("auth_type") == "codex_auth"
+                    else provider_key(provider)
+                )
+                if value:
+                    keys[vendor] = value
+            except Exception:  # noqa: BLE001 - isolate missing/unreadable credentials
+                continue
+        return keys
+
+    def reject_credential(self, vendor: str, key: str) -> None:
+        with self.lock:
+            # An old in-flight 401 must not disable a newly installed key.
+            if self._routing is not None and self._routing.keys.get(vendor) == key:
+                self._rejected_credentials[vendor] = sha256(key.encode()).hexdigest()
+
+    def credential_problem(self, vendor: str, key: str | None) -> str:
+        with self.lock:
+            current = self._routing.keys.get(vendor) if self._routing is not None else None
+            if not current:
+                return f"Provider {vendor!r} has no readable API key; add a key to resume."
+            if current != key:
+                return f"Provider {vendor!r} credentials changed; submit a new request."
+            if self._rejected_credentials.get(vendor) == sha256(current.encode()).hexdigest():
+                return (
+                    f"Provider {vendor!r} rejected its API key (HTTP 401). "
+                    "Further upstream requests are paused; replace the key to resume."
+                )
+        return ""
+
+    def credential_status(self) -> dict[str, str]:
+        with self.lock:
+            routing = self._routing
+            if routing is None:
+                return {}
+            return {
+                vendor: "missing_or_unreadable" if not routing.keys.get(vendor) else "rejected"
+                for vendor in routing.providers
+                if not routing.keys.get(vendor)
+                or self._rejected_credentials.get(vendor)
+                == sha256(routing.keys[vendor].encode()).hexdigest()
+            }
 
     def forced_fast_models(self, routing: RoutingSnapshot | None = None) -> frozenset[str]:
         """Slugs whose requests get service_tier=priority."""
@@ -3415,6 +3787,7 @@ class RouterState:
 
     def clear_keys(self) -> None:
         with self.lock:
+            self._rejected_credentials.clear()
             routing = self._routing
             if routing is None:
                 self.keys = {}
@@ -3474,6 +3847,48 @@ class SotaRouterHandler(BaseHTTPRequestHandler):
             pass
         finally:
             self.close_connection = True
+
+    def end_headers(self) -> None:
+        # Applies to both JSON and streaming replies. Browser pages must not
+        # sniff these responses or reuse a cached private model/health listing.
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Cache-Control", "no-store")
+        super().end_headers()
+
+    def _browser_request_allowed(self) -> bool:
+        """Native clients send no Origin; remote browser pages may not spend keys.
+
+        CORS alone does not stop a simple text/plain POST from starting a billed
+        generation. Check Origin before reading/routing its body, and do not emit
+        permissive CORS headers. Also reject browser cross-site requests that omit
+        Origin, and prevent DNS rebinding through an attacker-controlled Host.
+        """
+        host = self.headers.get("Host", "")
+        try:
+            target = urllib.parse.urlsplit("http://" + host)
+            if target.hostname not in {"127.0.0.1", "localhost", "::1"}:
+                return False
+            if target.port is not None and target.port != self.server.server_port:
+                return False
+        except ValueError:
+            return False
+        origin = self.headers.get("Origin")
+        if origin:
+            try:
+                parsed = urllib.parse.urlsplit(origin)
+                if parsed.scheme not in {"http", "https"}:
+                    return False
+                if parsed.hostname not in {"127.0.0.1", "localhost", "::1"}:
+                    return False
+                expected_port = 443 if parsed.scheme == "https" else 80
+                if (parsed.port or expected_port) != self.server.server_port:
+                    return False
+            except ValueError:
+                return False
+        elif self.headers.get("Sec-Fetch-Site", "").lower() == "cross-site":
+            return False
+        return True
 
     def _client_protocol(self) -> str:
         """The wire protocol the client below us speaks, from the path it called."""
@@ -3715,6 +4130,12 @@ class SotaRouterHandler(BaseHTTPRequestHandler):
         return url
 
     def _route_request(self) -> None:
+        if not self._browser_request_allowed():
+            self._json_response(403, {"error": {
+                "message": "Browser requests from another origin are not allowed to access the local router",
+                "type": "cross_origin_request_denied",
+            }})
+            return
         clean_path = self.path.split("?", 1)[0]
         if clean_path in {"/health", "/v1/health", "/healthz", "/v1/healthz"}:
             # Health answers drive restart decisions, so they must never be served from
@@ -3752,6 +4173,7 @@ class SotaRouterHandler(BaseHTTPRequestHandler):
                     "config_error_age_seconds": (
                         round(time.time() - config_error_at) if config_error_at else 0
                     ),
+                    "credential_errors": self.state.credential_status(),
                 },
             )
             return
@@ -3979,27 +4401,24 @@ class SotaRouterHandler(BaseHTTPRequestHandler):
                     },
                 )
                 return
-        if clean_path in COMPACT_PATHS:
+        self._bridged_compaction = False
+        if is_compaction_request(clean_path, payload):
             primary_provider = routing.providers.get(candidates[0][0]) if candidates else None
             if primary_provider is not None and (
                 is_juno_adapter(primary_provider)
                 or is_chat_completions_adapter(primary_provider)
             ):
-                # There is no semantics-preserving Responses -> Messages mapping for compact.
-                # Refuse locally before credentials, retries, or failover can reach an upstream.
-                self._json_response(
-                    501,
-                    {
-                        "error": {
-                            "message": (
-                                "Responses compact is not supported by the juno "
-                                "Messages adapter"
-                            ),
-                            "type": "unsupported_adapter_operation",
-                        }
-                    },
-                )
-                return
+                if self.command != "POST":
+                    self._json_response(405, {"error": {"message": "Compaction requires POST", "type": "invalid_request_method"}})
+                    return
+                self._bridged_compaction = True
+                self._bridged_compaction_stream = clean_path not in COMPACT_PATHS and bool(payload.get("stream"))
+                self._bridged_compaction_parallel = payload.get("parallel_tool_calls") is not False
+                try:
+                    payload = responses_compaction_payload(payload)
+                except (TypeError, ValueError) as error:
+                    self._json_response(400, {"error": {"message": str(error), "type": "invalid_compaction_request"}})
+                    return
         counting_tokens = clean_path in COUNT_TOKENS_PATHS and isinstance(payload, dict)
         # Treat every request arriving at a generation route as non-replayable.  POST is the
         # normal wire method, but being conservative for an unusual GET/PUT/PATCH caller is
@@ -4041,6 +4460,16 @@ class SotaRouterHandler(BaseHTTPRequestHandler):
         for index, (vendor, upstream_model) in enumerate(candidates):
             provider = routing.providers.get(vendor)
             key = routing.keys.get(vendor)
+            if provider is not None:
+                problem = self.state.credential_problem(vendor, key)
+                if problem:
+                    # 400 is terminal for the caller. Neither replaying this request nor
+                    # billing a different provider repairs a missing/rejected credential.
+                    # Do not log this as an upstream attempt: no network request occurred.
+                    self._json_response(
+                        400, {"error": {"message": problem, "type": "provider_auth_unavailable"}}
+                    )
+                    return
             if provider is None or not key:
                 last_status, last_error = 502, "routing generation is incomplete"
                 self.state.record(
@@ -4054,9 +4483,9 @@ class SotaRouterHandler(BaseHTTPRequestHandler):
                 )
                 continue
             body = outgoing_body
-            adapter = is_juno_adapter(provider)
+            adapter = is_juno_adapter(provider) and request_protocol == "responses"
             if counting_tokens and (
-                adapter
+                is_juno_adapter(provider)
                 or is_chat_completions_adapter(provider)
                 or is_messages_to_chat_adapter(provider)
             ):
@@ -4069,6 +4498,15 @@ class SotaRouterHandler(BaseHTTPRequestHandler):
                 return
             if isinstance(payload, dict) and upstream_model:
                 payload["model"] = upstream_model
+                if clean_path in RESPONSES_GENERATION_PATHS:
+                    output_limit = configured_max_output_tokens(provider, upstream_model)
+                    if output_limit is not None:
+                        requested_limit = payload.get("max_output_tokens")
+                        payload["max_output_tokens"] = (
+                            min(requested_limit, output_limit)
+                            if type(requested_limit) is int and requested_limit > 0
+                            else output_limit
+                        )
                 if forced_fast and clean_path not in {"/messages", "/v1/messages"} and not adapter:
                     payload["service_tier"] = "priority"
                 try:
@@ -4079,14 +4517,16 @@ class SotaRouterHandler(BaseHTTPRequestHandler):
                     elif is_messages_to_chat_adapter(provider):
                         translated = messages_to_chat_payload(payload, upstream_model)
                     else:
-                        translated = payload
+                        # Local state is restored even if the user switches to a native
+                        # Responses provider. Unrelated upstream compaction stays opaque.
+                        translated = restore_compaction_payload(payload)
                     body = json.dumps(translated, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
                 except (TypeError, ValueError, OverflowError) as error:
                     self._json_response(
                         400,
                         {
                             "error": {
-                                "message": f"Could not translate Responses request for juno: {error}",
+                                "message": f"Could not translate request for {vendor}: {error}",
                                 "type": "request_translation_error",
                             }
                         },
@@ -4137,13 +4577,11 @@ class SotaRouterHandler(BaseHTTPRequestHandler):
                 )
                 last_status, last_error = status, error or f"HTTP {status}"
                 break
-            # One invisible same-vendor retry when the stream dies before any
-            # state-bearing event has reached the client.  The apps retry a visible
-            # failure themselves (and re-bill), so absorbing the early death here costs
-            # the same and the user never sees it.  A stream that already showed content
-            # is never retried -- duplicating visible output is strictly worse.
+            # A received HTTP stream proves the request was sent, even if it yielded
+            # no content. Only explicitly replay-safe operations may repeat it.
             self._relay_headers_sent = False
-            for attempt_round in range(2):
+            relay_attempts = 2 if request_can_replay else 1
+            for attempt_round in range(relay_attempts):
                 retry_stream = self._relay(
                     upstream,
                     vendor,
@@ -4154,9 +4592,9 @@ class SotaRouterHandler(BaseHTTPRequestHandler):
                     request_payload=payload if isinstance(payload, dict) else None,
                     tool_namespaces=tool_namespaces,
                     tool_kinds=tool_kinds,
-                    is_final_attempt=attempt_round == 1,
+                    is_final_attempt=attempt_round == relay_attempts - 1,
                 )
-                if not retry_stream:
+                if not retry_stream or attempt_round == relay_attempts - 1:
                     return
                 self.state.record(
                     vendor,
@@ -4268,10 +4706,14 @@ class SotaRouterHandler(BaseHTTPRequestHandler):
                         if upstream_is_sse:
                             outcome: dict[str, Any] = {}
                             for chunk in anthropic_sse_to_responses(
-                                upstream, model, tool_namespaces, tool_kinds, outcome
+                                upstream, model, tool_namespaces, tool_kinds, outcome,
+                                parallel_tool_calls=(request_payload or {}).get("parallel_tool_calls") is not False,
                             ):
                                 write_chunk(chunk)
-                            if outcome.get("truncated"):
+                            if outcome.get("failed"):
+                                status = 502
+                                relay_error = "upstream adapter stream reported an error"
+                            elif outcome.get("truncated"):
                                 # The client already received the protocol-level terminal
                                 # event; record the run as a failure so the health board
                                 # and the log can see the gateway truncating.
@@ -4298,7 +4740,8 @@ class SotaRouterHandler(BaseHTTPRequestHandler):
                             if len(raw) > MAX_REQUEST_BODY_BYTES:
                                 raise ValueError("upstream response exceeded the adapter limit")
                             response = anthropic_message_to_response(
-                                json.loads(raw), model, tool_namespaces, tool_kinds
+                                json.loads(raw), model, tool_namespaces, tool_kinds,
+                                parallel_tool_calls=(request_payload or {}).get("parallel_tool_calls") is not False,
                             )
                             for chunk in response_to_sse(response):
                                 write_chunk(chunk)
@@ -4313,7 +4756,8 @@ class SotaRouterHandler(BaseHTTPRequestHandler):
                     if len(raw) > MAX_REQUEST_BODY_BYTES:
                         raise ValueError("upstream response exceeded the adapter limit")
                     response = anthropic_message_to_response(
-                        json.loads(raw), model, tool_namespaces, tool_kinds
+                        json.loads(raw), model, tool_namespaces, tool_kinds,
+                        parallel_tool_calls=(request_payload or {}).get("parallel_tool_calls") is not False,
                     )
                     data = json.dumps(response, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
                     self.send_response(status)
@@ -4444,10 +4888,14 @@ class SotaRouterHandler(BaseHTTPRequestHandler):
                     if upstream_is_sse:
                         outcome: dict[str, Any] = {}
                         for chunk in chat_sse_to_responses(
-                            upstream, model, tool_namespaces, tool_kinds, outcome
+                            upstream, model, tool_namespaces, tool_kinds, outcome,
+                            parallel_tool_calls=(request_payload or {}).get("parallel_tool_calls") is not False,
                         ):
                             write_chunk(chunk)
-                        if outcome.get("truncated"):
+                        if outcome.get("failed"):
+                            status = 502
+                            relay_error = "upstream adapter stream reported an error"
+                        elif outcome.get("truncated"):
                             status = 502
                             relay_error = "truncated SSE stream: no completion event"
                         elif outcome.get("retryable"):
@@ -4460,7 +4908,7 @@ class SotaRouterHandler(BaseHTTPRequestHandler):
                             # understands instead of leaving it an empty stream.
                             self._write_stream_error_frame(
                                 friendly_upstream_error("timeout", vendor),
-                                protocol="messages" if is_messages_to_chat_adapter(provider) else "responses",
+                                protocol="responses",
                                 send_status=True,
                             )
                             status = 502
@@ -4470,7 +4918,8 @@ class SotaRouterHandler(BaseHTTPRequestHandler):
                         if len(raw) > MAX_REQUEST_BODY_BYTES:
                             raise ValueError("upstream response exceeded the adapter limit")
                         response = chat_message_to_response(
-                            json.loads(raw), model, tool_namespaces, tool_kinds
+                            json.loads(raw), model, tool_namespaces, tool_kinds,
+                            parallel_tool_calls=(request_payload or {}).get("parallel_tool_calls") is not False,
                         )
                         for chunk in response_to_sse(response):
                             write_chunk(chunk)
@@ -4481,7 +4930,8 @@ class SotaRouterHandler(BaseHTTPRequestHandler):
                     if len(raw) > MAX_REQUEST_BODY_BYTES:
                         raise ValueError("upstream response exceeded the adapter limit")
                     response = chat_message_to_response(
-                        json.loads(raw), model, tool_namespaces, tool_kinds
+                        json.loads(raw), model, tool_namespaces, tool_kinds,
+                        parallel_tool_calls=(request_payload or {}).get("parallel_tool_calls") is not False,
                     )
                     data = json.dumps(response, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
                     self.send_response(status)
@@ -4613,7 +5063,10 @@ class SotaRouterHandler(BaseHTTPRequestHandler):
                             upstream, model, outcome, thinking_enabled
                         ):
                             write_chunk(chunk)
-                        if outcome.get("truncated"):
+                        if outcome.get("failed"):
+                            status = 502
+                            relay_error = "upstream adapter stream reported an error"
+                        elif outcome.get("truncated"):
                             status = 502
                             relay_error = "truncated SSE stream: no completion event"
                         elif outcome.get("retryable"):
@@ -4626,7 +5079,7 @@ class SotaRouterHandler(BaseHTTPRequestHandler):
                             # understands instead of leaving it an empty stream.
                             self._write_stream_error_frame(
                                 friendly_upstream_error("timeout", vendor),
-                                protocol="messages" if is_messages_to_chat_adapter(provider) else "responses",
+                                protocol="messages",
                                 send_status=True,
                             )
                             status = 502
@@ -4635,18 +5088,34 @@ class SotaRouterHandler(BaseHTTPRequestHandler):
                         raw = upstream.read(MAX_REQUEST_BODY_BYTES + 1)
                         if len(raw) > MAX_REQUEST_BODY_BYTES:
                             raise ValueError("upstream response exceeded the adapter limit")
+                        completion = json.loads(raw)
                         message = chat_completion_to_anthropic_message(
-                            json.loads(raw), model, thinking_enabled
+                            completion, model, thinking_enabled
                         )
-                        data = json.dumps(message, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-                        self.send_response(status)
-                        self.send_header("Content-Type", "application/json; charset=utf-8")
-                        self.send_header("Content-Length", str(len(data)))
-                        self.send_header("Connection", "close")
-                        self.end_headers()
-                        headers_sent = True
-                        self._relay_headers_sent = True
-                        write_chunk(data)
+                        # The client requested SSE even though this gateway returned
+                        # JSON. Reuse the stream translator on this already-received
+                        # reply; this does not issue another upstream request. Keep
+                        # original argument text so a max_tokens truncation never
+                        # becomes a fabricated, valid raw_arguments tool input.
+                        choices = completion.get("choices") if isinstance(completion.get("choices"), list) else []
+                        choice = choices[0] if choices and isinstance(choices[0], dict) else {}
+                        source_message = choice.get("message")
+                        delta = dict(source_message) if isinstance(source_message, dict) else {}
+                        calls = delta.get("tool_calls")
+                        if isinstance(calls, list):
+                            delta["tool_calls"] = [
+                                {**call, "index": index} for index, call in enumerate(calls)
+                                if isinstance(call, dict)
+                            ]
+                        stream_reply = BytesIO(_sse_frame("message", {
+                            "model": message["model"],
+                            "usage": completion.get("usage") if isinstance(completion.get("usage"), dict) else {},
+                            "choices": [{"delta": delta, "finish_reason": choice.get("finish_reason")}],
+                        }) + b"data: [DONE]\n\n")
+                        for chunk in chat_sse_to_anthropic_sse(
+                            stream_reply, model, thinking_enabled=thinking_enabled
+                        ):
+                            write_chunk(chunk)
                 elif self.command == "HEAD":
                     pass
                 else:
@@ -4727,6 +5196,61 @@ class SotaRouterHandler(BaseHTTPRequestHandler):
             )
         return False
 
+    def _relay_compact(
+        self, upstream: Any, vendor: str, started: float, model: str, provider: dict[str, Any]
+    ) -> bool:
+        """A compact result is atomic: a truncated/failed summary never replaces history."""
+        status, error, usage = 200, "", {}
+        try:
+            with upstream:
+                chat = is_chat_completions_adapter(provider)
+                if "text/event-stream" in str(upstream.headers.get("Content-Type") or "").lower():
+                    response = None
+                    outcome: dict[str, Any] = {}
+                    converter = chat_sse_to_responses if chat else anthropic_sse_to_responses
+                    for chunk in converter(upstream, model, outcome=outcome):
+                        for line in chunk.decode("utf-8").splitlines():
+                            if not line.startswith("data:") or line[5:].strip() == "[DONE]":
+                                continue
+                            event = json.loads(line[5:])
+                            if event.get("type") == "response.completed":
+                                response = event.get("response")
+                    if not response or any(outcome.values()):
+                        raise ValueError("Compaction upstream stream failed or ended without completion")
+                else:
+                    raw = upstream.read(MAX_REQUEST_BODY_BYTES + 1)
+                    if len(raw) > MAX_REQUEST_BODY_BYTES:
+                        raise ValueError("Compaction response exceeded the adapter limit")
+                    converter = chat_message_to_response if chat else anthropic_message_to_response
+                    response = converter(json.loads(raw), model)
+                compacted = response_to_compaction(response)
+                usage = compacted.get("usage") or {}
+                result = dict(response, output=compacted["output"], output_text="",
+                              parallel_tool_calls=self._bridged_compaction_parallel)
+                if self._bridged_compaction_stream:
+                    raw = b"".join(response_to_sse(result))
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                    self.send_header("Content-Length", str(len(raw)))
+                    self.send_header("Connection", "close")
+                    self.end_headers()
+                    self._relay_headers_sent = True
+                    self.wfile.write(raw)
+                    self.wfile.flush()
+                elif self.path.split("?", 1)[0] in COMPACT_PATHS:
+                    self._json_response(200, compacted)
+                else:
+                    self._json_response(200, result)
+        except CLIENT_GONE_ERRORS as exc:
+            status, error = 499, f"client gone: {type(exc).__name__}"
+        except Exception as exc:
+            status, error = 502, str(exc)
+            self._json_response(502, {"error": {"message": error, "type": "compaction_upstream_error"}})
+        finally:
+            self.close_connection = True
+            self.state.record(vendor, self.command, self.path, status, time.monotonic() - started, error, model=model, usage=usage)
+        return False
+
     def _relay(
         self,
         upstream: Any,
@@ -4747,6 +5271,12 @@ class SotaRouterHandler(BaseHTTPRequestHandler):
         invisibly.  Response headers are held back until the first body byte so a
         zero-content death can still be answered with a plain JSON error.
         """
+        if (
+            provider is not None and 200 <= status < 300
+            and getattr(self, "_bridged_compaction", False)
+            and (is_chat_completions_adapter(provider) or is_juno_adapter(provider))
+        ):
+            return self._relay_compact(upstream, vendor, started, model, provider)
         if provider is not None and is_messages_to_chat_adapter(provider) and 200 <= status < 300:
             return self._relay_messages_chat(
                 upstream,
@@ -4769,7 +5299,8 @@ class SotaRouterHandler(BaseHTTPRequestHandler):
                 tool_kinds,
                 is_final_attempt=is_final_attempt,
             )
-        if provider is not None and is_juno_adapter(provider) and 200 <= status < 300:
+        if (provider is not None and is_juno_adapter(provider)
+                and self._client_protocol() == "responses" and 200 <= status < 300):
             return self._relay_juno(
                 upstream,
                 vendor,
@@ -5029,7 +5560,7 @@ class SotaRouterHandler(BaseHTTPRequestHandler):
             allow_retry = False
         started = time.monotonic()
         upstream, status, error, pre_request = self._open_upstream(provider, key, body)
-        # A pre-request failure (dead TLS handshake, DNS, refused port) never reached the
+        # A proven pre-request failure (DNS, refused port) never reached the
         # gateway, so retrying it cannot double-bill even on a billable generation -- while a
         # replay-safe metadata request may retry any failure class it always could.
         if not allow_retry and not (upstream is None and pre_request):
@@ -5038,7 +5569,7 @@ class SotaRouterHandler(BaseHTTPRequestHandler):
             if upstream is None:
                 if not (pre_request or allow_retry):
                     break
-            elif status not in SAME_VENDOR_RETRY_STATUSES:
+            elif not allow_retry or status not in SAME_VENDOR_RETRY_STATUSES:
                 break
             elapsed = time.monotonic() - started
             if elapsed > SAME_VENDOR_RETRY_MAX_ELAPSED:
@@ -5074,18 +5605,10 @@ class SotaRouterHandler(BaseHTTPRequestHandler):
         DNS, TCP connect, or the TLS handshake -- which is the one failure class that is safe
         to retry even for a billable generation.
         """
-        opened_at = time.monotonic()
-
         def classify_transport_failure(error: BaseException) -> bool:
-            # Refused/DNS failures cannot happen after the request is on the wire. An
-            # SSLError can: the same exception type covers a dead handshake and a gateway
-            # that processed the request and dropped the connection before responding, so
-            # only a fast one -- inside the handshake window -- counts as never-sent.
-            if isinstance(error, (ConnectionRefusedError, socket.gaierror)):
-                return True
-            if isinstance(error, ssl.SSLError):
-                return time.monotonic() - opened_at < PRE_REQUEST_SSL_HANDSHAKE_WINDOW
-            return False
+            # TLS errors may occur after acceptance, even within a few milliseconds.
+            # Only these transport exception classes establish that no request was sent.
+            return isinstance(error, PRE_REQUEST_FAILURE_CLASSES)
 
         try:
             configured_auth_header = str(
@@ -5141,10 +5664,12 @@ class SotaRouterHandler(BaseHTTPRequestHandler):
             # urllib follows redirects by default, which is another form of hidden replay and
             # may also carry the upstream credential to a different host. Provider endpoints
             # are required to be canonical; surface 3xx to the client instead of following it.
-            opener = urllib.request.build_opener(NoRedirectHandler())
+            opener = build_network_opener(NoRedirectHandler())
             response = opener.open(request, timeout=budget)
             return response, int(response.status), "", False
         except urllib.error.HTTPError as error:
+            if int(error.status) == 401:
+                self.state.reject_credential(str(provider["id"]), key)
             if 300 <= int(error.status) < 400:
                 # Do not relay Location to the client: a client-side redirect would create a
                 # second request outside this router (and may expose the vendor URL). Treat it
@@ -5170,6 +5695,13 @@ class SotaRouterHandler(BaseHTTPRequestHandler):
     do_PUT = _route_request
 
 
+class SotaThreadingHTTPServer(ThreadingHTTPServer):
+    # HTTPServer activates/listens inside __init__. Set the backlog before that call,
+    # not on an instance whose socket is already listening with the default of five.
+    request_queue_size = 128
+    daemon_threads = True
+
+
 def write_pid_file(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".new")
@@ -5178,22 +5710,32 @@ def write_pid_file(path: Path) -> None:
 
 
 def check_configuration(registry_path: Path, auth_path: Path) -> dict[str, Any]:
-    registry = load_registry(registry_path)
+    # The serving router isolates credential failures per provider. Its startup
+    # check must use the same rule: one deleted key must not stop every other
+    # configured provider from starting after a reboot.
+    registry = load_registry(registry_path, allow_missing_secrets=True)
     providers = [provider for provider in registry["providers"] if provider["enabled"]]
     if not providers:
         raise ValueError("Provider registry has no enabled provider")
     key_status: dict[str, bool] = {}
     for provider in providers:
-        if provider.get("auth_type") == "codex_auth":
-            key = read_codex_auth_key(auth_path)
-        else:
-            key = provider_key(provider)
-        if not key:
-            raise RuntimeError(f"Provider {provider['id']!r} has no usable credential")
-        # This also rejects CR/LF injection in a credential before the process is launched.
-        auth_headers(provider, key, include_probe_defaults=False)
-        key_status[provider["id"]] = True
         key = ""
+        try:
+            if provider.get("auth_type") == "codex_auth":
+                key = read_codex_auth_key(auth_path)
+            else:
+                key = provider_key(provider)
+            if not key:
+                raise RuntimeError("No usable credential")
+            # This also rejects CR/LF injection before the process is launched.
+            auth_headers(provider, key, include_probe_defaults=False)
+            key_status[provider["id"]] = True
+        except (OSError, ValueError, TypeError, RuntimeError):
+            key_status[provider["id"]] = False
+        finally:
+            key = ""
+    if not any(key_status.values()):
+        raise RuntimeError("No enabled provider has a usable credential; add an API key before starting the router")
     return {
         "status": "ready",
         "version": ROUTER_VERSION,
@@ -5201,6 +5743,10 @@ def check_configuration(registry_path: Path, auth_path: Path) -> dict[str, Any]:
         "providers": [provider["id"] for provider in providers],
         "models": selectable_slugs(registry),
         "keys_present": key_status,
+        "credential_errors": {
+            provider_id: "missing_or_unreadable"
+            for provider_id, present in key_status.items() if not present
+        },
     }
 
 
@@ -5242,13 +5788,11 @@ def main() -> int:
             pass
 
     state = RouterState(args.registry, args.auth, args.log)
-    server = ThreadingHTTPServer((args.host, args.port), SotaRouterHandler)
-    server.daemon_threads = True
+    server = SotaThreadingHTTPServer((args.host, args.port), SotaRouterHandler)
     # The default listen backlog of 5 is too small for the apps' request bursts (a turn can
     # fire the main generation, follow-up title/summary generations and count_tokens at
     # once). Excess connections are refused by the OS and surface as sporadic "connection
     # failed" in the client; 128 absorbs any burst this machine produces.
-    server.request_queue_size = 128
     server.router_state = state  # type: ignore[attr-defined]
     def stop(_signum: int, _frame: Any) -> None:
         threading.Thread(target=server.shutdown, daemon=True).start()
@@ -5260,9 +5804,7 @@ def main() -> int:
         # launcher does not need a certificate or a second port.
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.load_cert_chain(str(args.tls_cert), str(args.tls_key))
-        tls_server = ThreadingHTTPServer((args.host, args.tls_port), SotaRouterHandler)
-        tls_server.daemon_threads = True
-        tls_server.request_queue_size = 128
+        tls_server = SotaThreadingHTTPServer((args.host, args.tls_port), SotaRouterHandler)
         tls_server.router_state = state  # type: ignore[attr-defined]
         tls_server.socket = context.wrap_socket(tls_server.socket, server_side=True)
         threading.Thread(

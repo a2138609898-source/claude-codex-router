@@ -10,9 +10,18 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import subprocess
+import sys
 import time
 from typing import Callable
 import uuid
+
+try:
+    from codex_app_lifecycle import FileLock, LaunchRequestLease, LifecycleBusy
+except ModuleNotFoundError as error:
+    if error.name != "codex_app_lifecycle":
+        raise
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "CodexHistorySync"))
+    from codex_app_lifecycle import FileLock, LaunchRequestLease, LifecycleBusy
 
 
 PHASE_LABELS = {
@@ -115,6 +124,12 @@ class LaunchAttempt:
         self.inspect_process = inspect_process
         self.clock = clock
         self.popen = popen
+        self.request_lease = LaunchRequestLease(self.core_root, self.request_id, clock=clock)
+        # An explicitly requested offline sync must not see its own caller as
+        # a request to cancel. Ordinary launch/restart requests always publish.
+        self.publish_launch_intent = "-syncbeforelaunch" not in {
+            str(argument).lower() for argument in invocation
+        }
         self.started = clock()
         self.process = None
         self.sink = None
@@ -138,6 +153,7 @@ class LaunchAttempt:
         if not self.can_cancel_queued:
             return False
         self.cancelled = True
+        self._release_request()
         return True
 
     def detach(self) -> None:
@@ -147,9 +163,35 @@ class LaunchAttempt:
         copy is safe and does not cancel an in-progress configuration write.
         """
         self.detached = True
+        self._release_request()
         if self.sink is not None:
             self.sink.close()
             self.sink = None
+
+    def _release_request(self) -> None:
+        try:
+            self.request_lease.release()
+        except (OSError, LifecycleBusy):
+            # A dead controller cannot renew its short lease, and an active
+            # child keeps its separate shell request. Cleanup never stops it.
+            pass
+
+    def _history_writes_idle(self) -> bool:
+        """Wake a deferred launch as soon as both history leases are released.
+
+        The shell still acquires both leases itself. This nonblocking probe only
+        shortens the manager's retry delay; it never grants permission to start
+        the desktop or to write history without the actual launcher's locks.
+        """
+        lifecycle_path = self.core_root / "work" / "codex-app-lifecycle.lock"
+        history_path = self.core_root / "sync.lock"
+        if not lifecycle_path.is_file() or not history_path.is_file():
+            return False
+        try:
+            with FileLock(lifecycle_path), FileLock(history_path):
+                return True
+        except (OSError, LifecycleBusy):
+            return False
 
     def _verify_completed(self) -> dict:
         result = self.completed_result
@@ -161,9 +203,18 @@ class LaunchAttempt:
                 processes = [process] if process is not None else []
             else:
                 processes = self.inspect_processes()
-        except (OSError, RuntimeError) as error:
-            # Verification trouble is not launch failure. Keep this exact
-            # completed attempt; polling again must never spawn a second one.
+        except (OSError, RuntimeError, KeyError, TypeError, ValueError, OverflowError) as error:
+            # An inspection failure is not proof the app failed, but it must
+            # share the same bounded verification deadline. Never respawn this
+            # completed request or leave the UI permanently in "starting".
+            if self.clock() - completed_at >= self.verification_grace_seconds:
+                self.terminal = {
+                    **result, "status": "error", "window_shown": False,
+                    "verification_error": str(error),
+                    "error": "启动器已返回，但在核验期限内无法确认本次 Codex 窗口；"
+                             "程序可能仍在运行，请检查启动日志后再决定是否重试。",
+                }
+                return self._snapshot(self.terminal)
             self.last_result = {**result, "status": "starting", "phase": "verifying_window",
                                 "verification_error": str(error)}
             return self._snapshot(self.last_result)
@@ -200,6 +251,7 @@ class LaunchAttempt:
         except Exception:
             self.sink.close()
             self.sink = None
+            self._release_request()
             raise
 
     def _output(self) -> str:
@@ -236,17 +288,38 @@ class LaunchAttempt:
             return self._snapshot({"status": "cancelled"})
         if self.completed_result is not None:
             return self._verify_completed()
+        if self.publish_launch_intent:
+            try:
+                self.request_lease.refresh()
+            except (OSError, LifecycleBusy) as error:
+                if self.process is None:
+                    self._release_request()
+                    self.terminal = {
+                        "status": "error", "phase": "preflight",
+                        "error": "无法发布本次启动请求，请检查历史协调目录的访问权限：" + str(error),
+                    }
+                    return self._snapshot(self.terminal)
+                # The child already owns its shell request. Follow it instead
+                # of losing or terminating a live launch on a transient write.
         if self.process is None:
             if self.clock() < self.next_retry:
-                return self._snapshot(self.last_result)
+                if (self.last_result.get("phase") != "waiting_for_history_sync"
+                        or not self._history_writes_idle()):
+                    return self._snapshot(self.last_result)
+                self.next_retry = self.clock()
+                self.retry_delay = DEFERRED_RETRY_INITIAL_SECONDS
             self._start()
         code = self.process.poll()
         if code is None:
             status = self._status()
             if status:
                 self.last_result = status
-                if status.get("status") != "deferred":
+                if status.get("status") in ("ready", "error"):
                     self.retry_delay = DEFERRED_RETRY_INITIAL_SECONDS
+                # A "starting" write must NOT reset the backoff: every retried
+                # launcher emits "starting" before its own "deferred", so resetting
+                # here pinned the delay at 2s and produced an 8s retry storm for the
+                # whole duration of a running history sync (observed 2026-09-30).
             # A terminal status file can precede process teardown. Never launch again yet.
             return self._snapshot({**self.last_result, "status": "starting",
                                    "launcher_pid": self.process.pid})
@@ -276,6 +349,7 @@ class LaunchAttempt:
                 self.retry_delay = DEFERRED_RETRY_INITIAL_SECONDS
             return self._snapshot(result)
         if result.get("status") == "ready" and code == 0:
+            self._release_request()
             self.completed_result = result
             self.completed_at = self.clock()
             return self._verify_completed()
@@ -283,4 +357,5 @@ class LaunchAttempt:
             result = {**result, "status": "error",
                       "error": f"启动器未完成打开窗口（退出码 {code}，阶段 {result.get('phase', 'unknown')}）。"}
         self.terminal = result
+        self._release_request()
         return self._snapshot(result)

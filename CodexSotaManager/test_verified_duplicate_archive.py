@@ -68,7 +68,7 @@ class VerifiedDuplicateArchiveTests(unittest.TestCase):
         before = {path: path.read_bytes() for path in (self.source, self.clone, self.state, self.index)}
         original_write = archive.repair.atomic_bytes
         def fail_global_cache(path, content):
-            if path == self.state:
+            if Path(path).resolve() == self.state.resolve():
                 raise OSError("simulated cache write failure")
             return original_write(path, content)
         with patch.object(archive.repair, "atomic_bytes", side_effect=fail_global_cache):

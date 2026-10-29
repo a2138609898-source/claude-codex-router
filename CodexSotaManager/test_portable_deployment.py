@@ -20,10 +20,10 @@ import repair_archived_sidebar as sidebar
 
 class PortableDeploymentTests(unittest.TestCase):
     def test_bundle_uses_directories_and_an_explicit_runtime_allowlist(self):
-        captured = {}
+        captured = []
 
         def analysis(*args, **kwargs):
-            captured.update(kwargs)
+            captured.append(kwargs)
             return SimpleNamespace(pure=[], scripts=[], binaries=[], datas=[])
 
         namespace = {
@@ -35,7 +35,9 @@ class PortableDeploymentTests(unittest.TestCase):
         }
         spec = REPO / "CodexSotaManager" / "codex-sota.spec"
         exec(compile(spec.read_text(encoding="utf-8-sig"), str(spec), "exec"), namespace)
-        data = captured["datas"]
+        # GUI and helper executables share one onedir bundle. Validate the
+        # runtime data from every Analysis instead of whichever was evaluated last.
+        data = [item for analysis_options in captured for item in analysis_options["datas"]]
         core_data = [(Path(path), destination) for path, destination in data if Path(path).parent == CORE]
         self.assertTrue(core_data)
         for path, destination in core_data:
@@ -73,7 +75,7 @@ class PortableDeploymentTests(unittest.TestCase):
                             capture_output=True, encoding="utf-8-sig", errors="replace", env=env, timeout=15,
                         )
                         self.assertEqual(result.returncode, 0, result.stderr)
-                        self.assertEqual(Path(result.stdout.strip()), override or home / default)
+                        self.assertEqual(Path(result.stdout.strip()).resolve(), (override or home / default).resolve())
             self.assertFalse(custom.exists())
             self.assertFalse((home / ".codex-sota").exists())
             self.assertFalse((home / ".claude-sota").exists())
@@ -103,7 +105,7 @@ class PortableDeploymentTests(unittest.TestCase):
                 cwd=CORE, env=env, capture_output=True, text=True, timeout=10,
             )
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(json.loads(result.stdout), roots)
+            self.assertEqual([Path(value).resolve() for value in json.loads(result.stdout)], [Path(value).resolve() for value in roots])
             self.assertEqual(list(Path(temporary).iterdir()), [])
 
     def test_custom_app_path_remains_visible_to_offline_sync_guard(self):
@@ -144,7 +146,9 @@ foreach ($name in @('Switch-CodexSota.ps1', 'Switch-CodexProfile.ps1', 'Run-Code
     }
     $env:CODEX_APP_EXE = $valid
     $script:resolvedAppExecutable = $null
-    if ((Get-CodexAppExecutable) -ne $valid) { throw ('Valid app override rejected by ' + $name) }
+    $resolvedActual = [IO.Path]::GetFullPath((Resolve-Path -LiteralPath (Get-CodexAppExecutable)).ProviderPath)
+    $resolvedExpected = [IO.Path]::GetFullPath((Resolve-Path -LiteralPath $valid).ProviderPath)
+    if ($resolvedActual -ne $resolvedExpected) { throw ('Valid app override rejected by ' + $name) }
 }
 Write-Output 'validated 3 launcher resolvers only'
 '''

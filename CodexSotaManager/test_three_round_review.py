@@ -108,7 +108,7 @@ class RollbackSafetyReviewTests(unittest.TestCase):
             original_copytree = sync.shutil.copytree
 
             def partial_copy(source, destination, *args, **kwargs):
-                if Path(source) == root / "sessions":
+                if Path(str(source).removeprefix("\\\\?\\")) == root / "sessions":
                     Path(destination).mkdir(parents=True, exist_ok=True)
                     (Path(destination) / "first.jsonl").write_text("partial")
                     raise OSError("injected disk-full during recovery backup")

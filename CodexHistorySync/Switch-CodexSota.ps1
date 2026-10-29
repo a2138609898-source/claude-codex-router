@@ -1,4 +1,4 @@
-param(
+﻿param(
     [switch]$AuditOnly,
     [switch]$NoGui,
     [switch]$SkipSync,
@@ -25,6 +25,9 @@ if ($LaunchRequestId -notmatch '^[a-zA-Z0-9_-]{1,80}$') { throw 'Invalid launch 
 $lifecycleWorkDir = Join-Path $PSScriptRoot 'work'
 $lifecycleLockPath = Join-Path $lifecycleWorkDir 'codex-app-lifecycle.lock'
 $launchRequestPath = Join-Path $lifecycleWorkDir 'codex-launch-request.json'
+$launchRequestDir = Join-Path $lifecycleWorkDir 'codex-launch-requests'
+$launchRequestGuardPath = Join-Path $lifecycleWorkDir 'codex-launch-requests.lock'
+$shellLaunchRequestPath = Join-Path $launchRequestDir ('shell-' + $LaunchRequestId + '-' + $PID + '.json')
 $launchStatusPath = Join-Path $lifecycleWorkDir ('launch-status-' + $LaunchRequestId + '.json')
 # Read the previous identity before any "starting" phase overwrites this file.
 # It is an independent recovery record if writing active-profile.json failed.
@@ -270,6 +273,7 @@ function Get-SotaAuthStatus {
 function Test-SotaConfig {
     $result = Invoke-SotaConfigValidator
     $script:configValidationReason = [string]$result.reason
+    $script:configuredModelProvider = [string]$result.model_provider
     return $null -ne $result -and $result.valid -eq $true
 }
 
@@ -293,26 +297,35 @@ function Stop-CodexApp {
         Start-Sleep -Milliseconds 200
     } while ([DateTime]::UtcNow -lt $deadline)
 
-    if ($ForceHidden) {
-        # A marker-matched process with no desktop window is a stale/incomplete
-        # launch, not an active conversation. Remove only this hidden desktop
-        # process so a new request cannot inherit its single-instance wait.
-        foreach ($process in $remaining | Where-Object { $_.MainWindowHandle -eq 0 }) {
-            try { Stop-Process -Id $process.Id -Force -ErrorAction Stop }
-            catch { $launchWarnings.Add('Could not terminate stale hidden Codex process ' + $process.Id + ': ' + $_.Exception.Message) }
-        }
-        $killDeadline = [DateTime]::UtcNow.AddSeconds(5)
-        do {
-            $remaining = @(Get-OwnedCodexAppProcesses)
-            if ($remaining.Count -eq 0) { return }
-            Start-Sleep -Milliseconds 200
-        } while ([DateTime]::UtcNow -lt $killDeadline)
-        throw 'A stale hidden Codex process could not be cleared.'
-    }
+    # Keep the legacy switch bindable, but a hidden window is not evidence that
+    # the process is stale: tray/background conversations can still be active.
+    # Even an explicit restart authorizes only a normal close here.
 
     # Restart requests authorize a normal close, not forced termination of
     # active conversations. Keep the existing app intact if it will not close.
     throw 'Codex has not finished closing. It was not force-terminated. Finish or cancel active work, close its window, then retry the restart.'
+}
+
+function Test-ExplicitPortableCodexApp {
+    param([string]$ExecutablePath)
+    $configured = [Environment]::GetEnvironmentVariable('CODEX_APP_EXE')
+    if ([string]::IsNullOrWhiteSpace($configured)) { return $false }
+    $configured = [IO.Path]::GetFullPath([Environment]::ExpandEnvironmentVariables($configured))
+    $selected = [IO.Path]::GetFullPath($ExecutablePath)
+    if (-not [string]::Equals($configured, $selected, [StringComparison]::OrdinalIgnoreCase)) { return $false }
+    # A Store executable always needs its package identity, including an old
+    # package selected explicitly. Never fall back after a Store launch fails.
+    if ($selected -match '\\WindowsApps\\') { return $false }
+    $packages = @(Invoke-WithComRetry -Action { Get-AppxPackage -Name 'OpenAI.Codex' -ErrorAction Stop })
+    foreach ($package in $packages) {
+        foreach ($image in @('ChatGPT.exe', 'Codex.exe')) {
+            $packaged = Join-Path $package.InstallLocation ('app\' + $image)
+            if ([string]::Equals($selected, [IO.Path]::GetFullPath($packaged), [StringComparison]::OrdinalIgnoreCase)) {
+                return $false
+            }
+        }
+    }
+    return $true
 }
 
 function Start-SotaApp {
@@ -323,13 +336,44 @@ function Start-SotaApp {
     $startInfo.WorkingDirectory = Split-Path -Parent $ExecutablePath
     $startInfo.UseShellExecute = $false
     $startInfo.CreateNoWindow = $false
-    $startInfo.EnvironmentVariables['CODEX_HOME'] = $sotaRoot
+    # 2026-09-30 12:31: this assignment died with "Cannot index into a null array"
+    # intermittently (5 failed launches, then a normal one, same file hash). On this
+    # machine's .NET Framework the EnvironmentVariables getter always materializes a
+    # StringDictionary, so the null state is a transient host-level race, not a
+    # deterministic value. Probe the table first, retry once after a beat, and if it
+    # still is not there, fail with the evidence the next diagnosis needs instead of
+    # a bare index error.
+    $startEnvironment = $startInfo.EnvironmentVariables
+    if ($null -eq $startEnvironment) {
+        Start-Sleep -Milliseconds 250
+        $startEnvironment = $startInfo.EnvironmentVariables
+    }
+    if ($null -eq $startEnvironment) {
+        throw ("ProcessStartInfo exposed no environment table " +
+            "(UseShellExecute=$($startInfo.UseShellExecute), " +
+            "type=$($startInfo.GetType().FullName)); cannot pin CODEX_HOME.")
+    }
+    $startEnvironment['CODEX_HOME'] = $sotaRoot
 
     foreach ($name in $apiEnvironmentNames) {
         $startInfo.EnvironmentVariables.Remove($name)
     }
 
-    $startedProcess = [System.Diagnostics.Process]::Start($startInfo)
+    # 2026-10-24: Codex Desktop 26.1021+ loads its startup policy by running
+    # `codex app-server --print-startup-config`. A user-level CODEX_CLI_PATH pin
+    # can force an older CLI that does not know this flag; the App then aborts
+    # with "Organization settings could not be loaded". Let the App use the core
+    # shipped in the same package. The global pin stays intact for other tools.
+    $startInfo.EnvironmentVariables.Remove('CODEX_CLI_PATH')
+    if ($startInfo.EnvironmentVariables.ContainsKey('CODEX_CLI_PATH')) {
+        throw 'CODEX_CLI_PATH must not be inherited by the Codex App; it pins an incompatible CLI.'
+    }
+
+    $storeLauncher = Join-Path $PSScriptRoot 'Start-CodexStoreProcess.ps1'
+    if (Test-ExplicitPortableCodexApp -ExecutablePath $ExecutablePath) {
+        $startedProcess = [System.Diagnostics.Process]::Start($startInfo)
+    }
+    else { $startedProcess = & $storeLauncher -StartInfo $startInfo }
     if (-not $startedProcess) {
         throw 'Windows did not return a Codex App process.'
     }
@@ -438,6 +482,7 @@ function Get-PythonExecutable {
     if ($script:resolvedPythonExecutable) { return $script:resolvedPythonExecutable }
     $candidates = @(
         [Environment]::GetEnvironmentVariable('CODEX_SOTA_PYTHON'),
+        (Join-Path (Split-Path -Parent (Split-Path -Parent $PSScriptRoot)) 'codex-sota-runtime.exe'),
         [Environment]::GetEnvironmentVariable('CODEX_PYTHON'),
         (Join-Path $env:USERPROFILE '.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe'),
         (Join-Path $env:LOCALAPPDATA 'Programs\Python\Python313\python.exe'),
@@ -631,6 +676,10 @@ function Write-LaunchStatus {
     }
     $json = $payload | ConvertTo-Json -Depth 5 -Compress
     if ($app) { $script:previousRequestStatus = [pscustomobject]$payload }
+    if ($AuditOnly) {
+        if ($Emit) { Write-Output $json }
+        return
+    }
     try {
         [IO.Directory]::CreateDirectory($lifecycleWorkDir) | Out-Null
         $temporary = $launchStatusPath + '.new-' + $PID
@@ -645,20 +694,43 @@ function Write-LaunchStatus {
 
 function Set-LaunchRequest {
     [IO.Directory]::CreateDirectory($lifecycleWorkDir) | Out-Null
-    $payload = @{ request_id = $LaunchRequestId; launcher_pid = $PID
+    [IO.Directory]::CreateDirectory($launchRequestDir) | Out-Null
+    $payload = @{ request_id = $LaunchRequestId; launcher_pid = $PID; request_source = 'shell'
         launcher_creation_ticks = (Get-ProcessCreationTicks -ProcessId $PID)
-        expires_at = ([DateTime]::UtcNow.AddMinutes(3) - [DateTime]'1970-01-01Z').TotalSeconds } | ConvertTo-Json -Compress
-    $temporary = $launchRequestPath + '.new-' + $PID
-    [IO.File]::WriteAllText($temporary, $payload, [Text.UTF8Encoding]::new($false))
-    Move-Item -LiteralPath $temporary -Destination $launchRequestPath -Force
+        expires_at = ([DateTime]::UtcNow.AddMinutes(30) - [DateTime]'1970-01-01Z').TotalSeconds } | ConvertTo-Json -Compress
+    $guard = Enter-AppLifecycleLock -LockPath $launchRequestGuardPath -WaitSeconds 1
+    if (-not $guard) { throw 'Could not publish the Codex launch request.' }
+    try {
+        # Keep the legacy marker for a pre-upgrade sync that is still running.
+        # The per-shell marker prevents another launcher from erasing our intent.
+        foreach ($path in @($launchRequestPath, $shellLaunchRequestPath)) {
+            $temporary = $path + '.new-' + $PID
+            try {
+                [IO.File]::WriteAllText($temporary, $payload, [Text.UTF8Encoding]::new($false))
+                Move-Item -LiteralPath $temporary -Destination $path -Force
+            }
+            finally { Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue }
+        }
+    }
+    finally { $guard.Unlock(0, 1); $guard.Dispose() }
 }
 
 function Clear-LaunchRequest {
+    $guard = $null
     try {
-        $request = Get-Content -Raw -Encoding UTF8 -LiteralPath $launchRequestPath -ErrorAction Stop | ConvertFrom-Json
-        if ($request.request_id -eq $LaunchRequestId) { Remove-Item -LiteralPath $launchRequestPath -Force -ErrorAction SilentlyContinue }
+        $guard = Enter-AppLifecycleLock -LockPath $launchRequestGuardPath -WaitSeconds 1
+        if (-not $guard) { return }
+        foreach ($path in @($launchRequestPath, $shellLaunchRequestPath)) {
+            try {
+                $request = Get-Content -Raw -Encoding UTF8 -LiteralPath $path -ErrorAction Stop | ConvertFrom-Json
+                if ($request.request_id -eq $LaunchRequestId -and [int]$request.launcher_pid -eq $PID) {
+                    Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+                }
+            } catch { }
+        }
     }
     catch { }
+    finally { if ($guard) { $guard.Unlock(0, 1); $guard.Dispose() } }
 }
 
 function Get-ProcessCreationTicks {
@@ -723,17 +795,9 @@ function Remove-StaleLaunchArtifacts {
         }
     }
 
-    if (Test-Path -LiteralPath $launchRequestPath) {
-        $request = $null
-        try { $request = Get-Content -Raw -Encoding UTF8 -LiteralPath $launchRequestPath | ConvertFrom-Json } catch { }
-        $staleRequest = $false
-        if (-not $request) { $staleRequest = $true }
-        elseif ($request.request_id -eq $LaunchRequestId) { $staleRequest = $false }
-        elseif ($request.expires_at -and [double]$request.expires_at -le (([DateTime]::UtcNow - [DateTime]'1970-01-01Z').TotalSeconds)) { $staleRequest = $true }
-        elseif ($request.launcher_pid -and -not (Test-ProcessIdentity -ProcessId $request.launcher_pid -CreationTicks ([string]$request.launcher_creation_ticks))) { $staleRequest = $true }
-        elseif (-not $request.launcher_pid -and ((Get-Item -LiteralPath $launchRequestPath).LastWriteTimeUtc -lt $now.AddMinutes(-10))) { $staleRequest = $true }
-        if ($staleRequest) { Remove-Item -LiteralPath $launchRequestPath -Force -ErrorAction SilentlyContinue }
-    }
+    # The shared lifecycle reader retires stale requests while holding their
+    # publication guard. Cleanup here must not unlink a concurrently renewed
+    # request after checking an older snapshot of the same filename.
 }
 
 function Enter-AppLifecycleLock {
@@ -828,6 +892,12 @@ function Test-StructuredSyncSuccess {
         [switch]$AuditOnly
     )
 
+    if ($Result -and $Result.status -eq 'skipped' -and
+        $Result.reason -eq 'optional_profiles_absent' -and $Result.sync_performed -eq $false -and
+        @($Result.missing_optional_profiles).Count -gt 0 -and
+        $Result.mode -eq $(if ($AuditOnly) { 'three-way-audit' } else { 'three-way' })) {
+        return $true
+    }
     if (-not $Result -or $Result.status -ne 'ok') {
         return $false
     }
@@ -934,6 +1004,7 @@ function Invoke-ArchivedSidebarRepair {
 }
 
 try {
+if (-not $AuditOnly -and -not $PrepareOnly) { Set-LaunchRequest }
 $appExecutable = Get-CodexAppExecutable
 $authStatus = Get-SotaAuthStatus
 $authMode = $authStatus.mode
@@ -945,6 +1016,7 @@ $configValid = Test-SotaConfig
 if (-not $configValid -and -not $AuditOnly) {
     $validatorResult = Invoke-SotaConfigValidator -Repair
     $script:configValidationReason = [string]$validatorResult.reason
+    $script:configuredModelProvider = [string]$validatorResult.model_provider
     if ($null -ne $validatorResult -and $validatorResult.valid -eq $true) {
         $configValid = $true
     }
@@ -1100,6 +1172,7 @@ foreach ($provider in @($registryProviders | Where-Object { $_.enabled -eq $true
 
 }
 catch {
+    if (-not $AuditOnly -and -not $PrepareOnly) { Clear-LaunchRequest }
     Write-LaunchStatus -Status 'error' -Phase 'preflight' -ErrorText $_.Exception.Message -Emit
     if (-not $NoGui) { Show-SotaMessage -Title 'Multi-vendor SOTA Codex preflight failed' -Icon Error -Message $_.Exception.Message }
     exit 1
@@ -1147,7 +1220,7 @@ if ($AuditOnly) {
         api_key_present = $authStatus.key_present
         api_key_shape_valid = $authStatus.key_shape_valid
         app_exists = -not [string]::IsNullOrEmpty($appExecutable)
-        model_provider = 'tango_relay'
+        model_provider = $script:configuredModelProvider
         default_model = $defaultModel
         selectable_models = $catalogModels
         upstreams = $upstreamAudit
@@ -1257,11 +1330,10 @@ try {
     } catch { }
     $requestedApp = Get-RequestedSotaApp
     if ($requestedApp) { $existingApp = $requestedApp; $sameRequest = $true }
-    # Reuse a visible app, or a hidden app only when this exact request created
-    # it and is being polled. A stale marker must never turn into an unbounded
-    # waiting_for_window/deferred loop on the next launch.
+    # Verified ownership is sufficient for reuse. A background/tray window may
+    # be absent without making its process disposable.
     $existingWindow = $existingApp -and $existingApp.MainWindowHandle -ne 0
-    $reusableExistingApp = $existingApp -and ($existingWindow -or $sameRequest)
+    $reusableExistingApp = $null -ne $existingApp
     if ($reusableExistingApp -and (-not $Restart -or $sameRequest)) {
         # A pending launch polled with the same request id is idempotent, even
         # if the caller originally requested Restart.
@@ -1280,12 +1352,7 @@ try {
     if ($activeMarker -and $activeMarker.profile -ne 'Sota' -and -not $SyncBeforeLaunch) {
         $launchWarnings.Add('Opening existing local SOTA history now; changes from other profiles will be merged after a quiet exit or an explicit history sync.')
     }
-    $staleHiddenApp = $existingApp -and -not $existingWindow -and -not $sameRequest
-    if ($staleHiddenApp) {
-        Write-LaunchStatus -Status 'starting' -Phase 'closing_previous_app'
-        Stop-CodexApp -ForceHidden
-    }
-    elseif (-not $Restart -and @(Get-OwnedCodexAppProcesses).Count -gt 0) {
+    if (-not $Restart -and @(Get-OwnedCodexAppProcesses).Count -gt 0) {
         throw 'An existing Codex window could not be verified as the SOTA profile. It was not closed. Close it yourself or explicitly choose Restart before switching profiles.'
     }
     else {
@@ -1347,6 +1414,7 @@ catch {
 finally {
     if ($historyWriteLease) { $historyWriteLease.Unlock(0, 1); $historyWriteLease.Dispose() }
     if ($lifecycleLease) { $lifecycleLease.Unlock(0, 1); $lifecycleLease.Dispose() }
+    Clear-LaunchRequest
 }
 
 exit 0

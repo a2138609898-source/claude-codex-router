@@ -750,23 +750,11 @@ class RouterRegressionTests(unittest.TestCase):
                     healed["config_error"], "", "a fixed file must clear the old complaint"
                 )
 
-    @unittest.expectedFailure  # 见下方 docstring：代码与本测试互相矛盾，待你定夺
-    def test_responses_failover_skips_messages_only_provider_when_idempotency_is_explicit(self) -> None:
-        """UNRESOLVED: this test and the router contradict each other. The router is the safer half.
+    def test_billable_responses_never_fail_over_even_with_idempotency_key(self) -> None:
+        """A third-party Idempotency-Key cannot authorize billing a second account.
 
-        The test asserts that a `/v1/responses` generation with an explicit Idempotency-Key fails
-        over from a 503 primary to another responses provider. The router refuses: `/v1/responses`
-        is in BILLABLE_GENERATION_PATHS, so `request_can_replay` is False and only one candidate is
-        ever built -- `allow_failover=True` is ignored for inference. Its reasoning (codex_sota_router
-        .py, near BILLABLE_GENERATION_PATHS) is that a generation may have reached the upstream even
-        when its response did not reach us, and a third-party relay may ignore Idempotency-Key, so a
-        replay risks a second charge on a second account.
-
-        Both halves were written in the same change and were never reconciled. The open question is
-        yours: should `allow_failover` still move a *billable* request to another vendor? Keeping the
-        router as-is means failover now applies only to metadata/discovery calls, which makes the
-        checkbox misleading. Marked expected-failure rather than deleted so the decision cannot be
-        lost; if the router is ever changed to allow it, this reports an unexpected success.
+        This replaces the contradictory expected-failure assertion that required replay.
+        Metadata failover remains covered separately; generation stays on one provider.
         """
         with tempfile.TemporaryDirectory() as temporary, LocalUpstream(
             503, {"error": "primary unavailable"}
@@ -814,13 +802,14 @@ class RouterRegressionTests(unittest.TestCase):
                     },
                     method="POST",
                 )
-                with urllib.request.urlopen(request, timeout=5) as response:
-                    payload = json.loads(response.read())
-
-            self.assertEqual(payload["winner"], "responses")
+                with self.assertRaises(urllib.error.HTTPError) as raised:
+                    urllib.request.urlopen(request, timeout=5)
+                with raised.exception as response:
+                    self.assertEqual(response.code, 503)
+                    self.assertIn("primary unavailable", response.read().decode())
             self.assertEqual(len(primary.requests), 1)
             self.assertEqual(messages_only.requests, [])
-            self.assertEqual(len(responses.requests), 1)
+            self.assertEqual(responses.requests, [])
 
     def test_upstream_read_timeout_is_recorded_as_gateway_failure_not_client_abort(self) -> None:
         class TimedOutUpstream:
@@ -891,7 +880,7 @@ class RouterRegressionTests(unittest.TestCase):
                     stderr="",
                 )
 
-            with mock.patch.object(registry.subprocess, "run", side_effect=fake_run):
+            with mock.patch.object(registry, "_run_router_starter", side_effect=fake_run):
                 result = registry.restart_router(workspace)
 
             self.assertEqual(len(calls), 1, "the default path ran more than the starter")
@@ -919,7 +908,7 @@ class RouterRegressionTests(unittest.TestCase):
                     payload = {"status": "ready", "started": True}
                 return SimpleNamespace(returncode=0, stdout=json.dumps(payload), stderr="")
 
-            with mock.patch.object(registry.subprocess, "run", side_effect=fake_run):
+            with mock.patch.object(registry, "_run_router_starter", side_effect=fake_run):
                 result = registry.restart_router(workspace, force=True)
 
             self.assertEqual(len(calls), 2)
@@ -942,7 +931,7 @@ class RouterRegressionTests(unittest.TestCase):
                     stderr="",
                 )
 
-            with mock.patch.object(registry.subprocess, "run", side_effect=fake_run):
+            with mock.patch.object(registry, "_run_router_starter", side_effect=fake_run):
                 with self.assertRaises(RuntimeError):
                     registry.restart_router(workspace, force=True)
 
@@ -1054,9 +1043,14 @@ class RouterRegressionTests(unittest.TestCase):
                 "count_tokens escaped to juno's billable /messages endpoint",
             )
 
-    def test_juno_adapter_rejects_responses_compact_without_upstream_hit(self) -> None:
-        """Compact is not an ordinary generation and must never be rewritten to Messages."""
-        with tempfile.TemporaryDirectory() as temporary, ScriptedUpstream() as upstream:
+    def test_juno_adapter_compacts_as_bounded_summary_with_replayable_state(self) -> None:
+        """Compaction requests a separate tool-free summary and returns local state."""
+        summary = "The user asked for compact me; next step is to continue the pending task."
+        with tempfile.TemporaryDirectory() as temporary, LocalUpstream(200, {
+            "id": "summary-fixture", "type": "message", "role": "assistant",
+            "content": [{"type": "text", "text": summary}], "stop_reason": "end_turn",
+            "usage": {"input_tokens": 20, "output_tokens": 10},
+        }) as upstream:
             root = Path(temporary)
             registry_path = root / "providers.json"
             auth_path = root / "auth.json"
@@ -1082,19 +1076,23 @@ class RouterRegressionTests(unittest.TestCase):
                         headers={"Content-Type": "application/json"},
                         method="POST",
                     )
-                    with self.assertRaises(urllib.error.HTTPError) as raised:
-                        urllib.request.urlopen(request, timeout=10)
-                    self.assertEqual(raised.exception.code, 501)
-                    body = json.loads(raised.exception.read())
-                    self.assertEqual(
-                        body["error"]["type"], "unsupported_adapter_operation"
-                    )
+                    with urllib.request.urlopen(request, timeout=10) as response:
+                        self.assertEqual(response.status, 200)
+                        body = json.loads(response.read())
+                    self.assertEqual(body["object"], "response.compaction")
+                    self.assertEqual(body["output"][0]["type"], "compaction")
+                    restored = router.restore_compaction_payload({"input": body["output"]}, require_local=True)
+                    self.assertIn(summary, restored["input"][0]["content"])
 
-            self.assertEqual(
-                upstream.requests,
-                [],
-                "Responses compact was rewritten into juno's billable Messages endpoint",
-            )
+            self.assertEqual(len(upstream.requests), 2)
+            for attempted in upstream.requests:
+                self.assertEqual(attempted["path"], "/messages")
+                sent = json.loads(attempted["body"])
+                self.assertFalse(sent["stream"])
+                self.assertLessEqual(sent["max_tokens"], 4096)
+                self.assertNotIn("tools", sent)
+                self.assertIn("compact me", json.dumps(sent["messages"]))
+                self.assertIn("handoff", sent["system"])
 
     def test_adapter_reasoning_effort_maps_to_thinking_budget(self) -> None:
         """Codex's reasoning.effort must reach a Messages gateway as thinking, not vanish.
@@ -1978,8 +1976,8 @@ class RouterRegressionTests(unittest.TestCase):
         self.assertIn("答案", without_thinking)
         self.assertIn("event: message_stop", without_thinking)
 
-    def test_messages_bridge_truncation_and_early_retry(self) -> None:
-        """Truncated chat streams fail the turn; zero-content deaths retry invisibly."""
+    def test_messages_bridge_truncation_and_empty_stream_are_not_replayed(self) -> None:
+        """Both truncated and empty billable streams fail without another generation."""
         mode = {"value": "truncate"}
         calls: list[int] = []
 
@@ -2033,14 +2031,19 @@ class RouterRegressionTests(unittest.TestCase):
                         "messages": [{"role": "user", "content": "hi"}],
                     }
 
-                    def ask():
+                    def ask(expected_status=200):
                         request = urllib.request.Request(
                             local.url + "/v1/messages",
                             data=json.dumps(payload).encode("utf-8"),
                             headers={"Content-Type": "application/json", "anthropic-version": "2023-06-01"},
                             method="POST",
                         )
-                        with urllib.request.urlopen(request, timeout=10) as response:
+                        try:
+                            response = urllib.request.urlopen(request, timeout=10)
+                        except urllib.error.HTTPError as error:
+                            response = error
+                        with response:
+                            self.assertEqual(response.status, expected_status)
                             return response.read().decode("utf-8", "replace")
 
                     truncated = ask()
@@ -2057,10 +2060,11 @@ class RouterRegressionTests(unittest.TestCase):
 
                     mode["value"] = "retry"
                     calls.clear()
-                    retried = ask()
-                    self.assertEqual(len(calls), 2, "the zero-content death was not retried")
-                    self.assertIn("部分", retried)
-                    self.assertNotIn("event: error", retried)
+                    empty = ask()
+                    self.assertEqual(len(calls), 1, "an accepted generation was replayed")
+                    self.assertNotIn("部分", empty)
+                    self.assertIn("event: error", empty)
+                    self.assertNotIn("event: message_stop", empty)
         finally:
             server.shutdown()
             server.server_close()
@@ -2450,8 +2454,8 @@ class RouterRegressionTests(unittest.TestCase):
         self.assertIn("partial", stream)
         self.assertEqual(log_lines[-1]["status"], 502)
 
-    def test_chat_bridge_retries_an_early_death_invisibly(self) -> None:
-        """Zero-content death on attempt one is retried; the client sees a clean run."""
+    def test_chat_bridge_does_not_replay_an_early_billable_death(self) -> None:
+        """HTTP 200 with no content still means the upstream accepted the request."""
         calls: list[int] = []
 
         class FlakyChat(BaseHTTPRequestHandler):
@@ -2498,15 +2502,16 @@ class RouterRegressionTests(unittest.TestCase):
                         method="POST",
                     )
                     with urllib.request.urlopen(request, timeout=10) as response:
+                        self.assertEqual(response.status, 200)
                         stream = response.read().decode("utf-8", "replace")
         finally:
             server.shutdown()
             server.server_close()
 
-        self.assertEqual(len(calls), 2, "the zero-content death was not retried")
-        self.assertIn("recovered", stream)
-        self.assertIn("response.completed", stream)
-        self.assertNotIn("response.failed", stream)
+        self.assertEqual(len(calls), 1, "the empty generation was replayed")
+        self.assertNotIn("recovered", stream)
+        self.assertNotIn("response.completed", stream)
+        self.assertIn("response.failed", stream)
 
     def test_chat_bridge_refuses_a_messages_client(self) -> None:
         """A dual-protocol provider with the bridge refuses Messages instead of mangling."""
@@ -2747,19 +2752,8 @@ class RouterRegressionTests(unittest.TestCase):
                     untouched.requests, [], "the retry leaked to a second vendor's account"
                 )
 
-    @unittest.expectedFailure  # 同上：代码禁止计费请求重试，本测试要求重试
-    def test_a_fast_transient_5xx_can_retry_only_with_idempotency_key(self) -> None:
-        """UNRESOLVED: contradicts the router, which never retries a billable generation.
-
-        This asserts that an Idempotency-Key licenses a bounded same-vendor retry of a 503 on
-        `/v1/messages`. `_attempt_upstream` disables it unconditionally for BILLABLE_GENERATION_PATHS
-        -- "the caller marks billable generation requests as non-replayable even when an
-        Idempotency-Key is present" -- so the vendor sees one request and the 503 is passed through.
-
-        Same open decision as
-        test_responses_failover_skips_messages_only_provider_when_idempotency_is_explicit. The
-        router's position is the conservative one and costs nothing while failover is off.
-        """
+    def test_fast_billable_5xx_does_not_retry_even_with_idempotency_key(self) -> None:
+        """A provider may ignore the key; preserve single-shot billing after an HTTP reply."""
         with tempfile.TemporaryDirectory() as temporary, ScriptedUpstream(
             messages_failures=1
         ) as flaky, ScriptedUpstream() as untouched:
@@ -2804,9 +2798,12 @@ class RouterRegressionTests(unittest.TestCase):
                     },
                     method="POST",
                 )
-                with urllib.request.urlopen(request, timeout=20) as response:
-                    self.assertEqual(response.status, 200)
-                self.assertEqual(len(flaky.requests), 2, "the keyed 503 was not retried")
+                with self.assertRaises(urllib.error.HTTPError) as raised:
+                    urllib.request.urlopen(request, timeout=20)
+                with raised.exception as response:
+                    self.assertEqual(response.code, 503)
+                    response.read()
+                self.assertEqual(len(flaky.requests), 1, "the keyed generation was replayed")
                 self.assertEqual(
                     untouched.requests, [], "a same-vendor retry leaked to another account"
                 )
@@ -3941,7 +3938,7 @@ class ManagerRegressionTests(unittest.TestCase):
                     ).encode()
 
             app = SimpleNamespace(workspace=workspace)
-            with mock.patch.object(manager.urllib.request, "urlopen", return_value=Response()), \
+            with mock.patch.object(manager.LOCAL_HEALTH_OPENER, "open", return_value=Response()), \
                 mock.patch.object(manager, "restart_router", return_value={"status": "ready"}) as restart:
                 started = manager.CodexSotaApp._ensure_router_running(app, workspace)
 
@@ -4094,6 +4091,7 @@ class ManagerRegressionTests(unittest.TestCase):
         app._run_task.assert_not_called()
 
     def test_claude_launch_enables_3p_mode_and_uses_the_resolved_squirrel_target(self) -> None:
+        claim_id = "fixture-squirrel-generation"
         app = SimpleNamespace(
             _busy=False,
             registry={"version": 1, "providers": []},
@@ -4109,7 +4107,7 @@ class ManagerRegressionTests(unittest.TestCase):
 
         def run_process(command: list[str], **_kwargs: object) -> SimpleNamespace:
             process_calls.append(command)
-            return SimpleNamespace(returncode=0, stdout="", stderr="")
+            return SimpleNamespace(pid=4242)
 
         target = {
             "kind": "aumid",
@@ -4127,13 +4125,17 @@ class ManagerRegressionTests(unittest.TestCase):
         ), mock.patch.object(
             # Unmocked, these two reach the user's real Claude config library and spawn a real
             # detached watcher.  A unit test must not touch either.
-            manager, "claim_claude_slot", return_value={"status": "claimed", "displaced_name": "CC Switch"}
+            manager, "claim_claude_slot", return_value={
+                "status": "claimed", "displaced_name": "CC Switch", "claim": {"claim_id": claim_id}
+            }
         ) as claim_slot, mock.patch.object(
+            manager, "confirm_claude_slot_claim", return_value={"status": "confirmed"}
+        ) as confirm_slot, mock.patch.object(
             manager, "arm_claude_slot_release", return_value={"status": "armed"}
         ) as arm_watcher, mock.patch.object(
             manager, "release_claude_slot", return_value={"status": "released"}
         ) as release_slot, mock.patch.object(
-            manager.subprocess, "run", side_effect=run_process
+            manager.subprocess, "Popen", side_effect=run_process
         ), mock.patch.object(
             manager, "claude_window_present", return_value=True
         ):
@@ -4146,8 +4148,11 @@ class ManagerRegressionTests(unittest.TestCase):
         )
         # The slot is borrowed for the launch and the give-it-back watcher is armed, so
         # cc-switch gets its own profile back when this Claude exits.
-        claim_slot.assert_called_once_with()
-        arm_watcher.assert_called_once_with()
+        claim_slot.assert_called_once_with(
+            launch_pending=True, launch_timeout_seconds=manager.LAUNCH_WINDOW_WAIT_SECONDS + 120.0
+        )
+        confirm_slot.assert_called_once_with(claim_id, pids=set())
+        arm_watcher.assert_called_once_with(claim_id)
         release_slot.assert_not_called()
 
     def test_claude_launch_succeeds_even_though_explorer_reports_a_nonzero_exit_code(self) -> None:
@@ -4157,6 +4162,7 @@ class ManagerRegressionTests(unittest.TestCase):
         activation exits 1, and so does a nonexistent AUMID.  Treating non-zero as failure made
         every Claude launch report failure *after* closing the user's running Claude.
         """
+        claim_id = "fixture-explorer-generation"
         app = SimpleNamespace(
             _busy=False,
             registry={"providers": []},
@@ -4184,17 +4190,20 @@ class ManagerRegressionTests(unittest.TestCase):
         ), mock.patch.object(manager, "migrate_legacy_entry", return_value={"status": "not-needed"}), mock.patch.object(
             manager, "ensure_deployment_mode", return_value={"status": "ready", "changed": False}
         ), mock.patch.object(manager, "write_claude_profile", return_value={"models": 1}), mock.patch.object(
-            manager, "claim_claude_slot", return_value={"status": "claimed", "displaced_name": "CC Switch"}
-        ), mock.patch.object(
+            manager, "claim_claude_slot", return_value={
+                "status": "claimed", "displaced_name": "CC Switch", "claim": {"claim_id": claim_id}
+            }
+        ) as claim_slot, mock.patch.object(
+            manager, "confirm_claude_slot_claim", return_value={"status": "confirmed"}
+        ) as confirm_slot, mock.patch.object(
             manager, "arm_claude_slot_release", return_value={"status": "armed"}
         ) as arm_watcher, mock.patch.object(
             manager, "release_claude_slot", return_value={"status": "released"}
         ) as release_slot, mock.patch.object(
             manager, "close_running_claude", return_value={"closed": 0}
         ), mock.patch.object(
-            manager.subprocess,
-            "run",
-            return_value=SimpleNamespace(returncode=1, stdout="", stderr=""),
+            manager, "start_claude_process",
+            return_value={"returncode": 1, "detail": ""},
         ), mock.patch.object(manager, "claude_window_present", return_value=True):
             manager.CodexSotaApp._launch_claude(app)
 
@@ -4202,11 +4211,16 @@ class ManagerRegressionTests(unittest.TestCase):
         self.assertTrue(result["window"], result)
         self.assertEqual(result["launch_code"], 1)
         self.assertEqual(warnings, [], "a launch that produced a window must not warn")
-        arm_watcher.assert_called_once_with()
+        claim_slot.assert_called_once_with(
+            launch_pending=True, launch_timeout_seconds=manager.LAUNCH_WINDOW_WAIT_SECONDS + 120.0
+        )
+        confirm_slot.assert_called_once_with(claim_id, pids=set())
+        arm_watcher.assert_called_once_with(claim_id)
         release_slot.assert_not_called()
 
     def test_claude_launch_hands_the_slot_back_when_no_window_appears(self) -> None:
         """A launch that produces no window must not leave cc-switch pointed at our gateway."""
+        claim_id = "fixture-no-window-generation"
         app = SimpleNamespace(
             _busy=False,
             registry={"providers": []},
@@ -4233,22 +4247,31 @@ class ManagerRegressionTests(unittest.TestCase):
         ), mock.patch.object(manager, "migrate_legacy_entry", return_value={"status": "not-needed"}), mock.patch.object(
             manager, "ensure_deployment_mode", return_value={"status": "ready", "changed": False}
         ), mock.patch.object(manager, "write_claude_profile", return_value={"models": 1}), mock.patch.object(
-            manager, "claim_claude_slot", return_value={"status": "claimed", "displaced_name": "CC Switch"}
-        ), mock.patch.object(
+            manager, "claim_claude_slot", return_value={
+                "status": "claimed", "displaced_name": "CC Switch", "claim": {"claim_id": claim_id}
+            }
+        ) as claim_slot, mock.patch.object(
+            manager, "confirm_claude_slot_claim", return_value={"status": "confirmed"}
+        ) as confirm_slot, mock.patch.object(
             manager, "arm_claude_slot_release", return_value={"status": "armed"}
         ) as arm_watcher, mock.patch.object(
             manager, "release_claude_slot", return_value={"status": "released"}
         ) as release_slot, mock.patch.object(
             manager, "close_running_claude", return_value={"closed": 0}
         ), mock.patch.object(
-            manager.subprocess, "run", return_value=SimpleNamespace(returncode=0, stdout="", stderr="")
+            manager.subprocess, "Popen", return_value=SimpleNamespace(pid=4242)
         ), mock.patch.object(manager, "claude_window_present", return_value=False), mock.patch.object(
             manager, "LAUNCH_WINDOW_WAIT_SECONDS", 0.05
         ), mock.patch.object(manager, "LAUNCH_WINDOW_POLL_SECONDS", 0.01):
             manager.CodexSotaApp._launch_claude(app)
 
         self.assertFalse(captured["result"]["window"])
-        release_slot.assert_called_once_with()
+        claim_slot.assert_called_once_with(launch_pending=True, launch_timeout_seconds=120.05)
+        confirm_slot.assert_not_called()
+        release_slot.assert_called_once_with(
+            expected_claim_id=claim_id, allow_pending=True, is_claude_running=mock.ANY
+        )
+        self.assertTrue(callable(release_slot.call_args.kwargs["is_claude_running"]))
         arm_watcher.assert_not_called()
 
 
@@ -4623,12 +4646,26 @@ class ConfigRestoreTests(unittest.TestCase):
                 ],
             }
 
-            _candidate, report = manager.merge_restored_registry(
+            candidate, report = manager.merge_restored_registry(
                 incoming, {"version": 1, "providers": []}, space.name
             )
 
-            # codex_auth borrows the Codex App's own login, so it has no key file to miss.
-            self.assertEqual(report["needs_key"], ["no_key"])
+            # A new imported route must not acquire the existing Codex login.
+            # It becomes an independent DPAPI provider until its own key is supplied.
+            self.assertEqual(report["needs_key"], ["no_key", "codex_login"])
+            self.assertEqual(report["independent_key_required"], ["codex_login"])
+            self.assertEqual(candidate["providers"][2]["auth_type"], "dpapi")
+            self.assertIn("-import-", candidate["providers"][2]["secret_file"])
+
+            # An identity already registered on disk remains a supported borrowed login.
+            existing = deepcopy(incoming["providers"][2])
+            restored, existing_report = manager.merge_restored_registry(
+                incoming, {"version": 1, "providers": [existing]}, space.name
+            )
+            self.assertEqual(existing_report["needs_key"], ["no_key"])
+            self.assertEqual(existing_report["independent_key_required"], [])
+            self.assertEqual(restored["providers"][2]["auth_type"], "codex_auth")
+            self.assertEqual(restored["providers"][2]["base_url"], existing["base_url"])
 
     def test_restore_writes_the_registry_and_backs_up_the_old_one_first(self) -> None:
         with self.workspace() as space:

@@ -75,13 +75,17 @@ def plan_root(root: Path, pairs: list[tuple[str, str]]) -> list[ArchivePlan]:
                 raise core.SyncError("Multiple duplicate pages need separate branch review")
             evidence, digests = {}, []
             for thread_id in (keep, duplicate):
-                path = repair.plain_path(rows[thread_id]["rollout_path"])
+                path = core.canonical_storage_path(rows[thread_id]["rollout_path"])
+                # Expanding RUNNER~1-style names is safe; following a symlink
+                # pointer would discard the evidence that it escaped the exact
+                # inventory. Keep repair.inside's unchanged link/boundary checks.
+                repair.inside(root, path)
                 if path not in pages or pages[path]["owner"] != thread_id:
                     raise core.SyncError("Thread does not point to its own physical head")
                 for page in repair.chain_paths(path, pages):
                     evidence[page] = repair.fingerprint(page)
                 stat = path.stat()
-                session = core.SessionFile(thread_id, path, path.relative_to(root), stat.st_size, stat.st_mtime_ns)
+                session = core.SessionFile(thread_id, path, core.relative_storage_path(path, root), stat.st_size, stat.st_mtime_ns)
                 digests.append(core.normalized_session_digest(session))
             if digests[0] != digests[1]:
                 raise core.SyncError("Duplicate contents differ; distinct histories must be preserved")

@@ -12,8 +12,8 @@ import sys
 import time
 
 from codex_app_lifecycle import (
-    FileLock, LifecycleBusy, WATCHER_LOCK_PATH, app_running, launch_pending,
-    process_identity, _role_for_path,
+    AppNotQuiescent, FileLock, LifecycleBusy, WATCHER_LOCK_PATH, app_running,
+    assert_quiescent, launch_pending, lifecycle_lock, process_identity, _role_for_path,
 )
 
 
@@ -180,7 +180,7 @@ def run_sync_with_retry(attempts: int = 1) -> dict[str, object]:
                 result = json.loads(raw_lines[-1])
             except json.JSONDecodeError:
                 result = None
-            if isinstance(result, dict) and result.get("status") in ("ok", "deferred"):
+            if isinstance(result, dict) and result.get("status") in ("ok", "deferred", "skipped"):
                 return result
         last_error = (completed.stderr or completed.stdout or "unknown error").strip()
         if (
@@ -239,11 +239,19 @@ def run_archived_sidebar_repair() -> dict[str, object]:
     """
     if not ARCHIVE_SIDEBAR_REPAIR_SCRIPT.is_file():
         raise RuntimeError(f"Archived sidebar repair tool is missing: {ARCHIVE_SIDEBAR_REPAIR_SCRIPT}")
-    completed = subprocess.run(
-        [str(SYNC_PYTHON), str(ARCHIVE_SIDEBAR_REPAIR_SCRIPT)],
-        capture_output=True, text=True, encoding="utf-8", errors="replace",
-        creationflags=CREATE_NO_WINDOW, check=False,
-    )
+    try:
+        # A quiet-period observation is not a write lease. Launchers take the
+        # same pair in this order and must not open over projection maintenance.
+        assert_quiescent()
+        with lifecycle_lock(), FileLock(INSTALL_DIR / "sync.lock"):
+            assert_quiescent()
+            completed = subprocess.run(
+                [str(SYNC_PYTHON), str(ARCHIVE_SIDEBAR_REPAIR_SCRIPT)],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                creationflags=CREATE_NO_WINDOW, check=False,
+            )
+    except (AppNotQuiescent, LifecycleBusy) as error:
+        return {"status": "deferred", "reason": str(error)}
     if completed.returncode != 0:
         detail = (completed.stderr or completed.stdout or "no structured result").strip()
         raise RuntimeError(f"Archived sidebar repair failed (exit {completed.returncode}): {detail}")
@@ -263,7 +271,6 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
-    setup_logging()
     args = build_parser().parse_args()
     if args.audit_only:
         print(
@@ -281,16 +288,23 @@ def main() -> int:
         return 0
     if args.pid is None:
         raise SystemExit("--pid is required unless --audit-only is used")
+    setup_logging()
     try:
         with FileLock(WATCHER_LOCK_PATH):
             logging.info("watching Codex App pid=%s (singleton)", args.pid)
             if not wait_for_process(args.pid, args.app_executable, args.creation_ticks):
-                logging.info("stale/unverifiable Codex watcher pid=%s; exiting without app wait",
+                logging.info("stale/unverifiable Codex watcher pid=%s; checking global quiet state",
                              args.pid)
-                return 0
+                # A fast exit may beat watcher startup. The global process and
+                # launch-request guards below still require a full quiet period,
+                # including when this PID was recycled or could not be inspected.
             while True:
                 wait_until_app_is_fully_closed(max(1.0, args.quiet_seconds))
                 archive_repair = run_archived_sidebar_repair()
+                if archive_repair.get("status") == "deferred":
+                    logging.info("archived sidebar repair deferred: %s", archive_repair.get("reason"))
+                    time.sleep(2.0)
+                    continue
                 if archive_repair.get("detail"):
                     logging.info("archived sidebar repair complete: %s", archive_repair["detail"])
                 repair = run_pending_repair()
@@ -299,6 +313,9 @@ def main() -> int:
                     time.sleep(2.0)
                     continue
                 result = run_sync_with_retry()
+                if result.get("status") == "skipped":
+                    logging.info("post-exit history sync inactive: %s", result.get("reason"))
+                    return 0
                 if result.get("status") == "deferred":
                     logging.info("post-exit sync deferred: %s", result.get("reason"))
                     # Keep the singleton alive to observe the NEXT clean exit.

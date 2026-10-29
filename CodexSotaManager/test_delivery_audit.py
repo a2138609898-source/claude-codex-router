@@ -53,6 +53,15 @@ class DeliveryAuditTests(unittest.TestCase):
                 SyncAndBuildRegressionTests._make_history_root(root, 'test', ('one',))
             first = sync.create_outer_snapshot(roots, base / 'backups' / '1')
             second = sync.create_outer_snapshot(roots, base / 'backups' / '2')
+            # Retention needs durable proof that each transaction completed.
+            # A bare snapshot is also what an interrupted writer leaves behind;
+            # it must not be silently classified as a successful old run.
+            for snapshot in (first, second):
+                (snapshot['root'].parent / 'run-state.json').write_text(
+                    json.dumps({'status': 'completed'}), encoding='utf-8'
+                )
+            unknown = base / 'backups' / '0' / 'outer-snapshot'
+            unknown.mkdir(parents=True)
             original = roots[0] / 'sessions' / 'rollout-one.jsonl'
             copied = second['root'] / 'cockpit' / 'sessions' / original.name
             expected = copied.read_bytes()
@@ -62,6 +71,7 @@ class DeliveryAuditTests(unittest.TestCase):
             sync.prune_outer_snapshots(base / 'backups')
             self.assertFalse(first['root'].exists())
             self.assertEqual(copied.read_bytes(), expected)
+            self.assertTrue(unknown.exists())
 
     def test_incomplete_rollback_survives_both_retention_policies(self):
         with tempfile.TemporaryDirectory() as temp:

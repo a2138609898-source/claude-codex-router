@@ -4,6 +4,16 @@
 和 Codex CLI/App，后面接若干家 OpenAI / Anthropic 兼容的中转供应商，再配一个 Tkinter 管理器负责
 增删供应商、存密钥、切档、看用量。仓库不包含任何个人账号、密钥、聊天记录或运行状态。
 
+## Windows 直接安装
+
+从 [GitHub Releases](https://github.com/a2138609898-source/claude-codex-router/releases/latest)
+下载 `windows-x64-setup.exe`，双击即可按当前 Windows 用户安装。也可以下载 `portable.zip`，完整解压后运行
+`codex-sota.exe`。两者都自带运行环境，无需安装 Python、Node.js、Git 或管理员权限。
+
+首次打开选择 Codex App 或 Claude Desktop，添加自己的供应商地址、密钥和模型，保存并应用。
+对应的官方桌面客户端需另行安装。升级安装和卸载保留个人配置；换电脑需要重新填写自己的密钥。
+[安装说明](docs/WINDOWS-INSTALL.md) · [版本记录](CHANGELOG.md) · [维护架构](docs/ARCHITECTURE.md)
+
 项目当前支持 Windows 10/11、PowerShell 5.1 或 PowerShell 7、CPython 3.11+。它使用 Windows DPAPI、
 `msvcrt` 文件锁和 Win32 进程 API，因此不是跨平台项目；但源码目录可以放在任意路径，部署路径、Python
 解释器、Codex App 和各个 profile 根目录都可以通过环境变量覆盖。
@@ -76,7 +86,7 @@ mtime/size），每次请求前比一下，变了就重建路由表。改完 `pr
 **ROUTER_VERSION 和 `/healthz` 的三元比较。** `/healthz` 回 `status` + `version` +
 `registry_hash` + `upstreams`。启动脚本 `Start-CodexSotaRouter.ps1` 是**幂等的 ensure-running**：
 四项全对就认为已经在跑，直接返回不动进程。涉及路由安全语义的改动必须递增
-`ROUTER_VERSION`；当前 v15 加入了裸模型拒绝。若只改了未递增版本的代码，健康检查仍可能匹配，
+`ROUTER_VERSION`；当前 v20 包含裸模型拒绝、缺失密钥隔离及浏览器跨站请求防护。若只改了未递增版本的代码，健康检查仍可能匹配，
 「重启」会变成什么都没做；真要换进程必须走 `-Stop`，或者调用方传 `force=True`。
 
 ## 目录结构
@@ -109,10 +119,10 @@ mtime/size），每次请求前比一下，变了就重建路由表。改完 `pr
 | `Build-Staged.ps1` / `Apply-StagedBuild.ps1` | 先打到 staging，验证过再原子换上去 |
 | `codex-sota.spec` | PyInstaller 配置 |
 
-## 安装与运行
+## 从源码运行
 
 1. 安装 CPython 3.11 或更新版本、PowerShell 和 Codex App。源码运行不需要第三方运行时依赖；构建
-   管理器才需要 PyInstaller。
+   管理器才需要 PyInstaller。下载已构建安装包时无需执行这些步骤。
 2. 将仓库解压或克隆到任意不含个人数据的目录。不要把仓库放进 `.codex-*` profile 根目录。
 3. 在仓库根目录执行 `powershell -NoProfile -ExecutionPolicy Bypass -File .\setup.ps1 -SkipBuildTools`。
    它检查 Python 并生成被 Git 忽略的 `.runtime\codex-sota.env.ps1`，不会改用户 profile。
@@ -183,6 +193,17 @@ cd CodexSotaManager
 
 ## 打包
 
+生成可直接分发的安装包和便携包：
+
+```powershell
+.\setup.ps1
+.\Build-Release.ps1 -Version 0.2.0
+```
+
+构建需要 Inno Setup 6.4 或更新版本。输出的 `release/` 包含安装程序、便携 ZIP 和 SHA-256 校验文件。
+发布构建检查源码未在构建期间变化、打包清单完整、隔离运行时导入以及本地假上游转发。
+标签发布流程见 [.github/workflows/release.yml](.github/workflows/release.yml)。
+
 需要构建时执行 `.\setup.ps1` 安装 `.runtime\.venv-build` 中的构建依赖，再执行
 `powershell -NoProfile -ExecutionPolicy Bypass -File .\CodexSotaManager\Build-Staged.ps1`。
 自定义构建环境可通过 `-PythonExecutable` 或 `CODEX_SOTA_BUILD_PYTHON` 指定。源码运行无需打包。
@@ -195,6 +216,7 @@ PyInstaller 走 `codex-sota.spec`（onedir、`console=False`、图标内嵌）�
 ## 安全说明
 
 - 路由器默认只监听 `127.0.0.1`（`--host` 的默认值），不对外。
+- 拒绝带外部 Origin、跨站浏览器来源或非本地 Host 的请求，防止网页和 DNS 重绑定使用本地额度。
 - **环回监听没有鉴权。** 它不检查任何进来的 `Authorization` 头（只读 `Transfer-Encoding` 和
   `Content-Length`），也就是说这台机器上任何进程只要能连到那个端口，就能用你配置的全部供应商和额度。
   `--auth` 参数指的是**发往上游**用的 Codex 认证文件，不是入口的门禁。单机自用可以接受，但别把这个
