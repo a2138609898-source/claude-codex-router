@@ -158,7 +158,7 @@ class ArchiveSidebarTests(unittest.TestCase):
                 with database(root / "state_5.sqlite") as db:
                     archived, path = db.execute("SELECT archived,rollout_path FROM threads WHERE id='archived'").fetchone()
                 self.assertEqual(archived, 0)
-                self.assertEqual(Path(path).parent, root / "sessions")
+                self.assertEqual(Path(path).parent.resolve(), (root / "sessions").resolve())
                 self.assertTrue(Path(path).is_file())
 
     def test_missing_rollouts_fail_before_snapshot_or_rollback(self):
