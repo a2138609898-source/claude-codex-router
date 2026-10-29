@@ -1,0 +1,2 @@
+# Native .jsonl.zst history used by Codex account/SOTA switching.
+zstandard==0.25.0

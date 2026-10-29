@@ -18,6 +18,18 @@ endpoint, API key, and models, then save and apply. Install the corresponding
 official Codex or Claude desktop application separately before launching it
 from the manager.
 
+Codex account switching: "GPT 账号直登" opens the separate initialized
+ChatGPT-account profile (default .codex-plus); "切回 / 重启 SOTA" returns to
+the original SOTA profile. Account sign-in and SOTA settings stay separate.
+Both directions catch up local conversations only after the desktop and its
+backend have fully exited. Native compressed/paginated history is supported;
+independent continuations are kept as branches, with verified backups.
+The account profile must already have a valid configuration and a history
+database created by Codex. A missing or incompatible profile is reported,
+never overwritten. Sign in or change the official account inside that profile's
+Codex App. Closing the manager alone does not close Codex or trigger a live
+database merge. This feature is not ChatGPT web-history or cross-PC cloud sync.
+
 Configuration stays under %USERPROFILE%\.codex-sota or .claude-sota. Secrets
 use Windows DPAPI and cannot be copied to a different Windows user or computer.
 On another computer, install the application and enter your own credentials.

@@ -1,4 +1,4 @@
-# Regression guard for the launch failure "Cannot bind argument to parameter 'Id'
+﻿# Regression guard for the launch failure "Cannot bind argument to parameter 'Id'
 # because it is an empty array."
 #
 # Get-Process -Id @() fails during PARAMETER BINDING. -ErrorAction SilentlyContinue only
@@ -20,7 +20,15 @@ $targets = @(
 )
 
 function Get-FunctionSource {
-    param([string]$Path, [string]$Name)
+    # Every function the launcher defines, not only the one under test.
+    #
+    # Extracting a single function stopped working the moment the launcher grew a helper: the
+    # 2026-09-25 hardening routes the WMI lookups through `Invoke-WithComRetry`, and this check
+    # then reported "The term 'Invoke-WithComRetry' is not recognized" -- i.e. it failed for its
+    # own reasons while looking exactly like the cold-start crash it exists to catch.  A guard
+    # that goes red for its own reasons is worse than no guard, because it hides the real answer.
+    # The two cmdlets the harness drives are stubbed after dot-sourcing, so they still win.
+    param([string]$Path)
 
     $tokens = $null
     $errors = $null
@@ -28,22 +36,23 @@ function Get-FunctionSource {
     if ($errors -and $errors.Count -gt 0) {
         throw "$([IO.Path]::GetFileName($Path)) does not parse: $($errors[0].Message)"
     }
-    $match = $ast.FindAll(
-        {
-            param($node)
-            $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
-            $node.Name -eq $Name
-        },
+    $definitions = @($ast.FindAll(
+        { param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] },
         $true
-    ) | Select-Object -First 1
-    if (-not $match) {
-        throw "$([IO.Path]::GetFileName($Path)) has no function named $Name"
+    ))
+    if (-not ($definitions | Where-Object { $_.Name -eq 'Get-OwnedCodexAppProcesses' })) {
+        throw "$([IO.Path]::GetFileName($Path)) has no function named Get-OwnedCodexAppProcesses"
     }
-    return $match.Extent.Text
+    return ($definitions | ForEach-Object { $_.Extent.Text }) -join "`n`n"
 }
 
 function Test-EmptyProcessTable {
     param([string]$Source, [int]$FakeProcessCount)
+
+    # Definitions first, then the stubs, so the stubs shade the launcher's own versions of the
+    # two functions this check drives.  PowerShell resolves a name to the most recent definition
+    # in the scope, which is what makes "dot-source everything, then stub" order-dependent.
+    . ([scriptblock]::Create($Source))
 
     # Stubs shadow the real cmdlets: PowerShell resolves functions before cmdlets.
     # [CmdletBinding()] makes -ErrorAction bind as a common parameter instead of colliding.
@@ -61,7 +70,6 @@ function Test-EmptyProcessTable {
     }
 
     $ErrorActionPreference = 'Stop'
-    . ([scriptblock]::Create($Source))
     return @(Get-OwnedCodexAppProcesses)
 }
 
@@ -100,7 +108,7 @@ foreach ($name in $targets) {
     }
 
     try {
-        $source = Get-FunctionSource -Path $path -Name 'Get-OwnedCodexAppProcesses'
+        $source = Get-FunctionSource -Path $path
     }
     catch {
         Write-Host ("FAIL  {0,-28} {1}" -f $name, $_.Exception.Message)

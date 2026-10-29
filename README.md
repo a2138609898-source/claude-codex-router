@@ -12,7 +12,7 @@
 
 首次打开选择 Codex App 或 Claude Desktop，添加自己的供应商地址、密钥和模型，保存并应用。
 对应的官方桌面客户端需另行安装。升级安装和卸载保留个人配置；换电脑需要重新填写自己的密钥。
-[安装说明](docs/WINDOWS-INSTALL.md) · [版本记录](CHANGELOG.md) · [维护架构](docs/ARCHITECTURE.md) · [本版验证](docs/VALIDATION-0.2.1.md)
+[安装说明](docs/WINDOWS-INSTALL.md) · [版本记录](CHANGELOG.md) · [维护架构](docs/ARCHITECTURE.md) · [本版验证](docs/VALIDATION-0.2.2.md)
 
 项目当前支持 Windows 10/11、PowerShell 5.1 或 PowerShell 7、CPython 3.11+。它使用 Windows DPAPI、
 `msvcrt` 文件锁和 Win32 进程 API，因此不是跨平台项目；但源码目录可以放在任意路径，部署路径、Python
@@ -26,6 +26,22 @@ Codex 各自只能填**一个**网关地址。所以在本地立一个收口：
 - 对上：始终是同一个 `http://127.0.0.1:<port>`，配一次就不用再动。
 - 对下：`providers.json` 里挂多家，每家自己的 base_url、密钥、模型清单和路径。
 - 中间：按请求里的模型名决定发给谁，并把「客户端看到的名字」翻译成「上游真正认的名字」。
+
+## Codex 官方账号与 SOTA 切换
+
+管理器的「GPT 账号直登」使用独立账号 profile（默认 `.codex-plus`）打开同一个 Codex App；
+「切回 / 重启 SOTA」继续使用原 SOTA profile。账号登录、供应商、模型配置和密钥分开保存，
+切换不会复制凭据、重置配置或停止 SOTA 后台路由。
+
+两个方向都会在 App 及其后台完全退出后补齐本地对话：打开账号版时读取 SOTA 历史，切回 SOTA
+时返回账号侧新增及续写。已有对话 ID、名称、项目、置顶和归档状态会保留；双方独立续写时保留分支，
+增量账本防止来回重复复制。兼容原生 `.jsonl.zst` 压缩、分页祖先和旧记录格式迁移，覆盖前留下校验备份。
+正在运行的 App 不会被强制结束，也不会边聊天边改写数据库。仅关闭管理器不等于退出 Codex App。
+
+此入口要求独立账号 profile 已初始化过（配置有效，并由 Codex 建立历史数据库）。缺少 profile、
+配置不兼容或认证类型不符时会停止并提示，不会用 SOTA 配置覆盖账号目录。未登录但已初始化的账号
+环境可以在 App 内完成官方登录；换账号也在账号版 App 内操作。这是同一台电脑的本地历史同步，
+不是 ChatGPT 网页聊天或跨电脑云同步。
 
 ## 架构
 
@@ -105,6 +121,7 @@ mtime/size），每次请求前比一下，变了就重建路由表。改完 `pr
 | `Run-CodexHistorySync.ps1` | Codex 历史同步的入口，顺带清理会泄给子进程的 API key 环境变量 |
 | `Switch-CodexSota.ps1` / `Switch-CodexProfile.ps1` | 切 Codex 档的启动器 |
 | `sync_codex_histories*.py` | Codex 会话历史的两向 / 三向同步 |
+| `sync_chatgpt_account_history.py` | 账号与 SOTA 切换时的离线增量历史补齐；支持压缩分页、独立分支和可恢复安装 |
 | `release_claude_slot_after_exit.py` | 守 Claude Desktop 退出，把 `appliedId` 槽还给原主 |
 | `check_*.py` / `check_*.ps1` | 独立自检脚本，见「测试」 |
 | `fixture_ports.py` | 给测试发空闲端口 |
@@ -121,7 +138,7 @@ mtime/size），每次请求前比一下，变了就重建路由表。改完 `pr
 
 ## 从源码运行
 
-1. 安装 CPython 3.11 或更新版本、PowerShell 和 Codex App。源码运行不需要第三方运行时依赖；构建
+1. 安装 CPython 3.11 或更新版本、PowerShell 和 Codex App。账号历史同步需要 `pip install -r requirements-history.txt`；构建
    管理器才需要 PyInstaller。下载已构建安装包时无需执行这些步骤。
 2. 将仓库解压或克隆到任意不含个人数据的目录。不要把仓库放进 `.codex-*` profile 根目录。
 3. 在仓库根目录执行 `powershell -NoProfile -ExecutionPolicy Bypass -File .\setup.ps1 -SkipBuildTools`。
@@ -197,7 +214,7 @@ cd CodexSotaManager
 
 ```powershell
 .\setup.ps1
-.\Build-Release.ps1 -Version 0.2.1
+.\Build-Release.ps1 -Version 0.2.2
 ```
 
 构建需要 Inno Setup 6.4 或更新版本。输出的 `release/` 包含安装程序、便携 ZIP 和 SHA-256 校验文件。

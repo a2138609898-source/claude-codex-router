@@ -6,6 +6,8 @@
     [switch]$AuditOnly,
     [switch]$SkipSync,
     [switch]$PrepareOnly,
+    [switch]$ChatGptDirect,
+    [switch]$Restart,
     [string]$LaunchRequestId,
     [ValidateRange(0, 30)][int]$LifecycleWaitSeconds = 3,
     [ValidateRange(1, 120)][int]$WindowReadyTimeoutSeconds = 30
@@ -33,6 +35,8 @@ $runnerPath = Join-Path $installDir 'Run-CodexHistorySync.ps1'
 $syncCorePath = Join-Path $installDir 'sync_codex_histories.py'
 $lastResultPath = Join-Path $installDir 'last-result.json'
 $postExitWatcherPath = Join-Path $installDir 'sync_after_codex_exit.py'
+$accountHistorySyncPath = Join-Path $installDir 'sync_chatgpt_account_history.py'
+$script:accountHistorySyncResult = $null
 $configValidatorPath = Join-Path $installDir 'validate_codex_profile.py'
 $activeProfilePath = Join-Path $installDir 'active-profile.json'
 $canonicalCockpitRoot = Resolve-ConfiguredRoot 'CODEX_SOTA_COCKPIT_ROOT' '.codex-personal'
@@ -153,6 +157,7 @@ function Write-ProfileLaunchResult {
         app_creation_ticks = if ($app) { $app.StartTime.ToUniversalTime().ToFileTimeUtc().ToString() } else { $null }
         window_owned = [bool]($app -and $app.MainWindowHandle -ne 0)
         error = $ErrorText
+        account_history_sync = $script:accountHistorySyncResult
     } | ConvertTo-Json -Compress
     if (-not $AuditOnly -and -not $PrepareOnly) {
         $temporary = $launchStatusPath + '.new-' + $PID
@@ -346,6 +351,45 @@ function Test-ExplicitPortableCodexApp {
     return $true
 }
 
+function Assert-ChatGptDirectProfile {
+    # This entry is opt-in. Existing Plus/Cockpit launchers retain their behavior.
+    # Validate before closing any app; no config, credentials, or registry is written.
+    if ($Profile -ne 'Plus') { throw 'ChatGptDirect only supports the separate Plus account profile.' }
+    if (-not (Test-Path -LiteralPath $accountHistorySyncPath -PathType Leaf)) {
+        throw 'The account-only history helper is missing. No app was closed and SOTA was not changed.'
+    }
+    if (-not (Test-Path -LiteralPath $canonicalPlusRoot -PathType Container)) {
+        throw "The separate account profile is missing: $canonicalPlusRoot. SOTA was not changed."
+    }
+    $authMode = Get-ProfileAuthMode -Root $canonicalPlusRoot
+    if ($authMode -notin @('chatgpt', 'missing')) {
+        throw "The account profile has incompatible credentials ($authMode). They were not cleared or replaced."
+    }
+    $validation = Invoke-ProfileConfigValidator -Root $canonicalPlusRoot -SelectedProfile Plus
+    if (-not $validation -or $validation.valid -ne $true) {
+        $reason = if ($validation) { $validation.reason } else { 'validator_failed' }
+        throw "The separate account profile failed read-only isolation validation ($reason). No configuration was changed."
+    }
+}
+
+function Set-ProfileStartEnvironment {
+    param([System.Diagnostics.ProcessStartInfo]$StartInfo, [string]$Root)
+    $childEnvironment = $StartInfo.EnvironmentVariables
+    if ($null -eq $childEnvironment) { throw 'The Codex child process environment could not be initialized.' }
+    $childEnvironment['CODEX_HOME'] = $Root
+    foreach ($name in $apiEnvironmentNames) { $childEnvironment.Remove($name) }
+    if ($ChatGptDirect) {
+        # Only the new child is changed. Machine/user/manager/SOTA environments
+        # and stored credentials stay intact, including any global CLI pin.
+        foreach ($name in @($childEnvironment.Keys)) {
+            if ($name -match '^(?i:OPENAI_.*|CODEX_(?:API_KEY|ACCESS_TOKEN|CLI_PATH|.*_API_KEY))$') {
+                $childEnvironment.Remove($name)
+            }
+        }
+    }
+}
+
+
 function Start-CodexAppForProfile {
     param(
         [string]$ExecutablePath,
@@ -364,7 +408,8 @@ function Start-CodexAppForProfile {
 
     $authMode = Get-ProfileAuthMode -Root $profileRoot
     $expectedAuthMode = if ($SelectedProfile -eq 'Plus') { 'chatgpt' } else { 'apikey' }
-    if ($authMode -ne $expectedAuthMode) {
+    $signedOutAccount = $ChatGptDirect -and $SelectedProfile -eq 'Plus' -and $authMode -eq 'missing'
+    if ($authMode -ne $expectedAuthMode -and -not $signedOutAccount) {
         throw "The $SelectedProfile profile has the wrong authentication mode: $authMode (expected $expectedAuthMode)."
     }
     if (-not (Test-ProfileConfig -Root $profileRoot -SelectedProfile $SelectedProfile)) {
@@ -376,14 +421,7 @@ function Start-CodexAppForProfile {
     $startInfo.WorkingDirectory = Split-Path -Parent $ExecutablePath
     $startInfo.UseShellExecute = $false
     $startInfo.CreateNoWindow = $false
-    $startInfo.EnvironmentVariables['CODEX_HOME'] = $profileRoot
-
-    # The selected CODEX_HOME owns its provider and authentication. Clearing
-    # inherited OpenAI variables prevents a machine-wide relay from leaking
-    # into either the Plus or Cockpit process.
-    foreach ($name in $apiEnvironmentNames) {
-        $startInfo.EnvironmentVariables.Remove($name)
-    }
+    Set-ProfileStartEnvironment -StartInfo $startInfo -Root $profileRoot
 
     $storeLauncher = Join-Path $PSScriptRoot 'Start-CodexStoreProcess.ps1'
     if (Test-ExplicitPortableCodexApp -ExecutablePath $ExecutablePath) {
@@ -532,6 +570,7 @@ function Invoke-ProfileConfigValidator {
     if ($ProbeCockpit) {
         $arguments += @('--probe-cockpit', '--timeout-seconds', '1.5')
     }
+    if ($ChatGptDirect) { $arguments += '--chatgpt-direct' }
     $previous = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
     try {
@@ -643,8 +682,9 @@ function Get-RequestedProfileApp {
     foreach ($path in @($activeProfilePath, $launchStatusPath)) {
         try {
             $marker = Get-Content -Raw -Encoding UTF8 -LiteralPath $path -ErrorAction Stop | ConvertFrom-Json
-            if ($marker.profile -ne $Profile -or ($marker.creation_request_id -ne $LaunchRequestId -and
-                $marker.request_id -ne $LaunchRequestId)) { continue }
+            if ($marker.profile -ne $Profile) { continue }
+            if (-not $ChatGptDirect -and $marker.creation_request_id -ne $LaunchRequestId -and
+                $marker.request_id -ne $LaunchRequestId) { continue }
             if (-not $marker.app_process_id -or -not $marker.app_creation_ticks) { continue }
             foreach ($app in @(Get-OwnedCodexAppProcesses)) {
                 if ($app.Id -eq [int]$marker.app_process_id -and
@@ -835,7 +875,38 @@ function Get-LastSyncResult {
     }
 }
 
+function Invoke-ChatGptAccountHistorySync {
+    # The caller keeps lifecycle protection while lending sync.lock to the
+    # child. The child owns that history lock even if this launcher exits.
+    if (-not $ChatGptDirect -or -not $lifecycleLease -or $historyWriteLease) {
+        throw 'Account history sync requires the account launcher lifecycle lease and a released history lease.'
+    }
+    $python = Get-PythonExecutable
+    if (-not $python) { throw 'Python 3.11+ was not found for account history synchronization.' }
+    $ticks = (Get-Process -Id $PID -ErrorAction Stop).StartTime.ToUniversalTime().ToFileTimeUtc().ToString()
+    $arguments = @('-B', $accountHistorySyncPath, '--source', $canonicalSotaRoot,
+        '--target', $canonicalPlusRoot, '--launcher-pid', [string]$PID,
+        '--launcher-creation-ticks', $ticks, '--launch-request-id', $LaunchRequestId)
+    $raw = @(& $python @arguments 2>&1)
+    $syncExit = $LASTEXITCODE
+    $result = Get-StructuredSyncResult -OutputLines $raw
+    if ($result -and $result.status -eq 'deferred' -and $syncExit -eq 2) { return $false }
+    if ($syncExit -ne 0 -or -not $result -or $result.status -ne 'ok' -or
+        $result.mode -ne 'account-history-one-way' -or $result.source_read_only -ne $true -or
+        $result.source -ne $canonicalSotaRoot -or $result.target -ne $canonicalPlusRoot -or
+        $result.mapped_source_threads -ne $result.source_threads) {
+        $detail = if ($result -and $result.error) { [string]$result.error } else { $raw -join [Environment]::NewLine }
+        throw "Account history synchronization did not complete safely. SOTA was not written. $detail"
+    }
+    $script:accountHistorySyncResult = $result
+    return $true
+}
+
+
 $targetRoot = $profileRoots[$Profile]
+# Direct mode excludes the existing bidirectional engine. Its separate,
+# one-way catch-up below is mandatory even when a legacy button passes SkipSync.
+if ($ChatGptDirect) { $SkipSync = $true }
 $plusLauncherCommand = Get-Command 'codex-plus.cmd' -ErrorAction SilentlyContinue
 $plusLauncher = if ($plusLauncherCommand) { $plusLauncherCommand.Source } else { $null }
 $launcherText = if ($plusLauncher -and (Test-Path -LiteralPath $plusLauncher)) {
@@ -958,6 +1029,7 @@ if (-not $appExecutable) {
 $legacyRecovered = 0
 $cockpitServiceReady = $null
 try {
+    if ($ChatGptDirect) { Assert-ChatGptDirectProfile }
     $lifecycleLease = Enter-AppLifecycleLock
     if ($lifecycleLease) {
         $historyWriteLease = Enter-AppLifecycleLock -LockPath (Join-Path $installDir 'sync.lock') -WaitSeconds 0
@@ -968,8 +1040,11 @@ try {
     }
     $requestedApp = Get-RequestedProfileApp
     if (-not $requestedApp) {
+        if ($ChatGptDirect -and -not $Restart -and @(Get-OwnedCodexAppProcesses).Count -gt 0) {
+            throw 'Another Codex profile is running. It was not closed. Finish its work, close it, or explicitly confirm the account switch in the manager.'
+        }
         Stop-CodexApp
-        if ($Profile -eq 'Plus') {
+        if ($Profile -eq 'Plus' -and -not $ChatGptDirect) {
             $null = Stop-CockpitTools
         }
         if (-not $SkipSync) {
@@ -991,6 +1066,20 @@ try {
         if (@(Get-ActiveCodexAppBackends).Count -gt 0) {
             Write-ProfileLaunchResult -Status 'deferred' -Phase 'waiting_for_previous_app'
             exit 0
+        }
+        if ($ChatGptDirect) {
+            Write-ProfileLaunchResult -Status 'starting' -Phase 'account_history_sync'
+            $historyWriteLease.Unlock(0, 1); $historyWriteLease.Dispose(); $historyWriteLease = $null
+            $accountHistoryReady = Invoke-ChatGptAccountHistorySync
+            $historyWriteLease = Enter-AppLifecycleLock -LockPath (Join-Path $installDir 'sync.lock') -WaitSeconds 0
+            if (-not $accountHistoryReady -or -not $historyWriteLease) {
+                Write-ProfileLaunchResult -Status 'deferred' -Phase 'waiting_for_history_sync'
+                exit 0
+            }
+            if (@(Get-OwnedCodexAppProcesses).Count -gt 0 -or @(Get-ActiveCodexAppBackends).Count -gt 0) {
+                Write-ProfileLaunchResult -Status 'deferred' -Phase 'waiting_for_previous_app'
+                exit 0
+            }
         }
     }
 }
@@ -1033,7 +1122,9 @@ catch {
     Write-Warning ("The active profile marker could not be saved: " + $_.Exception.Message)
 }
 try {
-    Start-PostExitSyncWatcher -AppProcessId $appProcessId
+    # The new account-only entry must not start a writer for other profiles.
+    # SOTA's existing launcher/watchers and legacy Plus/Cockpit paths are unchanged.
+    if (-not $ChatGptDirect) { Start-PostExitSyncWatcher -AppProcessId $appProcessId }
 }
 catch {
     # Optional post-exit maintenance must not close a successfully opened app.
@@ -1059,9 +1150,17 @@ if ($result -and $result.verification) {
         $totalCount = $verification.threads
     }
 }
+if ($ChatGptDirect -and $script:accountHistorySyncResult) {
+    $mainCount = $script:accountHistorySyncResult.unarchived_main_threads
+    $totalCount = $script:accountHistorySyncResult.account_threads
+}
 $profileLabel = if ($Profile -eq 'Plus') { 'GPT Plus' } else { 'Cockpit API' }
 $environmentNote = if ($Profile -eq 'Plus') {
-    '已停止 Cockpit 后台，并通过独立子进程把 Plus 配置和无 API 环境传入 Codex App。'
+    if ($ChatGptDirect) {
+        '已只读读取 SOTA 历史并补齐账号侧副本；SOTA 配置、原始对话和后台路由保持不变。'
+    } else {
+        '已停止 Cockpit 后台，并通过独立子进程把 Plus 配置和无 API 环境传入 Codex App。'
+    }
 }
 else {
     '已启动 Cockpit API 服务，并通过独立子进程把 Cockpit 配置传入 Codex App；全局第三方 API 环境已隔离。'
@@ -1080,6 +1179,7 @@ else {
 }
 $serviceLine = ''
 $watcherLine = "`n关闭 $profileLabel App 后会自动再执行一次 Cockpit、GPT Plus 与 Tango Relay 三方同步。"
+if ($ChatGptDirect) { $watcherLine = "`n下次从管理器切换到账号版时，会先安全补齐 SOTA 的新增历史；账号侧独立续写会保留。" }
 $messageIcon = 'Information'
 
 Show-ProfileMessage -Title "Codex 已切换到 $profileLabel" -Icon $messageIcon -Message @"

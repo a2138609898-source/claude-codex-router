@@ -1759,9 +1759,13 @@ class CodexSotaApp(tk.Tk):
         self.launch_button = ttk.Button(header, text="启动 Codex", command=self._launch_codex)
         self.launch_button.pack(side="right")
         self.restart_codex_button = ttk.Button(
-            header, text="重启 Codex", command=lambda: self._launch_codex(restart=True)
+            header, text="切回 / 重启 SOTA", command=lambda: self._launch_codex(restart=True)
         )
         self.restart_codex_button.pack(side="right", padx=(0, 8))
+        self.chatgpt_codex_button = ttk.Button(
+            header, text="GPT 账号直登", command=self._launch_chatgpt_codex
+        )
+        self.chatgpt_codex_button.pack(side="right", padx=(0, 8))
         switcher = ttk.Frame(header, style="Surface.TFrame")
         switcher.pack(side="left", padx=(28, 0))
         for ws in (CODEX, CLAUDE):
@@ -2311,6 +2315,9 @@ class CodexSotaApp(tk.Tk):
         self.launch_button.configure(text="启动 Claude" if wanted is CLAUDE else "启动 Codex")
         self._set_claude_status_controls()
         self.restart_codex_button.configure(state="disabled" if wanted is CLAUDE or self._busy else "normal")
+        account_button = getattr(self, "chatgpt_codex_button", None)
+        if account_button is not None:
+            account_button.configure(state="disabled" if wanted is CLAUDE or self._busy else "normal")
         self._append_log(f"已切到「{wanted.label}」工作区：{wanted.root}")
         try:
             self._load_registry()
@@ -3557,8 +3564,10 @@ class CodexSotaApp(tk.Tk):
             return
 
         if restart and not messagebox.askyesno(
-            "重启 Codex App",
-            "将先请求 Codex 正常退出，再重新打开。请先确认正在进行的任务已完成。\n\n继续重启？",
+            "切回 / 重启 SOTA",
+            "将先请求 Codex 正常退出，再使用原有 SOTA 配置重新打开。\n"
+            "GPT 账号登录信息与 SOTA 的配置、供应商和 key 分开保存，不会相互覆盖。\n"
+            "请先确认正在进行的任务已完成。\n\n继续？",
             parent=self,
         ):
             return
@@ -3576,6 +3585,42 @@ class CodexSotaApp(tk.Tk):
         self._set_busy(True, self._launch_phase)
         self._append_log(f"{'重启' if restart else '启动'}请求 {job.request_id}；日志：{job.log_path}")
         self.after(0, lambda: self._poll_codex_launch(job))
+
+    def _launch_chatgpt_codex(self) -> None:
+        """Open the separate account profile without applying any SOTA edits."""
+        if self._busy or self.workspace is not CODEX:
+            return
+        command = CORE_ROOT / "Switch-CodexProfile.ps1"
+        if not command.is_file():
+            messagebox.showerror(
+                "账号版启动失败", f"找不到账号环境启动脚本：{command}", parent=self
+            )
+            return
+        if not messagebox.askyesno(
+            "切换到 GPT 账号直登",
+            "将使用独立的 .codex-plus 官方账号环境打开同一个 Codex App。\n\n"
+            "• SOTA 的配置、供应商、模型和 key 完整保留，不会覆盖或退出 SOTA 的凭据。\n"
+            "• 不停止后台路由；旧 App 正常退出后，只读 SOTA 历史并补齐账号侧对话副本。\n"
+            "• 账号侧已有对话保留；两边独立续写会保留分支，首次同步可能需要一些时间。\n"
+            "• 如果当前 Codex 正在使用另一环境，将请求它正常退出；请先完成正在运行的任务。\n"
+            "• 已登录的 GPT 账号会沿用；未登录时请在 App 内完成官方登录。\n\n"
+            "需要换账号时，在账号版 App 的账户菜单退出登录后再登录。\n"
+            "以后点「切回 / 重启 SOTA」即可使用原来的 SOTA 配置。\n\n继续？",
+            parent=self,
+        ):
+            return
+        invocation, command_cwd = codex_sota_invocation(command)
+        invocation.extend(["-Profile", "Plus", "-ChatGptDirect", "-SkipSync"])
+        job = LaunchAttempt(
+            invocation, command_cwd, CORE_ROOT, detect_codex_app_processes,
+            restart=True, inspect_process=inspect_codex_app_process,
+        )
+        self._codex_launch_job = job
+        self._launch_phase = "正在检查独立的 GPT 账号环境"
+        self._set_busy(True, self._launch_phase)
+        self._append_log(f"GPT 账号直登请求 {job.request_id}；仅补齐账号侧历史，SOTA 配置和原始对话保持原样；日志：{job.log_path}")
+        self.after(0, lambda: self._poll_codex_launch(job))
+
 
     def _poll_codex_launch(self, job: LaunchAttempt) -> None:
         if self._closing or self._codex_launch_job is not job:
@@ -3602,7 +3647,9 @@ class CodexSotaApp(tk.Tk):
             self._task_failed(f"{result.get('error', '启动未完成')}\n启动日志：{job.log_path}")
             return
         try:
-            result["vendors"] = read_router_vendor_health(self.workspace.log_path)
+            # The account profile neither needs nor reports third-party router health.
+            if result.get("profile") != "Plus":
+                result["vendors"] = read_router_vendor_health(self.workspace.log_path)
             self._launch_finished(result)
         finally:
             self._set_busy(False, "就绪")
@@ -3796,15 +3843,32 @@ class CodexSotaApp(tk.Tk):
 
     def _launch_finished(self, result: dict[str, Any]) -> None:
         waited = int(result["elapsed"])
+        account_profile = result.get("profile") == "Plus"
         if result["window_shown"]:
-            self._append_log(f"Codex App 窗口已出现，共耗时 {waited} 秒。")
-            self.header_status_var.set("Codex 运行中")
+            if account_profile:
+                history_sync = result.get("account_history_sync")
+                if isinstance(history_sync, dict) and history_sync.get("status") == "ok":
+                    self._append_log(
+                        f"账号侧历史已准备：新增 {history_sync.get('new_threads', 0)} 条，"
+                        f"更新 {history_sync.get('updated_threads', 0)} 条；"
+                        f"账号目录共 {history_sync.get('account_threads', 0)} 条记录（含子对话和归档）。"
+                        "SOTA 原始历史未写入。"
+                    )
+                self._append_log(
+                    f"GPT 账号版 Codex 窗口已出现，共耗时 {waited} 秒；"
+                    "请在 App 内确认账号或完成登录。SOTA 配置未改变。"
+                )
+                self.header_status_var.set("GPT 账号版已打开")
+            else:
+                self._append_log(f"Codex App 窗口已出现，共耗时 {waited} 秒。")
+                self.header_status_var.set("Codex 运行中")
         else:
             self.header_status_var.set("需要检查")
             self._append_log(f"未确认 Codex 窗口；本次启动日志：{result.get('log_path', '')}")
         for warning in result.get("warnings", []):
             self._append_log("启动提示：" + str(warning))
-        self._report_degraded_vendors(result["vendors"])
+        if not account_profile:
+            self._report_degraded_vendors(result["vendors"])
 
     def _tick_launch_status(self, started: float) -> None:
         if self._closing or not self._busy:
@@ -4901,6 +4965,9 @@ class CodexSotaApp(tk.Tk):
         restart_button = getattr(self, "restart_codex_button", None)
         if restart_button is not None:
             restart_button.configure(state="disabled" if busy or self.workspace is CLAUDE else "normal")
+        account_button = getattr(self, "chatgpt_codex_button", None)
+        if account_button is not None:
+            account_button.configure(state="disabled" if busy or self.workspace is CLAUDE else "normal")
         if busy:
             self.provider_tree.state(["disabled"])
         else:

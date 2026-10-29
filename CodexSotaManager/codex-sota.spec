@@ -1,6 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 
 from pathlib import Path
+from PyInstaller.utils.hooks import copy_metadata
 
 
 manager_root = Path(SPECPATH).resolve()
@@ -14,6 +15,7 @@ core_runtime_names = (
     'sota_registry.py', 'sota_network.py', 'sota_compaction.py',
     'claude_desktop.py', 'codex_sota_router.py',
     'codex_app_lifecycle.py', 'sync_codex_histories.py',
+    'sync_chatgpt_account_history.py',
     'sync_codex_histories_three_way.py', 'sync_after_codex_exit.py',
     'repair_sota_launch_history.py', 'repair_archived_sidebar.py',
     'validate_codex_profile.py', 'release_claude_slot_after_exit.py',
@@ -32,11 +34,12 @@ a = Analysis(
     [str(entrypoint)],
     pathex=[str(core_root)],
     binaries=[],
-    datas=[(str(icon_path), '.')] + core_datas,
+    datas=[(str(icon_path), '.')] + core_datas + copy_metadata('zstandard'),
     hiddenimports=['CodexSotaManager', 'codex_launch_controller', 'sota_registry',
                    'sota_network', 'sota_compaction', 'claude_desktop',
                    'codex_sota_router', 'codex_app_lifecycle',
                    'sync_codex_histories', 'sync_codex_histories_three_way',
+                   'sync_chatgpt_account_history', 'zstandard',
                    'sync_after_codex_exit', 'repair_sota_launch_history',
                    'repair_archived_sidebar', 'validate_codex_profile',
                    'release_claude_slot_after_exit', 'repair_claude_slot_claim',

@@ -1,3 +1,4 @@
 # Build tools and optional certificate support shipped in complete desktop releases.
 pyinstaller>=6.10,<7
 -r requirements-optional.txt
+-r requirements-history.txt

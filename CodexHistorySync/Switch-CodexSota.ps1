@@ -42,6 +42,7 @@ $launchWarnings = [System.Collections.Generic.List[string]]::new()
 $script:resolvedAppExecutable = $null
 $script:resolvedPythonExecutable = $null
 $script:launchPhase = 'preflight'
+$script:accountReturnHistorySyncResult = $null
 # Native output (python, nested PowerShell) is decoded through [Console]::OutputEncoding.
 # Pin everything to UTF-8 so Chinese diagnostics and the JSON sync result survive the
 # capture instead of turning into mojibake in the error dialogs.
@@ -64,6 +65,7 @@ $catalogPath = Join-Path $sotaRoot 'sota-multi-vendor-model-catalog.json'
 $syncLogPath = Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) 'logs\sync.log'
 $runnerPath = Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) 'Run-CodexHistorySync.ps1'
 $postExitWatcherPath = Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) 'sync_after_codex_exit.py'
+$accountReturnHistorySyncPath = Join-Path $PSScriptRoot 'sync_chatgpt_account_history.py'
 $archiveSidebarRepairPath = Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) 'repair_archived_sidebar.py'
 $routerStarterPath = Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) 'Start-CodexSotaRouter.ps1'
 $configValidatorPath = Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) 'validate_codex_profile.py'
@@ -671,6 +673,7 @@ function Write-LaunchStatus {
         app_creation_time = if ($app) { ($app.StartTime.ToUniversalTime().ToFileTimeUtc() - 116444736000000000) / 10000000.0 } else { $null }
         window_owned = [bool]$ownedWindow; reused_existing = [bool]$Reused
         history_sync = if ($SyncBeforeLaunch) { 'explicit' } else { 'deferred_to_quiet_exit' }
+        account_return_history_sync = $script:accountReturnHistorySyncResult
         warnings = @($launchWarnings.ToArray()); error = $ErrorText
         updated_utc = [DateTime]::UtcNow.ToString('o')
     }
@@ -885,6 +888,42 @@ function Get-StructuredSyncResult {
     }
     return $null
 }
+
+function Invoke-AccountReturnHistorySync {
+    # Independent of the legacy three-way sync/SkipSync setting. Only account
+    # deltas are returned, after normal App exit, with the lifecycle lease held.
+    if (-not $lifecycleLease -or $historyWriteLease) {
+        throw 'Returning account history requires the lifecycle lease and a released history lease.'
+    }
+    if (-not (Test-Path -LiteralPath (Join-Path $plusRoot 'state_5.sqlite') -PathType Leaf) -or
+        -not (Test-Path -LiteralPath (Join-Path $sotaRoot 'state_5.sqlite') -PathType Leaf)) {
+        return $true # A profile that has never opened has no initialized history to merge.
+    }
+    $python = Get-PythonExecutable
+    if (-not $python) { throw 'Python 3.11+ was not found for returning account conversations.' }
+    $ticks = Get-ProcessCreationTicks -ProcessId $PID
+    $arguments = @('-B', $accountReturnHistorySyncPath, '--to-sota', '--source', $plusRoot,
+        '--target', $sotaRoot, '--launcher-pid', [string]$PID,
+        '--launcher-creation-ticks', $ticks, '--launch-request-id', $LaunchRequestId)
+    $raw = @(& $python @arguments 2>&1)
+    $syncExit = $LASTEXITCODE
+    $result = Get-StructuredSyncResult -OutputLines $raw
+    if ($result -and $result.status -eq 'deferred' -and $syncExit -eq 2) { return $false }
+    if ($syncExit -ne 0 -or -not $result -or $result.status -ne 'ok' -or
+        $result.mode -ne 'sota-return-history-one-way' -or $result.source_read_only -ne $true -or
+        $result.source -ne $plusRoot -or $result.target -ne $sotaRoot -or
+        $result.mapped_source_threads -ne $result.source_threads) {
+        $detail = if ($result -and $result.error) { [string]$result.error } else { $raw -join [Environment]::NewLine }
+        throw "Returning account conversations to SOTA did not complete safely. $detail"
+    }
+    $script:accountReturnHistorySyncResult = [ordered]@{
+        status = $result.status; new_threads = $result.new_threads; updated_threads = $result.updated_threads
+        conflicts_preserved = $result.conflicts_preserved; unchanged_imports_skipped = $result.unchanged_imports_skipped
+        source_read_only = $true; backup_dir = $result.backup_dir
+    }
+    return $true
+}
+
 
 function Test-StructuredSyncSuccess {
     param(
@@ -1349,7 +1388,7 @@ try {
         exit 0
     }
     if ($existingApp -and $Restart) { $launchWarnings.Add('Explicit restart requested; the existing SOTA desktop must close normally.') }
-    if ($activeMarker -and $activeMarker.profile -ne 'Sota' -and -not $SyncBeforeLaunch) {
+    if ($activeMarker -and $activeMarker.profile -notin @('Sota', 'Plus') -and -not $SyncBeforeLaunch) {
         $launchWarnings.Add('Opening existing local SOTA history now; changes from other profiles will be merged after a quiet exit or an explicit history sync.')
     }
     if (-not $Restart -and @(Get-OwnedCodexAppProcesses).Count -gt 0) {
@@ -1362,6 +1401,17 @@ try {
     if (@(Get-ActiveCodexAppBackends).Count -gt 0) {
         $launchWarnings.Add('A previous Codex app-server is still closing its history files; launch will resume after it exits.')
         Write-LaunchStatus -Status 'deferred' -Phase 'waiting_for_previous_app' -Emit
+        exit 0
+    }
+    # Keep lifecycle protection while the child takes the history byte lock.
+    # Reuse of a running SOTA App above never writes its live history.
+    Write-LaunchStatus -Status 'starting' -Phase 'waiting_for_history_sync'
+    $historyWriteLease.Unlock(0, 1); $historyWriteLease.Dispose(); $historyWriteLease = $null
+    $accountHistoryReady = Invoke-AccountReturnHistorySync
+    $historyWriteLease = Enter-AppLifecycleLock -LockPath (Join-Path $PSScriptRoot 'sync.lock') -WaitSeconds 0
+    if (-not $accountHistoryReady -or -not $historyWriteLease -or
+        @(Get-OwnedCodexAppProcesses).Count -gt 0 -or @(Get-ActiveCodexAppBackends).Count -gt 0) {
+        Write-LaunchStatus -Status 'deferred' -Phase 'waiting_for_history_sync' -Emit
         exit 0
     }
     # Repair only while the App is fully closed.  This is a bounded, lightweight
@@ -1386,8 +1436,8 @@ try {
             exit 0
         }
     }
-    # Existing local SOTA history opens immediately. Cross-profile changes are
-    # merged after a quiet exit or via the explicit synchronization entrypoint.
+    # Account changes are now available. The original three-way maintenance
+    # remains deferred to quiet exit or its explicit synchronization entrypoint.
     Write-LaunchStatus -Status 'starting' -Phase 'opening_desktop'
     $appProcessId = Start-SotaApp -ExecutablePath $appExecutable
     try { Set-ActiveSotaProfileMarker -AppProcessId $appProcessId }

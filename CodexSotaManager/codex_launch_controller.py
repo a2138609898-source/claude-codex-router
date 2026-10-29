@@ -35,6 +35,7 @@ PHASE_LABELS = {
     "closing_previous_app": "正在等待 Codex 正常退出",
     "opening_desktop": "正在打开 Codex App",
     "explicit_history_sync": "正在执行手动请求的历史同步",
+    "account_history_sync": "正在补齐 GPT 账号侧对话（SOTA 只读，首次可能较久）",
     "starting_app": "正在打开 Codex App",
     "waiting_for_window": "正在等待 Codex 窗口",
     "ready": "Codex 窗口已确认",

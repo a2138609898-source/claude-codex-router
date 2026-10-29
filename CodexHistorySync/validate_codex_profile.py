@@ -252,6 +252,43 @@ def probe_cockpit(root: Path, timeout_seconds: float) -> tuple[bool, str]:
     return True, "ok"
 
 
+def validate_chatgpt_direct_profile(
+    root: Path, protected_root: Path | None = None
+) -> tuple[bool, str]:
+    """Read-only guard for the manager's isolated ChatGPT-account launcher.
+
+    Never repair, migrate, copy, or reset an existing config/auth file here.
+    In particular, an account profile must not resolve into the SOTA directory,
+    or redirect OpenAI account credentials to a custom provider endpoint.
+    """
+    try:
+        selected_root = root.resolve()
+        configured = str(os.environ.get("CODEX_SOTA_CODEX_ROOT") or "").strip()
+        fallback = Path(os.path.expandvars(configured)).expanduser() if configured else Path.home() / ".codex-sota"
+        sota_root = (protected_root or fallback).resolve()
+        if selected_root.is_relative_to(sota_root) or sota_root.is_relative_to(selected_root):
+            return False, "profile_roots_overlap"
+    except (OSError, ValueError):
+        return False, "profile_root_unreadable"
+    valid, reason = validate_profile("Plus", root, None)
+    if not valid:
+        return valid, reason
+    data = _read_config(root)
+    if data.get("chatgpt_base_url"):
+        return False, "unexpected_chatgpt_base_url"
+    provider = _provider(data, "openai")
+    for field in (
+        "base_url", "env_key", "experimental_bearer_token", "http_headers",
+        "env_http_headers", "auth", "gateway_oauth",
+    ):
+        if field in provider:
+            return False, "unexpected_openai_provider_override"
+    if provider.get("requires_openai_auth") is False:
+        return False, "openai_auth_disabled"
+    return True, "ok"
+
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--profile", choices=("Plus", "Cockpit", "Sota"), required=True)
@@ -259,6 +296,10 @@ def main() -> int:
     parser.add_argument("--catalog", type=Path)
     parser.add_argument("--probe-cockpit", action="store_true")
     parser.add_argument("--timeout-seconds", type=float, default=2.0)
+    parser.add_argument(
+        "--chatgpt-direct", action="store_true",
+        help="Read-only validation of the separate official-account profile; never repair config.",
+    )
     parser.add_argument(
         "--repair",
         action="store_true",
@@ -273,7 +314,12 @@ def main() -> int:
     repair_report: dict[str, Any] | None = None
     model_provider: str | None = None
     try:
-        if args.probe_cockpit:
+        if args.chatgpt_direct:
+            if args.profile != "Plus" or args.repair or args.probe_cockpit:
+                valid, reason = False, "chatgpt_direct_requires_readonly_plus_profile"
+            else:
+                valid, reason = validate_chatgpt_direct_profile(args.root)
+        elif args.probe_cockpit:
             if args.profile != "Cockpit":
                 valid, reason = False, "probe_requires_cockpit_profile"
             else:

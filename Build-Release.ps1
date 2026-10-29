@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [ValidatePattern('^\d+\.\d+\.\d+$')]
-    [string]$Version = '0.2.1',
+    [string]$Version = '0.2.2',
     [string]$PythonExecutable = $env:CODEX_SOTA_BUILD_PYTHON,
     [string]$OutputDirectory = (Join-Path $PSScriptRoot 'release'),
     [string]$InnoCompiler = '',
@@ -37,7 +37,7 @@ if (-not $PythonExecutable) {
 $python = $null
 foreach ($candidate in @($candidates | Where-Object { $_ } | Select-Object -Unique)) {
     if (-not (Test-Path -LiteralPath $candidate -PathType Leaf) -or $candidate -match '\\WindowsApps\\') { continue }
-    $probeArguments = @('-I', '-B', '-c', 'import struct,sys,tkinter,PyInstaller,cryptography; print(sys.executable) if sys.version_info >= (3,11) and struct.calcsize("P") == 8 else sys.exit(2)')
+    $probeArguments = @('-I', '-B', '-c', 'import struct,sys,tkinter,PyInstaller,cryptography,zstandard; print(sys.executable) if sys.version_info >= (3,11) and struct.calcsize("P") == 8 else sys.exit(2)')
     if ([IO.Path]::GetFileName($candidate) -ieq 'py.exe') { $probeArguments = @('-3') + $probeArguments }
     try {
         $probe = @(& $candidate @probeArguments 2>$null)
@@ -71,7 +71,7 @@ $null = New-ArtifactManifest $bundle
 $validatedFiles = Assert-ArtifactBundle $bundle
 $verificationOutput = Join-Path $workRoot 'runtime-verification'
 Invoke-CheckedPython @('-B', (Join-Path $managerRoot 'Verify-StartupFix.py'), '--output', $verificationOutput, '--artifact-root', $bundle, '--runtime-only')
-$probeCode = 'import json,sys,sqlite3,ssl,tomllib,tkinter,cryptography,sota_registry,sota_network,sota_compaction,codex_sota_router,claude_desktop,codex_app_lifecycle,sync_codex_histories_three_way,CodexSotaManager; print(json.dumps({"status":"ok","version":sys.version.split()[0]}))'
+$probeCode = 'import json,sys,sqlite3,ssl,tomllib,tkinter,cryptography,zstandard,sota_registry,sota_network,sota_compaction,codex_sota_router,claude_desktop,codex_app_lifecycle,sync_codex_histories_three_way,sync_chatgpt_account_history,CodexSotaManager; assert zstandard.ZstdDecompressor().decompress(zstandard.ZstdCompressor().compress(b"history-runtime-probe")) == b"history-runtime-probe"; print(json.dumps({"status":"ok","version":sys.version.split()[0],"compressed_history":"ok"}))'
 $runtimeProbe = @(& $runtime -I -S -B -c $probeCode 2>&1)
 if ($LASTEXITCODE -ne 0 -or -not ($runtimeProbe -match '"status": "ok"')) {
     throw "The bundled runtime failed its isolated import check: $($runtimeProbe -join ' ')"

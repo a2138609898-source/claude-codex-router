@@ -35,6 +35,10 @@ backups/
 logs/
 *.log
 *.jsonl
+*.jsonl.zst
+.sota-account-history-sync.json
+.account-sota-history-sync.json
+.account-history-deps/
 session_index.jsonl
 .codex-global-state.json
 *.sqlite

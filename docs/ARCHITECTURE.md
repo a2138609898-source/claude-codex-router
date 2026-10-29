@@ -32,6 +32,7 @@ codex-sota-runtime.exe → 同一份打包运行环境 → 所有后台 Python �
 | `codex_launch_controller.py` / `codex_app_lifecycle.py` | 请求 ID、进程身份、启动租约、可取消等待，避免历史同步与新启动同时写入。 |
 | `Switch-Codex*.ps1` | 配置预检、启动/重启、环境变量清理和结构化状态；精确识别进程，不能误关同名程序。 |
 | `sync_codex_histories*.py` | 只同步历史文件与元数据；不复制配置、账号、密钥、日志和插件凭据。快照、校验、失败回滚和未完成恢复资料必须保留。 |
+| `sync_chatgpt_account_history.py` | 账号切换专用的双方向增量补齐。每次只有一个只读来源和一个目的目录；借用启动器生命周期锁、自己持有历史锁，通过稀疏 staging、校验备份及 journal 安装。 |
 | `repair_*.py` | 离线修复。先计划和证据校验，变更前留备份；缺失可选 profile 时跳过。 |
 | `archive_verified_duplicates.py` | 对明确选择且完整历史一致的冲突副本做事务归档，不移动或删除聊天内容。 |
 | `Build-Release.ps1` / `codex-sota.spec` | 显式文件白名单、共享运行环境、源码指纹、包内容校验、离线运行探针、ZIP 和 Inno 安装包。 |
