@@ -46,7 +46,7 @@ from sota_registry import (
 # 17 makes *all* billable generation requests single-shot. A third-party gateway may ignore an
 # Idempotency-Key, and separate vendors never share an idempotency ledger, so the key cannot be
 # treated as permission to replay a request that may already have been accepted and billed.
-ROUTER_VERSION = "20"
+ROUTER_VERSION = "21"
 HOP_BY_HOP_HEADERS = {
     "connection",
     "keep-alive",
@@ -2110,6 +2110,7 @@ def chat_sse_to_responses(
     tool_kinds: dict[str, str] | None = None,
     outcome: dict[str, Any] | None = None,
     parallel_tool_calls: bool = True,
+    require_explicit_completion: bool = False,
 ) -> Any:
     """Yield Responses SSE frames while consuming an OpenAI Chat Completions SSE stream.
 
@@ -2229,6 +2230,13 @@ def chat_sse_to_responses(
         if completed_sent:
             return b""
         completed_sent = True
+        if require_explicit_completion and finish_reason != "stop":
+            if outcome is not None:
+                outcome["failed"] = True
+            return _response_stream_failure(response_id, {
+                "code": "upstream_incomplete_summary",
+                "message": "Compaction upstream did not explicitly finish its summary",
+            })
         clean_output = [
             {k: v for k, v in item.items() if not k.startswith("_")} for item in output
         ]
@@ -2569,6 +2577,7 @@ def anthropic_sse_to_responses(
     tool_kinds: dict[str, str] | None = None,
     outcome: dict[str, Any] | None = None,
     parallel_tool_calls: bool = True,
+    require_explicit_completion: bool = False,
 ) -> Any:
     """Yield Responses SSE frames while consuming Anthropic Messages SSE.
 
@@ -2615,6 +2624,13 @@ def anthropic_sse_to_responses(
         if completed_sent:
             return b""
         completed_sent = True
+        if require_explicit_completion and stop_reason not in {"end_turn", "stop_sequence"}:
+            if outcome is not None:
+                outcome["failed"] = True
+            return _response_stream_failure(response_id, {
+                "code": "upstream_incomplete_summary",
+                "message": "Compaction upstream did not explicitly finish its summary",
+            })
         status = "incomplete" if stop_reason in OUTPUT_LIMIT_STOP_REASONS else "completed"
         response = {
             "id": response_id, "object": "response", "created_at": int(time.time()),
@@ -5208,7 +5224,7 @@ class SotaRouterHandler(BaseHTTPRequestHandler):
                     response = None
                     outcome: dict[str, Any] = {}
                     converter = chat_sse_to_responses if chat else anthropic_sse_to_responses
-                    for chunk in converter(upstream, model, outcome=outcome):
+                    for chunk in converter(upstream, model, outcome=outcome, require_explicit_completion=True):
                         for line in chunk.decode("utf-8").splitlines():
                             if not line.startswith("data:") or line[5:].strip() == "[DONE]":
                                 continue
@@ -5221,8 +5237,25 @@ class SotaRouterHandler(BaseHTTPRequestHandler):
                     raw = upstream.read(MAX_REQUEST_BODY_BYTES + 1)
                     if len(raw) > MAX_REQUEST_BODY_BYTES:
                         raise ValueError("Compaction response exceeded the adapter limit")
+                    payload = json.loads(raw)
+                    if not isinstance(payload, dict):
+                        raise ValueError("Compaction upstream response must be an object")
+                    # Ordinary generation tolerates gateways that omit stop metadata.
+                    # A summary replaces history, so only an explicit normal terminal
+                    # reason is sufficient here; a partial/refused/tool turn is not.
+                    if chat:
+                        choices = payload.get("choices")
+                        first = choices[0] if isinstance(choices, list) and choices else None
+                        reason = first.get("finish_reason") if isinstance(first, dict) else None
+                        finished = str(reason or "").strip().lower() == "stop"
+                    else:
+                        finished = str(payload.get("stop_reason") or "").strip().lower() in {
+                            "end_turn", "stop_sequence",
+                        }
+                    if not finished:
+                        raise ValueError("Compaction upstream did not explicitly finish its summary; history was not replaced")
                     converter = chat_message_to_response if chat else anthropic_message_to_response
-                    response = converter(json.loads(raw), model)
+                    response = converter(payload, model)
                 compacted = response_to_compaction(response)
                 usage = compacted.get("usage") or {}
                 result = dict(response, output=compacted["output"], output_text="",

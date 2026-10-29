@@ -35,7 +35,7 @@ def main() -> int:
         import sota_compaction
         import sota_network
         import sync_codex_histories_three_way
-        print(json.dumps({"status": "ok", "core_root": str(core), "python": os.environ.get("CODEX_SOTA_PYTHON"), "version": "0.2.0"}))
+        print(json.dumps({"status": "ok", "core_root": str(core), "python": os.environ.get("CODEX_SOTA_PYTHON"), "version": "0.2.1"}))
         return 0
     return CodexSotaManager.main()
 

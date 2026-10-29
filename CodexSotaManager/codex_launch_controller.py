@@ -8,6 +8,7 @@ until it reports a verified window, a queued sync, or a concrete failure.
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 import subprocess
 import sys
@@ -72,32 +73,34 @@ def parse_result(output: str, request_id: str) -> dict | None:
     return None
 
 
-def owns_reported_window(result: dict, processes: list[dict]) -> bool:
-    """PID, birth identity and visible window must all agree with the launcher."""
-    if result.get("window_owned") is not True:
-        return False
+def matches_reported_process(result: dict, process: dict) -> bool:
+    """Match the launcher's PID and birth identity to an inspected owned desktop."""
     try:
         pid = int(result["app_process_id"])
     except (KeyError, TypeError, ValueError):
         return False
-    for process in processes:
-        if (process.get("pid") != pid or process.get("role") != "desktop"
-                or not process.get("window_handle")):
-            continue
-        ticks = result.get("app_creation_ticks") or result.get("creation_ticks")
-        if ticks is not None:
-            return str(ticks) == str(process.get("creation_ticks"))
-        # Older compatible launchers may provide an ISO timestamp instead of FILETIME.
-        stamp = result.get("app_started_utc")
-        if stamp:
-            from datetime import datetime
-            try:
-                expected = datetime.fromisoformat(str(stamp).replace("Z", "+00:00")).timestamp()
-                return abs(expected - float(process["creation_time"])) < 0.01
-            except (KeyError, ValueError, TypeError, OverflowError):
-                return False
+    if process.get("pid") != pid or process.get("role") != "desktop":
         return False
+    ticks = result.get("app_creation_ticks") or result.get("creation_ticks")
+    if ticks is not None:
+        return str(ticks) == str(process.get("creation_ticks"))
+    # Older compatible launchers may provide an ISO timestamp instead of FILETIME.
+    stamp = result.get("app_started_utc")
+    if stamp:
+        try:
+            expected = datetime.fromisoformat(str(stamp).replace("Z", "+00:00")).timestamp()
+            return abs(expected - float(process["creation_time"])) < 0.01
+        except (KeyError, ValueError, TypeError, OverflowError):
+            return False
     return False
+
+
+def owns_reported_window(result: dict, processes: list[dict]) -> bool:
+    """PID, birth identity and visible window must all agree with the launcher."""
+    return result.get("window_owned") is True and any(
+        process.get("window_handle") and matches_reported_process(result, process)
+        for process in processes
+    )
 
 
 class LaunchAttempt:
@@ -144,10 +147,13 @@ class LaunchAttempt:
         self.detached = False
         self.completed_result: dict | None = None
         self.completed_at: float | None = None
+        self.window_inspection_failed_at: float | None = None
 
     @property
     def can_cancel_queued(self) -> bool:
-        return self.process is None and self.last_result.get("status") == "deferred"
+        return (not self.detached and not self.cancelled and self.terminal is None
+                and self.completed_result is None and self.process is None
+                and self.last_result.get("status") == "deferred")
 
     def cancel_queued(self) -> bool:
         if not self.can_cancel_queued:
@@ -233,6 +239,79 @@ class LaunchAttempt:
                              "error": "启动器报告的 Codex 进程已退出或身份发生变化；请查看本次启动日志。"}
         return self._snapshot(self.terminal)
 
+    def _poll_pending_window(self) -> dict | None:
+        """Observe a known live desktop without repeating launcher preflight work."""
+        result = self.last_result
+        if result.get("phase") != "waiting_for_window":
+            return None
+        try:
+            pid = int(result["app_process_id"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        if not (result.get("app_creation_ticks") or result.get("creation_ticks")
+                or result.get("app_started_utc")):
+            return None
+        try:
+            if self.inspect_process is not None:
+                process = self.inspect_process(pid)
+                processes = [process] if process is not None else []
+            else:
+                processes = self.inspect_processes()
+        except (OSError, RuntimeError, KeyError, TypeError, ValueError, OverflowError) as error:
+            # Uncertain ownership must not trigger another launch. Bound the
+            # uncertainty and leave the existing process untouched on failure.
+            if self.window_inspection_failed_at is None:
+                self.window_inspection_failed_at = self.clock()
+            if self.clock() - self.window_inspection_failed_at >= self.verification_grace_seconds:
+                self.terminal = {
+                    **result, "status": "error", "window_shown": False,
+                    "verification_error": str(error),
+                    "error": "无法核验正在等待窗口的 Codex 进程；程序可能仍在运行，请检查启动日志。",
+                }
+                self._release_request()
+                return self._snapshot(self.terminal)
+            return self._snapshot({**result, "verification_error": str(error)})
+        self.window_inspection_failed_at = None
+        matching = next((process for process in processes if matches_reported_process(result, process)), None)
+        if matching is None:
+            # A departed/recycled PID is not reusable. Let the same request's
+            # launcher perform its existing profile and lifecycle checks again.
+            return None
+        if matching.get("window_handle"):
+            self.terminal = {
+                **result, "status": "ready", "phase": "window_ready",
+                "window_owned": True, "window_shown": True,
+                "updated_utc": datetime.now(timezone.utc).isoformat(),
+            }
+            self._record_observed_window()
+            self._release_request()
+            return self._snapshot(self.terminal)
+        return self._snapshot(result)
+
+    def _record_observed_window(self) -> None:
+        """Keep the request receipt and log in step with native verification."""
+        assert self.terminal is not None
+        payload = self._snapshot(self.terminal)
+        raw = json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
+        temporary = self.status_path.with_name(self.status_path.name + ".observed-" + uuid.uuid4().hex)
+        try:
+            self.status_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary.write_text(raw, encoding="utf-8")
+            temporary.replace(self.status_path)
+            with self.log_path.open("ab") as handle:
+                handle.write((raw + "\n").encode("utf-8"))
+        except OSError as error:
+            self.terminal = {
+                **self.terminal,
+                "warnings": [*(self.terminal.get("warnings") or []),
+                             "Codex window was verified, but its status receipt could not be updated: " + str(error)],
+            }
+        finally:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+
     def _start(self) -> None:
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
         try:
@@ -302,6 +381,9 @@ class LaunchAttempt:
                 # The child already owns its shell request. Follow it instead
                 # of losing or terminating a live launch on a transient write.
         if self.process is None:
+            pending_window = self._poll_pending_window()
+            if pending_window is not None:
+                return pending_window
             if self.clock() < self.next_retry:
                 if (self.last_result.get("phase") != "waiting_for_history_sync"
                         or not self._history_writes_idle()):

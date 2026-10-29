@@ -383,6 +383,44 @@ def library_status() -> dict[str, Any]:
     }
 
 
+def library_status_readonly() -> dict[str, Any]:
+    """Inspect the current library without migrations, lock creation, or writes.
+
+    The shared appliedId belongs to whichever profile manager last selected it.
+    Status refresh must not claim or reconcile it. Writers atomically replace
+    the index, so this snapshot sees the previous or next complete document.
+    """
+    if not CONFIG_LIBRARY.exists():
+        return {
+            "available": False,
+            "reason": f"没有 {CONFIG_LIBRARY}，Claude Desktop 可能还没进过 3P 模式",
+        }
+    meta = read_meta()
+    applied = meta.get("appliedId")
+    entries = []
+    for entry in meta["entries"]:
+        if not isinstance(entry, dict):
+            continue
+        entry_id = str(entry.get("id") or "")
+        path = _safe_entry_path(entry_id)
+        entries.append({
+            "id": entry_id,
+            "name": str(entry.get("name") or entry_id),
+            "applied": entry_id == applied,
+            "mine": entry_id == SOTA_ENTRY_ID,
+            "exists": bool(path and path.exists()),
+            "valid_id": bool(UUID_RE.fullmatch(entry_id)),
+        })
+    return {
+        "available": True,
+        "applied_id": applied,
+        "applied_name": next((entry["name"] for entry in entries if entry["applied"]), None),
+        "entries": entries,
+        "mine_present": any(entry["mine"] for entry in entries),
+        "invalid_ids": [entry["id"] for entry in entries if not entry["valid_id"]],
+    }
+
+
 def _valid_gateway_url(value: str) -> str:
     text = str(value or "").strip().rstrip("/")
     parsed = urllib.parse.urlsplit(text)

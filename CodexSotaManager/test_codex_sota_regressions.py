@@ -1066,33 +1066,202 @@ class RouterRegressionTests(unittest.TestCase):
             provider["request_adapter"] = "responses_to_anthropic_messages"
             write_registry(registry_path, [provider])
 
+            trigger_history = [
+                {"role": "user", "content": "compact me"},
+                {"type": "compaction_trigger"},
+            ]
+            cases = [
+                ("/responses/compact", "compact me", False),
+                ("/v1/responses/compact", "compact me", False),
+                ("/responses", trigger_history, False),
+                ("/v1/responses", trigger_history, False),
+                ("/responses", trigger_history, True),
+                ("/v1/responses", trigger_history, True),
+            ]
             with RouterHarness(registry_path, auth_path, root / "router.log") as local:
-                for path in ("/responses/compact", "/v1/responses/compact"):
-                    request = urllib.request.Request(
-                        local.url + path,
-                        data=json.dumps(
-                            {"model": "juno--gpt-5.6-sol", "input": "compact me"}
-                        ).encode("utf-8"),
-                        headers={"Content-Type": "application/json"},
-                        method="POST",
-                    )
-                    with urllib.request.urlopen(request, timeout=10) as response:
-                        self.assertEqual(response.status, 200)
-                        body = json.loads(response.read())
-                    self.assertEqual(body["object"], "response.compaction")
-                    self.assertEqual(body["output"][0]["type"], "compaction")
-                    restored = router.restore_compaction_payload({"input": body["output"]}, require_local=True)
-                    self.assertIn(summary, restored["input"][0]["content"])
+                for path, history, stream in cases:
+                    with self.subTest(path=path, stream=stream):
+                        request = urllib.request.Request(
+                            local.url + path,
+                            data=json.dumps({
+                                "model": "juno--gpt-5.6-sol", "input": history,
+                                "stream": stream, "max_output_tokens": 16384,
+                                "reasoning": {"effort": "high"},
+                                "tools": [{"type": "function", "name": "must_not_run",
+                                           "parameters": {"type": "object", "properties": {}}}],
+                                "parallel_tool_calls": False,
+                            }).encode("utf-8"),
+                            headers={"Content-Type": "application/json"},
+                            method="POST",
+                        )
+                        with urllib.request.urlopen(request, timeout=10) as response:
+                            self.assertEqual(response.status, 200)
+                            wire = response.read().decode("utf-8")
+                            if stream:
+                                self.assertIn("text/event-stream", response.headers["Content-Type"])
+                                events = [json.loads(line[5:]) for line in wire.splitlines()
+                                          if line.startswith("data:") and line[5:].strip() != "[DONE]"]
+                                completed = [event["response"] for event in events
+                                             if event.get("type") == "response.completed"]
+                                self.assertEqual(len(completed), 1)
+                                self.assertFalse(any(event.get("type") == "response.output_text.delta"
+                                                     for event in events))
+                                body = completed[0]
+                            else:
+                                body = json.loads(wire)
+                        self.assertEqual(body["object"],
+                                         "response.compaction" if path.endswith("/compact") else "response")
+                        if not path.endswith("/compact"):
+                            self.assertEqual(body["status"], "completed")
+                            self.assertFalse(body["parallel_tool_calls"])
+                        self.assertEqual(len(body["output"]), 1)
+                        self.assertEqual(body["output"][0]["type"], "compaction")
+                        restored = router.restore_compaction_payload({"input": body["output"]}, require_local=True)
+                        self.assertIn(summary, restored["input"][0]["content"])
 
-            self.assertEqual(len(upstream.requests), 2)
+            self.assertEqual(len(upstream.requests), len(cases), "each compaction gets one summary attempt")
             for attempted in upstream.requests:
                 self.assertEqual(attempted["path"], "/messages")
                 sent = json.loads(attempted["body"])
                 self.assertFalse(sent["stream"])
                 self.assertLessEqual(sent["max_tokens"], 4096)
                 self.assertNotIn("tools", sent)
+                self.assertNotIn("thinking", sent)
+                self.assertNotIn("compaction_trigger", json.dumps(sent))
                 self.assertIn("compact me", json.dumps(sent["messages"]))
                 self.assertIn("handoff", sent["system"])
+
+    def test_compaction_requires_explicit_json_completion_without_replaying(self) -> None:
+        """A partial/refused JSON summary must never replace the conversation."""
+        missing = object()
+        summary = "The verified fixture result is ready for the next turn."
+        cases = [
+            ("responses_to_anthropic_messages", "stop_reason", "end_turn",
+             ("max_tokens", "tool_use", "refusal")),
+            ("responses_to_chat_completions", "finish_reason", "stop",
+             ("length", "tool_calls", "content_filter")),
+        ]
+        for adapter, field, completed_reason, unfinished_reasons in cases:
+            with self.subTest(adapter=adapter), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                if field == "stop_reason":
+                    payload = {"id": "summary-fixture", "type": "message", "role": "assistant",
+                               "content": [{"type": "text", "text": summary}],
+                               "usage": {"input_tokens": 20, "output_tokens": 10}}
+                    terminal = payload
+                    converter = router.anthropic_message_to_response
+                else:
+                    payload = {"id": "summary-fixture", "choices": [
+                        {"message": {"role": "assistant", "content": summary}}],
+                        "usage": {"prompt_tokens": 20, "completion_tokens": 10}}
+                    terminal = payload["choices"][0]
+                    converter = router.chat_message_to_response
+                with LocalUpstream(200, payload) as upstream:
+                    registry_path, auth_path = root / "providers.json", root / "auth.json"
+                    write_auth(auth_path)
+                    provider = provider_config("bridge", upstream.url, prefix="bridge--", is_default=True)
+                    provider["request_adapter"] = adapter
+                    write_registry(registry_path, [provider])
+                    stop_cases = [completed_reason, missing, None, *unfinished_reasons]
+                    with RouterHarness(registry_path, auth_path, root / "router.log") as local:
+                        for index, reason in enumerate(stop_cases):
+                            label = "missing" if reason is missing else reason
+                            with self.subTest(reason=label):
+                                if reason is missing:
+                                    terminal.pop(field, None)
+                                else:
+                                    terminal[field] = reason
+                                if reason is missing or reason is None:
+                                    # This strictness is limited to destructive compaction;
+                                    # ordinary generation retains its existing compatibility.
+                                    self.assertEqual(converter(payload)["status"], "completed")
+                                request = urllib.request.Request(
+                                    local.url + "/responses/compact",
+                                    data=json.dumps({"model": "bridge--shared-model", "input": "history"}).encode("utf-8"),
+                                    headers={"Content-Type": "application/json"}, method="POST",
+                                )
+                                if reason == completed_reason:
+                                    with urllib.request.urlopen(request, timeout=10) as response:
+                                        body = json.loads(response.read())
+                                    self.assertEqual(body["object"], "response.compaction")
+                                    restored = router.restore_compaction_payload({"input": body["output"]}, require_local=True)
+                                    self.assertIn(summary, restored["input"][0]["content"])
+                                else:
+                                    with self.assertRaises(urllib.error.HTTPError) as raised:
+                                        urllib.request.urlopen(request, timeout=10)
+                                    with raised.exception as response:
+                                        self.assertEqual(response.code, 502)
+                                        body = json.loads(response.read())
+                                    self.assertEqual(body["error"]["type"], "compaction_upstream_error")
+                                    self.assertNotIn("output", body)
+                                self.assertEqual(len(upstream.requests), index + 1,
+                                                 "an unsuccessful summary must not be retried")
+
+    def test_compaction_requires_explicit_sse_completion_without_changing_generation(self) -> None:
+        """A gateway ignoring stream=False must satisfy the same summary completion gate."""
+        missing = object()
+        summary = "The fixture has a verified result and a pending next step."
+
+        class MemorySSE(BytesIO):
+            headers = {"Content-Type": "text/event-stream"}
+
+        def frame(value: dict) -> bytes:
+            return ("data: " + json.dumps(value) + "\n\n").encode("utf-8")
+
+        for chat in (False, True):
+            allowed = ("stop",) if chat else ("end_turn", "stop_sequence")
+            reasons = (*allowed, missing, None, "content_filter" if chat else "refusal")
+            for reason in reasons:
+                with self.subTest(chat=chat, reason="missing" if reason is missing else reason):
+                    if chat:
+                        choice = {"delta": {"content": summary}}
+                        if reason is not missing:
+                            choice["finish_reason"] = reason
+                        raw = frame({"choices": [choice]}) + b"data: [DONE]\n\n"
+                        converter = router.chat_sse_to_responses
+                    else:
+                        delta = {} if reason is missing else {"stop_reason": reason}
+                        raw = b"".join(frame(value) for value in [
+                            {"type": "message_start", "message": {"id": "fixture", "usage": {}}},
+                            {"type": "content_block_start", "index": 0,
+                             "content_block": {"type": "text", "text": ""}},
+                            {"type": "content_block_delta", "index": 0,
+                             "delta": {"type": "text_delta", "text": summary}},
+                            {"type": "content_block_stop", "index": 0},
+                            {"type": "message_delta", "delta": delta, "usage": {}},
+                            {"type": "message_stop"},
+                        ])
+                        converter = router.anthropic_sse_to_responses
+                    if reason is missing or reason is None:
+                        ordinary = b"".join(converter(BytesIO(raw), "fixture"))
+                        self.assertIn(b"response.completed", ordinary,
+                                      "ordinary generation must retain its existing compatibility")
+                    handler = object.__new__(router.SotaRouterHandler)
+                    handler.command, handler.path = "POST", "/responses/compact"
+                    handler._bridged_compaction_stream = False
+                    handler._bridged_compaction_parallel = False
+                    handler._json_response = mock.Mock()
+                    record = mock.Mock()
+                    handler.server = SimpleNamespace(router_state=SimpleNamespace(record=record))
+                    retry = handler._relay_compact(
+                        MemorySSE(raw), "fixture", time.monotonic(), "fixture",
+                        {"request_adapter": ("responses_to_chat_completions" if chat
+                                             else "responses_to_anthropic_messages")},
+                    )
+                    self.assertFalse(retry)
+                    handler._json_response.assert_called_once()
+                    status, body = handler._json_response.call_args.args
+                    if reason in allowed:
+                        self.assertEqual(status, 200)
+                        self.assertEqual(body["object"], "response.compaction")
+                        restored = router.restore_compaction_payload({"input": body["output"]}, require_local=True)
+                        self.assertIn(summary, restored["input"][0]["content"])
+                    else:
+                        self.assertEqual(status, 502)
+                        self.assertEqual(body["error"]["type"], "compaction_upstream_error")
+                        self.assertNotIn("output", body)
+                    record.assert_called_once()
+                    self.assertEqual(record.call_args.args[3], status)
 
     def test_adapter_reasoning_effort_maps_to_thinking_budget(self) -> None:
         """Codex's reasoning.effort must reach a Messages gateway as thinking, not vanish.

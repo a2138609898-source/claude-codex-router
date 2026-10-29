@@ -192,7 +192,7 @@ from claude_desktop import (  # noqa: E402
     confirm_slot_claim as confirm_claude_slot_claim,
     ensure_deployment_mode,
     image_process_pids,
-    library_status as claude_library_status,
+    library_status_readonly as claude_library_status,
     migrate_legacy_entry,
     model_supports_1m_context as claude_model_supports_1m_context,
     reconcile_slot as reconcile_claude_slot,
@@ -1558,6 +1558,10 @@ class CodexSotaApp(tk.Tk):
         self.configure(bg=BG)
         self._closing = False
         self._task_events: queue.Queue[tuple[str, Any, Any]] = queue.Queue()
+        self._claude_status_epoch = 0
+        self._claude_status_running: int | None = None
+        self._claude_status_pending: tuple[int, dict[str, Any] | None] | None = None
+        self._claude_status_cancel: threading.Event | None = None
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self.registry: dict[str, Any] = {}
@@ -1625,6 +1629,7 @@ class CodexSotaApp(tk.Tk):
         # pending after/after_idle scripts. Cancel our timers before deleting those
         # commands; a _closing check inside a now-missing callback is too late.
         self._closing = True
+        self._cancel_claude_status_refresh()
         progress = getattr(self, "progress", None)
         if progress is not None:
             progress.stop()
@@ -2295,6 +2300,7 @@ class CodexSotaApp(tk.Tk):
             self.workspace_var.set(self.workspace.name)
             return
         self.workspace = wanted
+        self._cancel_claude_status_refresh()
         self.current_id = None
         self.loaded_provider = None
         self.draft_models = []
@@ -2303,6 +2309,7 @@ class CodexSotaApp(tk.Tk):
         # stray 保存并应用 would write that provider into the workspace it does not belong to.
         self._reset_editor()
         self.launch_button.configure(text="启动 Claude" if wanted is CLAUDE else "启动 Codex")
+        self._set_claude_status_controls()
         self.restart_codex_button.configure(state="disabled" if wanted is CLAUDE or self._busy else "normal")
         self._append_log(f"已切到「{wanted.label}」工作区：{wanted.root}")
         try:
@@ -3607,6 +3614,8 @@ class CodexSotaApp(tk.Tk):
         name.  Resolving the target before changing any configuration prevents a successful
         write from being followed by a launch of the unrelated 1P login instance.
         """
+        if getattr(self, "_claude_status_running", None) is not None:
+            return
         models = build_inference_models(self.registry)
         if not models:
             messagebox.showwarning(
@@ -3910,19 +3919,95 @@ class CodexSotaApp(tk.Tk):
         self._rank_model_latency()
 
     def _refresh_claude_status(self) -> None:
-        """Show which 3P profile Claude Desktop is on and how many models we could publish."""
-        self._claude_entries = []
-        try:
-            # Repair the old malformed SOTA id before rendering the picker; otherwise Claude
-            # can remain pointed at a profile it rejects even though the UI says the tab loaded.
-            migrate_legacy_entry()
-            # Backstop for a release that never ran (manager killed, watcher lost, reboot).
-            # Only acts when Claude is gone, so a live session is never touched.
-            self._reconcile_claude_slot()
-            status = claude_library_status()
-        except Exception as error:  # noqa: BLE001 - a bad library file must not break the tab
-            self.claude_status_var.set(f"Claude 配置库读不了：{error}")
+        """Coalesce read-only status checks without blocking the Tk thread."""
+        if self._closing:
             return
+        self._claude_status_epoch += 1
+        source = deepcopy(self.registry) if self.workspace is CLAUDE else None
+        self._claude_status_pending = (self._claude_status_epoch, source)
+        if self._claude_status_cancel is not None:
+            self._claude_status_cancel.set()
+        self._start_claude_status_refresh()
+
+    def _cancel_claude_status_refresh(self) -> None:
+        """Invalidate callbacks without interrupting an in-progress read-only snapshot."""
+        self._claude_status_epoch = getattr(self, "_claude_status_epoch", 0) + 1
+        self._claude_status_pending = None
+        cancelled = getattr(self, "_claude_status_cancel", None)
+        if cancelled is not None:
+            cancelled.set()
+
+    def _set_claude_status_controls(self) -> None:
+        waiting = getattr(self, "_claude_status_running", None) is not None
+        state = "disabled" if self._busy or waiting else "normal"
+        for name in ("claude_publish_button", "claude_release_button", "claude_switch_button"):
+            widget = getattr(self, name, None)
+            if widget is not None:
+                widget.configure(state=state)
+        launch_state = state if self.workspace is CLAUDE else ("disabled" if self._busy else "normal")
+        self.launch_button.configure(state=launch_state)
+
+    def _start_claude_status_refresh(self) -> None:
+        if (self._closing or self._busy or self._claude_status_running is not None
+                or self._claude_status_pending is None):
+            return
+        epoch, source = self._claude_status_pending
+        self._claude_status_pending = None
+        self._claude_status_running = epoch
+        cancelled = self._claude_status_cancel = threading.Event()
+        self._set_claude_status_controls()
+
+        def worker() -> None:
+            payload: dict[str, Any] = {}
+            try:
+                if cancelled.is_set():
+                    return
+                # Claude's appliedId is shared with other profile managers. Status
+                # refresh must never migrate, claim, or reconcile that global slot.
+                payload["status"] = claude_library_status()
+                if cancelled.is_set() or not payload["status"]["available"]:
+                    return
+                try:
+                    registry = source if source is not None else load_registry(
+                        CLAUDE.registry_path, allow_missing_secrets=True
+                    )
+                    payload["count_note"] = f"{len(build_inference_models(registry))} 个"
+                except (OSError, ValueError):
+                    payload["count_note"] = "无法读取 Claude 工作区注册表"
+                payload["slot_note"] = self._claude_slot_note()
+            except Exception as error:  # noqa: BLE001 - rendered on the Tk thread
+                payload["error"] = str(error)
+            finally:
+                self._task_events.put(("claude_status", epoch, payload))
+
+        # Closing cancels subsequent reads and ignores the eventual result. The
+        # read-only snapshot already in progress may finish without touching Tk.
+        try:
+            threading.Thread(target=worker, daemon=False).start()
+        except RuntimeError as error:
+            self._finish_claude_status_refresh(epoch, {"error": str(error)})
+
+    def _finish_claude_status_refresh(self, epoch: int, payload: dict[str, Any]) -> None:
+        if self._closing or self._claude_status_running != epoch:
+            return
+        cancelled = self._claude_status_cancel
+        self._claude_status_running = None
+        self._claude_status_cancel = None
+        try:
+            if epoch == self._claude_status_epoch and not (cancelled and cancelled.is_set()):
+                self._render_claude_status(payload)
+        finally:
+            self._set_claude_status_controls()
+            self._start_claude_status_refresh()
+
+    def _render_claude_status(self, payload: dict[str, Any]) -> None:
+        self._claude_entries = []
+        if payload.get("error"):
+            self.claude_status_var.set(f"Claude 配置库读不了：{payload['error']}")
+            self.claude_entry_combo.configure(values=[])
+            self._append_log(f"Claude 状态刷新失败：{payload['error']}")
+            return
+        status = payload["status"]
         if not status["available"]:
             self.claude_status_var.set(status["reason"])
             self.claude_entry_combo.configure(values=[])
@@ -3931,17 +4016,9 @@ class CodexSotaApp(tk.Tk):
         self.claude_entry_combo.configure(values=[e["name"] for e in status["entries"]])
         if status["applied_name"]:
             self.claude_entry_combo.set(status["applied_name"])
-        try:
-            source = (
-                self.registry if getattr(self, "workspace", CLAUDE) is CLAUDE
-                else load_registry(CLAUDE.registry_path, allow_missing_secrets=True)
-            )
-            count_note = f"{len(build_inference_models(source))} 个"
-        except (OSError, ValueError):
-            count_note = "无法读取 Claude 工作区注册表"
         self.claude_status_var.set(
-            f"当前生效的档：{status['applied_name'] or '（无）'}{self._claude_slot_note()}　|　"
-            f"可发布的 Messages 模型：{count_note}　|　共 {len(status['entries'])} 个档"
+            f"当前生效的档：{status['applied_name'] or '（无）'}{payload['slot_note']}　|　"
+            f"可发布的 Messages 模型：{payload['count_note']}　|　共 {len(status['entries'])} 个档"
         )
 
     def _reconcile_claude_slot(self) -> dict[str, Any]:
@@ -3976,7 +4053,7 @@ class CodexSotaApp(tk.Tk):
 
     def _release_claude_slot(self) -> None:
         """Hand the shared appliedId slot back without waiting for Claude to exit."""
-        if self._busy:
+        if self._busy or getattr(self, "_claude_status_running", None) is not None:
             return
         try:
             state = claude_slot_state()
@@ -4039,7 +4116,7 @@ class CodexSotaApp(tk.Tk):
 
 
     def _publish_claude_profile(self) -> None:
-        if self._busy:
+        if self._busy or getattr(self, "_claude_status_running", None) is not None:
             return
         source = (
             self.registry
@@ -4116,7 +4193,7 @@ class CodexSotaApp(tk.Tk):
         self._run_task("正在写入 Claude 档", worker, success)
 
     def _switch_claude_entry(self) -> None:
-        if self._busy:
+        if self._busy or getattr(self, "_claude_status_running", None) is not None:
             return
         wanted = self.claude_entry_combo.get().strip()
         entry = next((e for e in self._claude_entries if e["name"] == wanted), None)
@@ -4757,7 +4834,9 @@ class CodexSotaApp(tk.Tk):
                 kind, payload, result = self._task_events.get_nowait()
             except queue.Empty:
                 break
-            if kind == "progress":
+            if kind == "claude_status":
+                self._finish_claude_status_refresh(payload, result)
+            elif kind == "progress":
                 if self._busy:
                     self._task_label = str(payload)
                     self.status_var.set(str(payload))
@@ -4827,6 +4906,9 @@ class CodexSotaApp(tk.Tk):
         else:
             self.provider_tree.state(["!disabled"])
         self._set_editor_protected(self._protected)
+        self._set_claude_status_controls()
+        if not busy:
+            self._start_claude_status_refresh()
 
     def _open_path(self, path: Path) -> None:
         if self._busy:

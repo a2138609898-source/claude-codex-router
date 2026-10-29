@@ -5,6 +5,7 @@ from contextlib import contextmanager, nullcontext
 from copy import deepcopy
 import json
 from pathlib import Path
+import queue
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -225,14 +226,26 @@ class ManagerHardeningTests(unittest.TestCase):
         app = SimpleNamespace(
             workspace=manager.CODEX, registry={"providers": [provider()]},
             claude_status_var=mock.Mock(), claude_entry_combo=mock.Mock(),
+            launch_button=mock.Mock(), _closing=False, _busy=False,
+            _claude_status_epoch=0, _claude_status_running=None,
+            _claude_status_pending=None, _claude_status_cancel=None,
+            _task_events=queue.Queue(), _claude_entries=[],
+            _set_claude_status_controls=mock.Mock(),
             _reconcile_claude_slot=lambda: None, _claude_slot_note=lambda: "",
         )
+        app._start_claude_status_refresh = lambda: manager.CodexSotaApp._start_claude_status_refresh(app)
+        app._render_claude_status = lambda payload: manager.CodexSotaApp._render_claude_status(app, payload)
         with mock.patch.object(manager, "migrate_legacy_entry"), \
              mock.patch.object(manager, "claude_library_status", return_value={
                  "available": True, "entries": [], "applied_name": "fixture"}), \
              mock.patch.object(manager, "load_registry",
-                               return_value={"providers": [claude]}) as load:
+                               return_value={"providers": [claude]}) as load, \
+             mock.patch.object(manager.threading, "Thread") as thread:
+            thread.return_value.start.side_effect = lambda: thread.call_args.kwargs["target"]()
             manager.CodexSotaApp._refresh_claude_status(app)
+            kind, epoch, payload = app._task_events.get_nowait()
+            self.assertEqual(kind, "claude_status")
+            manager.CodexSotaApp._finish_claude_status_refresh(app, epoch, payload)
         load.assert_called_once_with(manager.CLAUDE.registry_path, allow_missing_secrets=True)
         self.assertIn("Messages 模型：21 个", app.claude_status_var.set.call_args.args[0])
 

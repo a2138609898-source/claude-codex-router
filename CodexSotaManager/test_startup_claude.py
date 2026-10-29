@@ -245,6 +245,8 @@ class ClaudeTaskProgressTests(unittest.TestCase):
         app.progress = mock.Mock()
         app.provider_tree = mock.Mock()
         app._set_editor_protected = mock.Mock()
+        app._set_claude_status_controls = mock.Mock()
+        app._start_claude_status_refresh = mock.Mock()
         app._protected = False
         app._task_request_id = "completed-claude"
         manager.CodexSotaApp._set_busy(app, False, "就绪")
