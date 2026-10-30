@@ -18,10 +18,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: Install history dependency
+      - name: Install test and packaging dependencies
         shell: pwsh
         run: |
-          python -m pip install -r requirements-history.txt
+          python -m pip install -r requirements-build.txt
           exit $LASTEXITCODE
       - name: Parse Python sources
         shell: pwsh

@@ -7,10 +7,12 @@ from pathlib import Path
 import sqlite3
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "CodexHistorySync"))
 import archive_verified_duplicates as archive
+import sync_chatgpt_account_history as account
 import sync_codex_histories as core
 
 
@@ -77,6 +79,54 @@ class WindowsPathIdentityTests(unittest.TestCase):
         self.assertEqual(core.canonical_storage_path(short), long)
         self.assertEqual(core.relative_storage_path(short, self.root), Path("sessions/future/rollout.jsonl"))
         self.assertEqual(core.relative_storage_path(long, self.short), Path("sessions/future/rollout.jsonl"))
+
+    def test_account_inventory_is_identical_for_short_and_long_roots(self):
+        history = self.root / "sessions" / ("rollout-" + self.owner + ".jsonl")
+        self.write(history)
+        compressed = history.with_name(history.name + ".zst")
+        compressed.write_bytes(account.zstandard_module().ZstdCompressor().compress(history.read_bytes()))
+        expected = account.tree_state(core.canonical_storage_path(self.root))
+        self.assertEqual(len(expected), 2)
+        self.assertEqual(account.tree_state(self.short), expected)
+        with self.assertRaises(account.AccountSyncError):
+            account.safe_path(self.short / ".." / "escaped.jsonl", self.short)
+
+    def test_account_sidebar_remaps_host_aliases_without_losing_project_maps(self):
+        target = core.canonical_storage_path(self.base / "account profile")
+        target.mkdir()
+        source = core.canonical_storage_path(self.root)
+        short_host, long_host = "local:" + str(self.short), "local:" + str(source)
+        target_host = "local:" + str(target)
+        unrelated_host = "local:" + str(self.base / "unrelated profile")
+        project_key = "app-server-project-id-by-legacy-project-id-by-host"
+        member_key = "thread-project-membership-host-ids"
+        state = {
+            member_key: {self.owner: short_host},
+            project_key: {
+                short_host: {"short-project": "one"},
+                long_host: {"long-project": "two"},
+                unrelated_host: {"unrelated": "keep"},
+                "ssh:fixture": {"remote": "keep"},
+            },
+            core.ATOM_STATE_KEY: {member_key: {self.owner: short_host}},
+        }
+        original = account.json_bytes(state)
+        destination = {project_key: {target_host: {"account-project": "keep"}}}
+        result = account.merge_sidebar(
+            SimpleNamespace(root=source, global_state=state),
+            SimpleNamespace(root=target, global_state=destination),
+            {self.owner: self.owner}, {self.owner: {"project_id": "fixture-project"}}, {},
+        )
+        self.assertEqual(result[member_key][self.owner], target_host)
+        self.assertEqual(result[core.ATOM_STATE_KEY][member_key][self.owner], target_host)
+        self.assertEqual(result[project_key][target_host], {
+            "account-project": "keep", "short-project": "one", "long-project": "two",
+        })
+        self.assertNotIn(short_host, result[project_key])
+        self.assertNotIn(long_host, result[project_key])
+        self.assertEqual(result[project_key][unrelated_host], {"unrelated": "keep"})
+        self.assertEqual(result[project_key]["ssh:fixture"], {"remote": "keep"})
+        self.assertEqual(account.json_bytes(state), original)
 
     def test_short_name_live_mutation_still_invokes_lifecycle_guard(self):
         guarded = []

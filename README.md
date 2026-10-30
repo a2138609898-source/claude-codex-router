@@ -12,7 +12,7 @@
 
 首次打开选择 Codex App 或 Claude Desktop，添加自己的供应商地址、密钥和模型，保存并应用。
 对应的官方桌面客户端需另行安装。升级安装和卸载保留个人配置；换电脑需要重新填写自己的密钥。
-[安装说明](docs/WINDOWS-INSTALL.md) · [版本记录](CHANGELOG.md) · [维护架构](docs/ARCHITECTURE.md) · [本版验证](docs/VALIDATION-0.2.2.md)
+[安装说明](docs/WINDOWS-INSTALL.md) · [版本记录](CHANGELOG.md) · [维护架构](docs/ARCHITECTURE.md) · [本版验证](docs/VALIDATION-0.2.3.md)
 
 项目当前支持 Windows 10/11、PowerShell 5.1 或 PowerShell 7、CPython 3.11+。它使用 Windows DPAPI、
 `msvcrt` 文件锁和 Win32 进程 API，因此不是跨平台项目；但源码目录可以放在任意路径，部署路径、Python
@@ -214,7 +214,7 @@ cd CodexSotaManager
 
 ```powershell
 .\setup.ps1
-.\Build-Release.ps1 -Version 0.2.2
+.\Build-Release.ps1 -Version 0.2.3
 ```
 
 构建需要 Inno Setup 6.4 或更新版本。输出的 `release/` 包含安装程序、便携 ZIP 和 SHA-256 校验文件。

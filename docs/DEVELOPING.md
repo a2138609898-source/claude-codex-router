@@ -9,7 +9,8 @@
   `Run-ThreeRoundValidation.ps1` 会自己去找解释器：先看 `CODEX_SOTA_PYTHON` / `CODEX_PYTHON`，再看构建环境和 Codex 自带
   运行时，再扫 `%LOCALAPPDATA%\Programs\Python\Python3*` 按版本号从新到旧，实在找不到才回落到 PATH。
   手工跑命令时请直接写解释器的完整路径。
-- **历史压缩依赖。** 账号/SOTA 往返历史需要 `requirements-history.txt` 中的 `zstandard`；源码测试前先安装。
+- **历史压缩依赖。** 账号/SOTA 往返历史需要 `requirements-history.txt` 中的 `zstandard`；完整源码测试前安装
+  `requirements-build.txt`，因为打包白名单测试也会加载 PyInstaller 的元数据收集器。
   构建依赖同时包含 PyInstaller、该压缩库和可选 TLS 证书支持 `cryptography`。发行包内置这些依赖，
   `zstandard` 的元数据及许可证随包保留；不能依靠开发机器的 site-packages 让缺依赖的包通过测试。
 

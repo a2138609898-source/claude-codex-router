@@ -42,9 +42,13 @@ def fingerprints(root):
 
 class AccountHistoryTests(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(prefix="account-sync-fixture-")
+        # Leave room for the deliberately deep paginated staging paths on
+        # Windows, including when TEMP itself is an 8.3 alias.
+        self.temp = tempfile.TemporaryDirectory(prefix="acct-")
         self.addCleanup(self.temp.cleanup)
-        self.base = Path(self.temp.name)
+        # Match the synchronizer's physical spelling, including hosted Windows
+        # runners whose TEMP uses an 8.3 alias. Fault injection must hit writes.
+        self.base = core.canonical_storage_path(self.temp.name)
         self.source, self.target = self.base / "sota", self.base / "account"
         self.work = self.base / "work"
         for root in (self.source, self.target):

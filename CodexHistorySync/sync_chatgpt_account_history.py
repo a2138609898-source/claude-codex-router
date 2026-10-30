@@ -137,6 +137,8 @@ def read_index(path: Path) -> dict:
 
 def tree_state(root: Path) -> dict:
     """A bounded inventory: never visit secrets, logs, plugins or config trees."""
+    # safe_path expands Windows 8.3 names; relative keys need the same root.
+    root = core.canonical_storage_path(root)
     result = {}
     for name in (STATE, HISTORY, GLOBAL, INDEX, LEDGER, RETURN_LEDGER, STATE + "-wal", HISTORY + "-wal"):
         path = safe_path(root / name, root)
@@ -556,10 +558,47 @@ def additive(preferred, other):
     return copy.deepcopy(preferred)
 
 
+def remap_profile_hosts(value, source_root, target_root):
+    """Recognize one local host across 8.3 spellings without following links."""
+    source_key = core.storage_path_key(source_root)
+    source_anchor = os.path.normcase(source_root.anchor)
+    target_host = "local:" + str(core.canonical_storage_path(target_root))
+
+    def host(text):
+        if not isinstance(text, str) or not text.startswith("local:"):
+            return text
+        path = core.plain_storage_path(text[6:])
+        if (path.is_absolute() and ".." not in path.parts
+                and os.path.normcase(path.anchor) == source_anchor):
+            try:
+                if core.storage_path_key(path) == source_key:
+                    return target_host
+            except (OSError, ValueError):
+                # Unknown/malformed host IDs are opaque sidebar metadata.
+                pass
+        return text
+
+    def visit(item):
+        if isinstance(item, str):
+            return host(item)
+        if isinstance(item, list):
+            return [visit(child) for child in item]
+        if isinstance(item, dict):
+            result = {}
+            for key, child in item.items():
+                key, child = host(key), visit(child)
+                # Short and long host keys can coexist after a native migration.
+                # Keep both project maps when they become one destination host.
+                result[key] = additive(result[key], child) if key in result else child
+            return result
+        return item
+
+    return visit(value)
+
+
 def merge_sidebar(source, target, mapping, rows, previous):
     """Only sidebar/history fields; never copy an Atom object or account settings."""
-    host_map = {"local:" + str(source.root): "local:" + str(target.root), **mapping}
-    incoming = remap_ui(source.global_state, host_map)
+    incoming = remap_ui(remap_profile_hosts(source.global_state, source.root, target.root), mapping)
     result = copy.deepcopy(target.global_state)
     for container_key in (None, core.ATOM_STATE_KEY):
         src = incoming if container_key is None else incoming.get(container_key, {})
