@@ -1034,12 +1034,14 @@ def _sync_account(source, target, work_base, *, guard, rollback_guard, dry_run, 
                         if field in existing:
                             row[field] = existing[field]
                 else:
-                    # Select the account's configured default for future turns;
-                    # historical per-turn model annotations remain untouched.
-                    if model_config.get("model"):
-                        row["model"] = model_config["model"]
-                    if model_config.get("model_reasoning_effort"):
-                        row["reasoning_effort"] = model_config["model_reasoning_effort"]
+                    # An unset account default means the official client chooses
+                    # it. Do not import a SOTA provider-qualified model/effort as
+                    # an account selection. Existing account choices and historical
+                    # per-turn annotations remain untouched; SOTA return is unchanged.
+                    if model_config.get("model") or not return_to_sota:
+                        row["model"] = model_config.get("model")
+                    if model_config.get("model_reasoning_effort") or not return_to_sota:
+                        row["reasoning_effort"] = model_config.get("model_reasoning_effort")
                 if row.get("archived"):
                     row.update(is_pinned=0, thread_section_id=None, section_position=None)
             if match in ("missing", "target_prefix"):

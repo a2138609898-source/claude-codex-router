@@ -30,6 +30,12 @@ never overwritten. Sign in or change the official account inside that profile's
 Codex App. Closing the manager alone does not close Codex or trigger a live
 database merge. This feature is not ChatGPT web-history or cross-PC cloud sync.
 
+Account-mode models and defaults follow official discovery and account access.
+An obsolete local catalog override is backed up and removed after normal app
+exit under the launch/history locks. Subsequent official model choices are
+preserved; SOTA/API catalogs and credentials remain unchanged. Keep the official
+desktop client current and online to receive its model updates and rollouts.
+
 Configuration stays under %USERPROFILE%\.codex-sota or .claude-sota. Secrets
 use Windows DPAPI and cannot be copied to a different Windows user or computer.
 On another computer, install the application and enter your own credentials.

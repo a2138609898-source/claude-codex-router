@@ -37,6 +37,9 @@ $lastResultPath = Join-Path $installDir 'last-result.json'
 $postExitWatcherPath = Join-Path $installDir 'sync_after_codex_exit.py'
 $accountHistorySyncPath = Join-Path $installDir 'sync_chatgpt_account_history.py'
 $script:accountHistorySyncResult = $null
+$script:accountModelDiscoveryResult = $null
+$script:profileLaunchIdentity = $null
+$script:profileLaunchWarnings = @()
 $configValidatorPath = Join-Path $installDir 'validate_codex_profile.py'
 $activeProfilePath = Join-Path $installDir 'active-profile.json'
 $canonicalCockpitRoot = Resolve-ConfiguredRoot 'CODEX_SOTA_COCKPIT_ROOT' '.codex-personal'
@@ -147,17 +150,39 @@ function Clear-LaunchRequest {
 }
 
 function Write-ProfileLaunchResult {
-    param([string]$Status, [string]$Phase, [int]$AppProcessId = 0, [string]$ErrorText)
-    $app = if ($AppProcessId -gt 0) { Get-Process -Id $AppProcessId -ErrorAction SilentlyContinue } else { $null }
+    param([string]$Status, [string]$Phase, [int]$AppProcessId = 0, [string]$ErrorText, [switch]$Quiet)
+    $identity = $script:profileLaunchIdentity
+    if (-not $identity -or $identity.request_id -ne $LaunchRequestId -or
+        $identity.profile -ne $Profile -or [int]$identity.app_process_id -ne $AppProcessId) { $identity = $null }
+    $app = $null
+    if ($identity) {
+        try {
+            $app = Get-ProfileAppByIdentity -ProcessId $AppProcessId -CreationTicks $identity.app_creation_ticks -ExecutablePath $identity.app_executable
+        }
+        catch { Add-ProfileLaunchWarning ('Could not refresh the launched desktop identity: ' + $_.Exception.Message) }
+    }
+    elseif ($AppProcessId -gt 0) { $app = Get-Process -Id $AppProcessId -ErrorAction SilentlyContinue }
+    $hasWindow = $false
+    if ($app) {
+        try {
+            $windowHandle = $app.MainWindowHandle
+            if ($null -eq $windowHandle) { throw 'Windows did not return a desktop window handle.' }
+            $hasWindow = [IntPtr]$windowHandle -ne [IntPtr]::Zero
+        }
+        catch { Add-ProfileLaunchWarning ('Could not inspect the launched desktop window: ' + $_.Exception.Message) }
+    }
     $result = [ordered]@{
         status = $Status; profile = $Profile; request_id = $LaunchRequestId; phase = $Phase
         launcher_pid = $PID
         launcher_creation_ticks = (Get-Process -Id $PID -ErrorAction SilentlyContinue).StartTime.ToUniversalTime().ToFileTimeUtc().ToString()
-        app_process_id = if ($app) { $app.Id } else { $null }
-        app_creation_ticks = if ($app) { $app.StartTime.ToUniversalTime().ToFileTimeUtc().ToString() } else { $null }
-        window_owned = [bool]($app -and $app.MainWindowHandle -ne 0)
+        app_process_id = if ($identity) { $identity.app_process_id } elseif ($app) { $app.Id } else { $null }
+        app_creation_ticks = if ($identity) { $identity.app_creation_ticks } elseif ($app) { $app.StartTime.ToUniversalTime().ToFileTimeUtc().ToString() } else { $null }
+        app_executable = if ($identity) { $identity.app_executable } elseif ($app) { $app.Path } else { $null }
+        window_owned = [bool]$hasWindow
         error = $ErrorText
+        warnings = @($script:profileLaunchWarnings)
         account_history_sync = $script:accountHistorySyncResult
+        account_model_discovery = $script:accountModelDiscoveryResult
     } | ConvertTo-Json -Compress
     if (-not $AuditOnly -and -not $PrepareOnly) {
         $temporary = $launchStatusPath + '.new-' + $PID
@@ -169,7 +194,7 @@ function Write-ProfileLaunchResult {
         catch { Write-Warning 'Could not persist profile launch status; structured stdout remains available.' }
         finally { Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue }
     }
-    Write-Output $result
+    if (-not $Quiet) { Write-Output $result }
 }
 
 function Get-ActiveCodexAppBackends {
@@ -223,12 +248,7 @@ function Get-OwnedCodexAppProcesses {
     $expectedExecutable = [System.IO.Path]::GetFullPath($expectedExecutable)
     $processInfo = @(Get-CimInstance Win32_Process -Filter "Name = 'ChatGPT.exe'" -ErrorAction Stop)
     $unowned = @($processInfo | Where-Object {
-        -not $_.ExecutablePath -or
-        -not [string]::Equals(
-            [System.IO.Path]::GetFullPath([string]$_.ExecutablePath),
-            $expectedExecutable,
-            [System.StringComparison]::OrdinalIgnoreCase
-        )
+        -not (Test-CodexExecutableIdentity -ExpectedPath $expectedExecutable -ActualPath ([string]$_.ExecutablePath))
     })
     if ($unowned.Count -gt 0) {
         throw "Refusing to stop unowned ChatGPT.exe process IDs: $(@($unowned.ProcessId) -join ', ')"
@@ -390,6 +410,106 @@ function Set-ProfileStartEnvironment {
 }
 
 
+function Add-ProfileLaunchWarning {
+    param([string]$Message)
+    if ($Message -and $script:profileLaunchWarnings -notcontains $Message) {
+        $script:profileLaunchWarnings += $Message
+    }
+}
+
+function Test-CodexExecutableIdentity {
+    param([string]$ExpectedPath, [string]$ActualPath)
+    if (-not $ExpectedPath -or -not $ActualPath) { return $false }
+    try {
+        $expected = [IO.Path]::GetFullPath($ExpectedPath)
+        $actual = [IO.Path]::GetFullPath($ActualPath)
+        if ([string]::Equals($expected, $actual, [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
+        # Store apps installed on another drive have a WindowsApps junction.
+        # Compare the files Windows opens, not path spelling, basename, hashes,
+        # or a broad WindowsApps wildcard. Unreadable/different files fail closed.
+        if (-not ('CodexProfileFileIdentity' -as [type])) {
+            Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+public static class CodexProfileFileIdentity {
+    [StructLayout(LayoutKind.Sequential)]
+    struct FileInfo {
+        public uint Attributes, CreationLow, CreationHigh, AccessLow, AccessHigh;
+        public uint WriteLow, WriteHigh, Volume, SizeHigh, SizeLow, Links, IndexHigh, IndexLow;
+    }
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+    static extern SafeFileHandle CreateFile(string path, uint access, uint share,
+        IntPtr security, uint disposition, uint flags, IntPtr template);
+    [DllImport("kernel32.dll", SetLastError=true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    static extern bool GetFileInformationByHandle(SafeFileHandle handle, out FileInfo info);
+    public static bool SameFile(string expected, string actual) {
+        using (var left = CreateFile(expected, 0, 7, IntPtr.Zero, 3, 0, IntPtr.Zero))
+        using (var right = CreateFile(actual, 0, 7, IntPtr.Zero, 3, 0, IntPtr.Zero)) {
+            if (left.IsInvalid || right.IsInvalid) return false;
+            FileInfo a, b;
+            return GetFileInformationByHandle(left, out a) && GetFileInformationByHandle(right, out b)
+                && a.Volume == b.Volume && a.IndexHigh == b.IndexHigh && a.IndexLow == b.IndexLow;
+        }
+    }
+}
+'@
+        }
+        return [CodexProfileFileIdentity]::SameFile($expected, $actual)
+    }
+    catch { return $false }
+}
+
+function Get-ProfileAppByIdentity {
+    param([int]$ProcessId, [string]$CreationTicks, [string]$ExecutablePath)
+    if ($ProcessId -le 0 -or -not $CreationTicks -or -not $ExecutablePath) { return $null }
+    try { $app = Get-Process -Id $ProcessId -ErrorAction Stop }
+    catch {
+        if ($_.FullyQualifiedErrorId -like 'NoProcessFoundForGivenId*') { return $null }
+        throw
+    }
+    if (-not $app -or $app.StartTime.ToUniversalTime().ToFileTimeUtc().ToString() -ne $CreationTicks) { return $null }
+    if (-not (Test-CodexExecutableIdentity -ExpectedPath $ExecutablePath -ActualPath $app.Path)) { return $null }
+    return $app
+}
+
+function Set-ProfileLaunchIdentity {
+    param([object]$App)
+    $script:profileLaunchIdentity = [pscustomobject]@{
+        profile = $Profile; request_id = $LaunchRequestId
+        app_process_id = $App.Id
+        app_creation_ticks = $App.StartTime.ToUniversalTime().ToFileTimeUtc().ToString()
+        app_executable = $App.Path
+    }
+}
+
+function Initialize-ChatGptOfficialModels {
+    # Called only for a cold direct-account launch after normal exit, with both
+    # lifecycle/history leases held. Preflight and existing-window reuse stay read-only.
+    if (-not $ChatGptDirect -or $Profile -ne 'Plus') {
+        throw 'Official model preparation is only supported by the direct account launcher.'
+    }
+    $result = Invoke-ProfileConfigValidator -Root $canonicalPlusRoot -SelectedProfile Plus -PrepareOfficialModels
+    if (-not $result -or $result.valid -ne $true) {
+        $reason = if ($result) { $result.reason } else { 'validator_failed' }
+        throw "Could not restore official account model discovery ($reason). Credentials and SOTA were not changed."
+    }
+    $script:accountModelDiscoveryResult = $result.repair
+    if ($result.repair.changed) {
+        Add-ProfileLaunchWarning 'Removed the legacy account model catalog; Codex now discovers models from the official account. The previous config was backed up.'
+    }
+}
+
+function Invoke-ProfileStoreLaunch {
+    param([System.Diagnostics.ProcessStartInfo]$StartInfo)
+    $storeLauncher = Join-Path $PSScriptRoot 'Start-CodexStoreProcess.ps1'
+    if (Test-ExplicitPortableCodexApp -ExecutablePath $StartInfo.FileName) {
+        return [System.Diagnostics.Process]::Start($StartInfo)
+    }
+    & $storeLauncher -StartInfo $StartInfo
+}
+
 function Start-CodexAppForProfile {
     param(
         [string]$ExecutablePath,
@@ -423,29 +543,53 @@ function Start-CodexAppForProfile {
     $startInfo.CreateNoWindow = $false
     Set-ProfileStartEnvironment -StartInfo $startInfo -Root $profileRoot
 
-    $storeLauncher = Join-Path $PSScriptRoot 'Start-CodexStoreProcess.ps1'
-    if (Test-ExplicitPortableCodexApp -ExecutablePath $ExecutablePath) {
-        $startedProcess = [System.Diagnostics.Process]::Start($startInfo)
-    }
-    else { $startedProcess = & $storeLauncher -StartInfo $startInfo }
+    $startedProcess = Invoke-ProfileStoreLaunch -StartInfo $startInfo
     if (-not $startedProcess) {
         throw 'Windows did not return a Codex App process.'
     }
 
+    # The selected launcher created this child; verify its executable identity.
+    # Capture its birth identity before window polling; never adopt an arbitrary
+    # ChatGPT process (including another profile or a new MCP helper) after spawn.
+    if (-not (Test-CodexExecutableIdentity -ExpectedPath $ExecutablePath -ActualPath $startedProcess.Path)) {
+        throw 'Windows returned an unexpected Codex executable. No window was adopted or closed.'
+    }
+    Set-ProfileLaunchIdentity -App $startedProcess
+    $identity = $script:profileLaunchIdentity
+    $app = $startedProcess
+    try {
+        Set-ActiveProfileMarker -SelectedProfile $SelectedProfile -AppProcessId $app.Id -ExpectedCreationTicks $identity.app_creation_ticks
+    }
+    catch { Add-ProfileLaunchWarning ('Could not save the active profile marker: ' + $_.Exception.Message) }
+    # An independent request receipt survives a marker-write failure or a
+    # manager timeout while the verified GUI is still bringing up its window.
+    Write-ProfileLaunchResult -Status 'starting' -Phase 'waiting_for_window' -AppProcessId $app.Id -Quiet
+    $script:launchWindowPending = $false
     $deadline = [DateTime]::UtcNow.AddSeconds($WindowReadyTimeoutSeconds)
-    $lastOwned = @()
     do {
+        try {
+            $app = Get-ProfileAppByIdentity -ProcessId $identity.app_process_id -CreationTicks $identity.app_creation_ticks -ExecutablePath $ExecutablePath
+            $hasWindow = $false
+            if ($app) {
+                $windowHandle = $app.MainWindowHandle
+                if ($null -eq $windowHandle) { throw 'Windows did not return a desktop window handle.' }
+                $hasWindow = [IntPtr]$windowHandle -ne [IntPtr]::Zero
+            }
+        }
+        catch {
+            # A transient inspection error is not proof the owned GUI failed.
+            # Return its receipt so the manager can verify this PID, not relaunch.
+            Add-ProfileLaunchWarning ('The desktop was started; window verification is pending: ' + $_.Exception.Message)
+            $script:launchWindowPending = $true
+            return [int]$identity.app_process_id
+        }
+        if (-not $app) { throw 'The launched Codex desktop exited or its identity changed. No other window was adopted.' }
+        if ($hasWindow) { return [int]$app.Id }
         Start-Sleep -Milliseconds 250
-        $lastOwned = @(Get-OwnedCodexAppProcesses)
-        $window = @($lastOwned | Where-Object { $_.MainWindowHandle -ne 0 } | Sort-Object StartTime | Select-Object -First 1)
-        if ($window.Count -gt 0) { return [int]$window[0].Id }
     } while ([DateTime]::UtcNow -lt $deadline)
 
-    if ($lastOwned.Count -gt 0) {
-        $script:launchWindowPending = $true
-        return [int](@($lastOwned | Sort-Object StartTime | Select-Object -First 1)[0].Id)
-    }
-    throw 'The owned Codex desktop process exited before creating its window.'
+    $script:launchWindowPending = $true
+    return [int]$identity.app_process_id
 }
 
 function Get-SessionFileCount {
@@ -552,7 +696,8 @@ function Invoke-ProfileConfigValidator {
         [string]$Root,
         [ValidateSet('Plus', 'Cockpit')]
         [string]$SelectedProfile,
-        [switch]$ProbeCockpit
+        [switch]$ProbeCockpit,
+        [switch]$PrepareOfficialModels
     )
 
     if (-not (Test-Path -LiteralPath $configValidatorPath)) {
@@ -571,6 +716,7 @@ function Invoke-ProfileConfigValidator {
         $arguments += @('--probe-cockpit', '--timeout-seconds', '1.5')
     }
     if ($ChatGptDirect) { $arguments += '--chatgpt-direct' }
+    if ($PrepareOfficialModels) { $arguments += '--prepare-official-models' }
     $previous = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
     try {
@@ -657,14 +803,19 @@ function Test-CockpitApiHealth {
 }
 
 function Set-ActiveProfileMarker {
-    param([ValidateSet('Plus', 'Cockpit')][string]$SelectedProfile, [int]$AppProcessId)
+    param([ValidateSet('Plus', 'Cockpit')][string]$SelectedProfile, [int]$AppProcessId, [string]$ExpectedCreationTicks)
 
     $app = Get-Process -Id $AppProcessId -ErrorAction Stop
+    $creationTicks = $app.StartTime.ToUniversalTime().ToFileTimeUtc().ToString()
+    if ($ExpectedCreationTicks -and $creationTicks -ne $ExpectedCreationTicks) {
+        throw 'The Codex process identity changed before its profile could be recorded.'
+    }
     $payload = [ordered]@{
         profile = $SelectedProfile
         updated_utc = [DateTime]::UtcNow.ToString('o')
         app_process_id = $app.Id
-        app_creation_ticks = $app.StartTime.ToUniversalTime().ToFileTimeUtc().ToString()
+        app_creation_ticks = $creationTicks
+        app_executable = $app.Path
         creation_request_id = $LaunchRequestId
         request_id = $LaunchRequestId
     } | ConvertTo-Json -Compress
@@ -686,9 +837,12 @@ function Get-RequestedProfileApp {
             if (-not $ChatGptDirect -and $marker.creation_request_id -ne $LaunchRequestId -and
                 $marker.request_id -ne $LaunchRequestId) { continue }
             if (-not $marker.app_process_id -or -not $marker.app_creation_ticks) { continue }
-            foreach ($app in @(Get-OwnedCodexAppProcesses)) {
-                if ($app.Id -eq [int]$marker.app_process_id -and
-                    $app.StartTime.ToUniversalTime().ToFileTimeUtc().ToString() -eq [string]$marker.app_creation_ticks) { return $app }
+            # Reusing a recorded profile checks that one PID and birth identity.
+            # An unrelated ChatGPT helper must not invalidate an already-owned GUI.
+            $app = Get-ProfileAppByIdentity -ProcessId ([int]$marker.app_process_id) -CreationTicks ([string]$marker.app_creation_ticks) -ExecutablePath (Get-CodexAppExecutable)
+            if ($app) {
+                Set-ProfileLaunchIdentity -App $app
+                return $app
             }
         }
         catch { }
@@ -1068,6 +1222,7 @@ try {
             exit 0
         }
         if ($ChatGptDirect) {
+            Initialize-ChatGptOfficialModels
             Write-ProfileLaunchResult -Status 'starting' -Phase 'account_history_sync'
             $historyWriteLease.Unlock(0, 1); $historyWriteLease.Dispose(); $historyWriteLease = $null
             $accountHistoryReady = Invoke-ChatGptAccountHistorySync
@@ -1105,21 +1260,26 @@ if ($Profile -eq 'Cockpit') {
 try {
     if ($requestedApp) {
         $appProcessId = $requestedApp.Id
-        $script:launchWindowPending = $requestedApp.MainWindowHandle -eq 0
+        $reusedWindowHandle = $requestedApp.MainWindowHandle
+        $script:launchWindowPending = $null -eq $reusedWindowHandle -or $reusedWindowHandle -eq 0
     }
     else { $appProcessId = Start-CodexAppForProfile -ExecutablePath $appExecutable -SelectedProfile $Profile }
 }
 catch {
     $launchError = $_.Exception.Message
     Show-ProfileMessage -Title 'Codex 切换失败' -Icon Error -Message "无法打开 Codex App。`n`n$launchError"
+    if ($NoGui) {
+        $reportedAppId = if ($script:profileLaunchIdentity) { [int]$script:profileLaunchIdentity.app_process_id } else { 0 }
+        Write-ProfileLaunchResult -Status 'error' -Phase 'opening_desktop' -AppProcessId $reportedAppId -ErrorText $launchError
+    }
     exit 1
 }
 
 try {
-    Set-ActiveProfileMarker -SelectedProfile $Profile -AppProcessId $appProcessId
+    Set-ActiveProfileMarker -SelectedProfile $Profile -AppProcessId $appProcessId -ExpectedCreationTicks $script:profileLaunchIdentity.app_creation_ticks
 }
 catch {
-    Write-Warning ("The active profile marker could not be saved: " + $_.Exception.Message)
+    Add-ProfileLaunchWarning ('Could not save the active profile marker: ' + $_.Exception.Message)
 }
 try {
     # The new account-only entry must not start a writer for other profiles.

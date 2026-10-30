@@ -9,6 +9,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import tomllib
 from types import SimpleNamespace
 import unittest
 from unittest import mock
@@ -87,6 +88,7 @@ class AccountProfileValidationTests(unittest.TestCase):
             'env_http_headers = { Authorization = "OPENAI_API_KEY" }',
             'auth = { command = "fixture-command" }',
             'gateway_oauth = { issuer = "https://relay.example.invalid" }',
+            'model_catalog_url = "https://relay.example.invalid/models"',
         )
         for override in overrides:
             with self.subTest(override=override.split("=")[0].strip()):
@@ -135,6 +137,206 @@ class AccountProfileValidationTests(unittest.TestCase):
         self.assertEqual(json.loads(result.stdout)["reason"],
                          "chatgpt_direct_requires_readonly_plus_profile")
         self.assertEqual(fingerprints(self.root), self.before)
+
+
+class OfficialModelDiscoveryTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.plus, self.sota = self.root / ".codex-plus", self.root / ".codex-sota"
+        self.plus.mkdir()
+        self.sota.mkdir()
+        self.config = self.plus / "config.toml"
+        self.base = ('# Keep account and personal preferences.\n'
+                     'forced_login_method = "chatgpt"\n'
+                     'cli_auth_credentials_store = "file"\n'
+                     'model_reasoning_effort = "max"\n')
+        self.legacy = ('model_catalog_json = "models_wm_visible.json"\n'
+                       'model = "old-account-model"\nreview_model = "old-review-model"\n')
+        self.config.write_text(self.base + self.legacy, encoding="utf-8")
+        (self.plus / "auth.json").write_text('{"auth_mode":"chatgpt","tokens":{"fixture":true}}')
+        (self.plus / "models_wm_visible.json").write_text('{"models":[{"slug":"old-account-model"}]}')
+        (self.plus / "models_cache.json").write_text('{"fetched_at":"old","models":[]}')
+        (self.plus / "history.jsonl").write_text('fixture history must stay unchanged\n')
+        (self.sota / "config.toml").write_text('model_provider="tango_relay"\nmodel_catalog_json="sota.json"\n')
+        (self.sota / "auth.json").write_text('{"fixture":"untouched"}')
+        (self.sota / "providers.json").write_text('{"providers":["untouched"]}')
+
+    def prepare(self):
+        return validator.prepare_chatgpt_official_models(self.plus, self.sota)
+
+    def test_static_catalog_and_old_pins_removed_with_exact_backup_only(self):
+        before = fingerprints(self.root)
+        original = self.config.read_bytes()
+        with mock.patch.object(validator.urllib.request, "build_opener",
+                               side_effect=AssertionError("Discovery belongs to the official client")):
+            result = self.prepare()
+        self.assertTrue(result["valid"], result)
+        self.assertTrue(result["changed"])
+        self.assertEqual(result["removed_fields"], ["model_catalog_json", "model", "review_model"])
+        self.assertEqual(Path(result["backup_path"]).read_bytes(), original)
+        self.assertEqual(tomllib.loads(self.config.read_text()), tomllib.loads(self.base))
+        after = fingerprints(self.root)
+        for path, digest in before.items():
+            if path != str(self.config.relative_to(self.root)):
+                self.assertEqual(after[path], digest, path)
+
+    def test_idempotent_and_future_official_model_choices_are_preserved(self):
+        self.assertTrue(self.prepare()["changed"])
+        self.config.write_text(self.base + 'model = "future-official-choice"\nreview_model = "future-review"\n')
+        before = fingerprints(self.root)
+        result = self.prepare()
+        self.assertTrue(result["valid"], result)
+        self.assertFalse(result["changed"])
+        self.assertEqual(fingerprints(self.root), before)
+
+    def test_reintroduced_catalog_is_removed_again_without_a_fixed_model_list(self):
+        self.assertTrue(self.prepare()["changed"])
+        self.config.write_text(self.base + 'model_catalog_json="different-static.json"\nmodel="future-model"\n')
+        result = self.prepare()
+        self.assertTrue(result["changed"], result)
+        self.assertNotIn("model", tomllib.loads(self.config.read_text()))
+        self.assertEqual(len(list(self.plus.glob("config.toml.before-official-models-*.bak"))), 2)
+
+    def test_multiline_prompts_and_inactive_nested_profiles_are_not_edited(self):
+        prompt = 'description = \'\'\'\nmodel_catalog_json = "keep-in-prompt"\nmodel = "keep-in-prompt"\n\'\'\'\n'
+        nested = '\n[profiles.other]\nmodel_catalog_json="keep-nested.json"\nmodel="keep-nested-model"\n'
+        self.config.write_text(self.base + prompt + self.legacy + nested)
+        result = self.prepare()
+        self.assertTrue(result["valid"], result)
+        self.assertEqual(self.config.read_text(), self.base + prompt + nested)
+
+    def test_crlf_quoted_keys_and_multiline_catalog_values_are_preserved_safely(self):
+        original = (self.base + '\'model_catalog_json\' = """old-catalog.json"""\n'
+                    + '"model" = "old-model" # comment on removed setting\n'
+                    + '[projects."kept"]\ntrust_level="trusted"\n').replace('\n', '\r\n').encode()
+        self.config.write_bytes(original)
+        result = self.prepare()
+        self.assertTrue(result["valid"], result)
+        self.assertEqual(self.config.read_bytes(),
+                         (self.base + '[projects."kept"]\ntrust_level="trusted"\n').replace('\n', '\r\n').encode())
+        self.assertEqual(Path(result["backup_path"]).read_bytes(), original)
+
+    def test_unsupported_escaped_key_fails_closed_without_dropping_unrelated_text(self):
+        self.config.write_text(self.base + '"model_\\u0063atalog_json"="old.json"\n')
+        before = fingerprints(self.root)
+        self.assertFalse(self.prepare()["valid"])
+        self.assertEqual(fingerprints(self.root), before)
+
+    def test_readonly_account_validation_does_not_run_migration(self):
+        before = fingerprints(self.root)
+        self.assertEqual(validator.validate_chatgpt_direct_profile(self.plus, self.sota), (True, "ok"))
+        self.assertEqual(fingerprints(self.root), before)
+
+    def test_signed_out_account_does_not_create_credentials(self):
+        (self.plus / "auth.json").unlink()
+        self.assertTrue(self.prepare()["valid"])
+        self.assertFalse((self.plus / "auth.json").exists())
+
+    def test_invalid_config_or_auth_is_never_repaired_or_reset(self):
+        for name, value in (("config.toml", "invalid TOML"),
+                            ("auth.json", '{"auth_mode":"apikey"}'),
+                            ("auth.json", "invalid JSON")):
+            with self.subTest(name=name, value=value):
+                path = self.plus / name
+                original = path.read_bytes()
+                path.write_text(value)
+                before = fingerprints(self.root)
+                self.assertFalse(self.prepare()["valid"])
+                self.assertEqual(fingerprints(self.root), before)
+                path.write_bytes(original)
+
+    def test_missing_account_config_is_not_created(self):
+        self.config.unlink()
+        before = fingerprints(self.root)
+        self.assertFalse(self.prepare()["valid"])
+        self.assertEqual(fingerprints(self.root), before)
+
+    def test_sota_or_overlapping_root_cannot_be_migrated(self):
+        before = fingerprints(self.root)
+        result = validator.prepare_chatgpt_official_models(self.sota, self.sota)
+        self.assertEqual(result["reason"], "profile_roots_overlap")
+        self.assertEqual(fingerprints(self.root), before)
+
+    def test_config_symlink_outside_account_root_is_rejected(self):
+        resolve = Path.resolve
+        def redirected(path, *args, **kwargs):
+            return resolve(self.sota / "config.toml") if path == self.config else resolve(path, *args, **kwargs)
+        before = fingerprints(self.root)
+        with mock.patch.object(Path, "resolve", redirected):
+            self.assertEqual(self.prepare()["reason"], "config_path_outside_account_profile")
+        self.assertEqual(fingerprints(self.root), before)
+
+    def test_configured_protected_root_cannot_be_migrated(self):
+        before = fingerprints(self.root)
+        with mock.patch.dict(os.environ, {"CODEX_SOTA_CODEX_ROOT": str(self.plus)}):
+            result = validator.prepare_chatgpt_official_models(self.plus)
+        self.assertEqual(result["reason"], "profile_roots_overlap")
+        self.assertEqual(fingerprints(self.root), before)
+
+    def test_custom_provider_or_catalog_endpoint_cannot_be_silently_adopted(self):
+        for extra in ('model_provider="tango_relay"\n',
+                      '[model_providers.openai]\nmodel_catalog_url="https://fixture.invalid/models"\n'):
+            with self.subTest(extra=extra):
+                self.config.write_text(self.base + self.legacy + extra)
+                before = fingerprints(self.root)
+                self.assertFalse(self.prepare()["valid"])
+                self.assertEqual(fingerprints(self.root), before)
+
+    def test_concurrent_changes_are_preserved_before_and_after_backup(self):
+        for change_on_read in (2, 3):
+            with self.subTest(change_on_read=change_on_read):
+                self.config.write_text(self.base + self.legacy)
+                original_read = Path.read_bytes
+                reads = 0
+                def changed(path):
+                    nonlocal reads
+                    if path == self.config:
+                        reads += 1
+                        if reads == change_on_read:
+                            path.write_text(self.base + self.legacy + '# concurrent user edit\n')
+                    return original_read(path)
+                with mock.patch.object(Path, "read_bytes", changed), \
+                        mock.patch.object(validator.os, "replace") as replace:
+                    result = self.prepare()
+                self.assertEqual(result["reason"], "config_changed_during_preparation")
+                replace.assert_not_called()
+                self.assertTrue(self.config.read_text().endswith('# concurrent user edit\n'))
+                self.assertEqual(list(self.plus.glob('.official-model-config-*')), [])
+
+    def test_failed_atomic_replace_keeps_original_and_backup(self):
+        original = self.config.read_bytes()
+        with mock.patch.object(validator.os, "replace", side_effect=OSError("fixture locked file")):
+            result = self.prepare()
+        self.assertFalse(result["valid"])
+        self.assertEqual(self.config.read_bytes(), original)
+        self.assertEqual(Path(result["backup_path"]).read_bytes(), original)
+        self.assertEqual(list(self.plus.glob('.official-model-config-*')), [])
+
+    def test_failed_backup_does_not_change_the_profile(self):
+        before = fingerprints(self.root)
+        with mock.patch.object(validator.tempfile, "mkstemp", side_effect=OSError("fixture no space")):
+            self.assertFalse(self.prepare()["valid"])
+        self.assertEqual(fingerprints(self.root), before)
+
+    def test_cli_requires_explicit_direct_account_preparation(self):
+        base = [sys.executable, "-B", str(CORE / "validate_codex_profile.py"), "--root", str(self.plus)]
+        before = fingerprints(self.root)
+        for options in (("--profile", "Plus", "--prepare-official-models"),
+                        ("--profile", "Sota", "--chatgpt-direct", "--prepare-official-models"),
+                        ("--profile", "Plus", "--chatgpt-direct", "--prepare-official-models", "--repair")):
+            with self.subTest(options=options):
+                result = subprocess.run(base + list(options), capture_output=True, text=True, timeout=10,
+                                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertEqual(json.loads(result.stdout)["reason"], "official_models_require_direct_plus_profile")
+                self.assertEqual(fingerprints(self.root), before)
+        result = subprocess.run(base + ["--profile", "Plus", "--chatgpt-direct", "--prepare-official-models"],
+                                capture_output=True, text=True, timeout=10,
+                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue(json.loads(result.stdout)["repair"]["changed"])
 
 
 class AccountButtonTests(unittest.TestCase):
@@ -292,6 +494,17 @@ class AccountButtonTests(unittest.TestCase):
 
 @unittest.skipUnless(os.name == "nt", "Windows launcher behavioral harness")
 class AccountLauncherBehaviorTests(unittest.TestCase):
+    def test_profile_identity_and_post_spawn_receipts_with_fake_processes(self):
+        powershell = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32/WindowsPowerShell/v1.0/powershell.exe"
+        result = subprocess.run(
+            [str(powershell), "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+             "-File", str(CORE / "check_profile_launch_identity.ps1")],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=50,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("isolated profile identity checks passed.", result.stdout)
+
     def test_real_launcher_functions_and_flows_with_fake_processes(self):
         powershell = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32/WindowsPowerShell/v1.0/powershell.exe"
         result = subprocess.run(

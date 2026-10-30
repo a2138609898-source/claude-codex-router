@@ -143,6 +143,34 @@ class AccountHistoryTests(unittest.TestCase):
         self.assertEqual((Path(result["backup_dir"]) / "before" / original.relative_to(self.target)).read_bytes(), before)
         self.assertFalse(original.exists())
 
+    def test_new_account_import_without_pins_uses_official_defaults(self):
+        (self.target / "config.toml").write_text('forced_login_method="chatgpt"\n')
+        thread_id, source = self.thread(self.source, "official-default", reasoning_effort="ultra")
+        self.run_sync()
+        row = self.rows()[thread_id]
+        self.assertEqual(row["model_provider"], "openai")
+        self.assertIsNone(row["model"])
+        self.assertIsNone(row["reasoning_effort"])
+        self.assertEqual(source.read_bytes().splitlines()[1:],
+                         Path(row["rollout_path"]).read_bytes().splitlines()[1:])
+
+    def test_account_effort_preference_survives_without_a_pinned_model(self):
+        (self.target / "config.toml").write_text('model_reasoning_effort="high"\n')
+        thread_id, _ = self.thread(self.source, "official-effort", reasoning_effort="ultra")
+        self.run_sync()
+        row = self.rows()[thread_id]
+        self.assertIsNone(row["model"])
+        self.assertEqual(row["reasoning_effort"], "high")
+
+    def test_existing_account_choice_survives_when_global_default_is_unset(self):
+        (self.target / "config.toml").write_text('forced_login_method="chatgpt"\n')
+        thread_id, _ = self.thread(self.source, "existing-official", ("one", "two"))
+        self.thread(self.target, "existing-official", ("one",), model="chosen-official-model", reasoning_effort="high")
+        self.run_sync()
+        row = self.rows()[thread_id]
+        self.assertEqual(row["model"], "chosen-official-model")
+        self.assertEqual(row["reasoning_effort"], "high")
+
     def test_account_ahead_and_account_only_history_are_kept_exactly(self):
         self.thread(self.source, "ahead", ("one",))
         _, ahead = self.thread(self.target, "ahead", ("one", "account continued"))

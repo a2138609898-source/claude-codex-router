@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [ValidatePattern('^\d+\.\d+\.\d+$')]
-    [string]$Version = '0.2.3',
+    [string]$Version = '0.2.4',
     [string]$PythonExecutable = $env:CODEX_SOTA_BUILD_PYTHON,
     [string]$OutputDirectory = (Join-Path $PSScriptRoot 'release'),
     [string]$InnoCompiler = '',

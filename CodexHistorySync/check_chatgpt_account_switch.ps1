@@ -90,7 +90,7 @@ $ChatGptDirect = $true
 $Restart = $mode -ne 'other-profile-unconfirmed'
 $SkipSync = $true
 $LaunchRequestId = 'fixture-account-request'
-$script:starts = $script:stops = $script:syncs = $script:validations = $script:accountSyncs = 0
+$script:starts = $script:stops = $script:syncs = $script:validations = $script:accountSyncs = $script:modelPreparations = 0
 $script:lifecycleHeld = $script:historyHeld = $script:pending = $false
 $lifecycleLease = $historyWriteLease = $null
 function Set-LaunchRequest { $script:pending = $true }
@@ -131,8 +131,15 @@ function Stop-CodexApp {
 }
 function Stop-CockpitTools { throw 'Account switching must not stop unrelated services' }
 function Invoke-CanonicalHistorySync { $script:syncs++; throw 'Account switching must not use bidirectional history sync' }
+function Initialize-ChatGptOfficialModels {
+    if (-not $script:lifecycleHeld -or -not $script:historyHeld -or -not $script:stops -or $script:starts) {
+        throw 'Model preparation must run after normal app exit under both leases, before launch'
+    }
+    $script:modelPreparations++
+    if ($mode -eq 'model-prepare-fails') { throw 'Fixture official model preparation failed' }
+}
 function Invoke-ChatGptAccountHistorySync {
-    if (-not $script:lifecycleHeld -or $script:historyHeld -or -not $script:stops) {
+    if (-not $script:lifecycleHeld -or $script:historyHeld -or -not $script:stops -or $script:modelPreparations -ne 1) {
         throw 'Account history sync did not receive the safe lock handoff after normal app exit'
     }
     $script:accountSyncs++
@@ -150,19 +157,21 @@ function Start-CodexAppForProfile {
     $script:starts++
     432
 }
-function Set-ActiveProfileMarker { param($SelectedProfile,$AppProcessId) }
+function Set-ActiveProfileMarker { param($SelectedProfile,$AppProcessId,$ExpectedCreationTicks) }
 function Start-PostExitSyncWatcher { param($AppProcessId); throw 'Direct account path must not start a cross-profile history writer' }
 function Show-ProfileMessage { param($Title,$Icon,$Message) }
 function Write-ProfileLaunchResult {
     param($Status,$Phase,$AppProcessId,$ErrorText)
     @{status=$Status;phase=$Phase;starts=$script:starts;stops=$script:stops;
-      syncs=$script:syncs;accountSyncs=$script:accountSyncs;validations=$script:validations} | ConvertTo-Json -Compress
+      syncs=$script:syncs;accountSyncs=$script:accountSyncs;validations=$script:validations;
+      modelPreparations=$script:modelPreparations} | ConvertTo-Json -Compress
 }
 '@
 $cases = @(
-    @{mode='cold';status='ready';starts=1;stops=1;accountSyncs=1},
-    @{mode='account-sync-fails';status='error';starts=0;stops=1;accountSyncs=1},
-    @{mode='account-sync-busy';status='deferred';starts=0;stops=1;accountSyncs=1},
+    @{mode='cold';status='ready';starts=1;stops=1;accountSyncs=1;modelPreparations=1},
+    @{mode='model-prepare-fails';status='error';starts=0;stops=1;modelPreparations=1},
+    @{mode='account-sync-fails';status='error';starts=0;stops=1;accountSyncs=1;modelPreparations=1},
+    @{mode='account-sync-busy';status='deferred';starts=0;stops=1;accountSyncs=1;modelPreparations=1},
     @{mode='invalid-profile';status='error';starts=0;stops=0},
     @{mode='other-profile-unconfirmed';status='error';starts=0;stops=0},
     @{mode='app-refuses-close';status='error';starts=0;stops=1},
@@ -180,16 +189,57 @@ foreach ($case in $cases) {
     $result = $null
     try { $result = ([string]$lines[-1]) | ConvertFrom-Json } catch { }
     $expectedAccountSyncs = if ($case.accountSyncs) { $case.accountSyncs } else { 0 }
+    $expectedModelPreparations = if ($case.modelPreparations) { $case.modelPreparations } else { 0 }
     if (-not $result -or $result.status -ne $case.status -or $result.starts -ne $case.starts -or
         $result.stops -ne $case.stops -or $result.syncs -ne 0 -or $result.validations -ne 1 -or
-        $result.accountSyncs -ne $expectedAccountSyncs) {
+        $result.accountSyncs -ne $expectedAccountSyncs -or $result.modelPreparations -ne $expectedModelPreparations) {
         throw ('Account ' + $case.mode + ' fixture failed: ' + ($lines -join ' '))
     }
-    Write-Output ('PASS account ' + $case.mode + ' preserves config, other services, and process safety')
+    Write-Output ('PASS account ' + $case.mode + ' preserves unrelated config, other services, and process safety')
+}
+
+& {
+    . ([scriptblock]::Create((Get-ProductionFunction 'Initialize-ChatGptOfficialModels')))
+    $ChatGptDirect = $true
+    $Profile = 'Plus'
+    $canonicalPlusRoot = 'C:\fixture\plus'
+    $script:fixturePrepareCalls = $script:fixtureWarnings = 0
+    function Add-ProfileLaunchWarning { param($Message); $script:fixtureWarnings++ }
+    function Invoke-ProfileConfigValidator {
+        param($Root, $SelectedProfile, [switch]$PrepareOfficialModels)
+        if (-not $PrepareOfficialModels -or $Root -ne $canonicalPlusRoot -or $SelectedProfile -ne 'Plus') {
+            throw 'Official model preparation did not use the explicit account-only validator option'
+        }
+        $script:fixturePrepareCalls++
+        @{valid=$fixtureValid;reason='fixture';repair=@{changed=$fixtureChanged;mode='official_account_model_discovery'}}
+    }
+    $fixtureValid = $true
+    $fixtureChanged = $false
+    Initialize-ChatGptOfficialModels
+    if ($script:fixtureWarnings -ne 0) { throw 'Unchanged official discovery emitted a repair warning' }
+    $fixtureChanged = $true
+    Initialize-ChatGptOfficialModels
+    if ($script:fixtureWarnings -ne 1 -or -not $script:accountModelDiscoveryResult.changed) {
+        throw 'Successful migration was not recorded'
+    }
+    $fixtureValid = $false
+    $rejected = $false
+    try { Initialize-ChatGptOfficialModels } catch { $rejected = $true }
+    if (-not $rejected) { throw 'Failed model preparation was silently accepted' }
+    $ChatGptDirect = $false
+    $rejected = $false
+    try { Initialize-ChatGptOfficialModels } catch { $rejected = $true }
+    if (-not $rejected -or $script:fixturePrepareCalls -ne 3) {
+        throw 'Model migration leaked into a non-direct launcher'
+    }
+    Write-Output 'PASS model discovery is explicit, account-only, and reports migrations without changing read-only validation'
 }
 
 & {
     . ([scriptblock]::Create((Get-ProductionFunction 'Get-RequestedProfileApp')))
+    . ([scriptblock]::Create((Get-ProductionFunction 'Get-ProfileAppByIdentity')))
+    . ([scriptblock]::Create((Get-ProductionFunction 'Test-CodexExecutableIdentity')))
+    . ([scriptblock]::Create((Get-ProductionFunction 'Set-ProfileLaunchIdentity')))
     $ChatGptDirect = $true
     $Profile = 'Plus'
     $LaunchRequestId = 'new-click'
@@ -201,7 +251,12 @@ foreach ($case in $cases) {
         request_id='previous-click';creation_request_id='previous-click'
     }
     function Get-Content { param([switch]$Raw,$Encoding,$LiteralPath,$ErrorAction); $script:fixtureMarker | ConvertTo-Json -Compress }
-    function Get-OwnedCodexAppProcesses { [pscustomobject]@{Id=432;StartTime=$script:fixtureBirth;MainWindowHandle=123} }
+    function Get-CodexAppExecutable { 'C:\fixture\ChatGPT.exe' }
+    function Get-Process {
+        param($Id,$ErrorAction)
+        [pscustomobject]@{Id=432;StartTime=$script:fixtureBirth;MainWindowHandle=123;Path='C:\fixture\ChatGPT.exe'}
+    }
+    function Get-OwnedCodexAppProcesses { throw 'Account reuse must inspect only its recorded PID' }
     if (-not (Get-RequestedProfileApp)) { throw 'Existing verified account profile was not reused' }
     $ChatGptDirect = $false
     if (Get-RequestedProfileApp) { throw 'Legacy request identity guard changed' }

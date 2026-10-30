@@ -2,13 +2,14 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import http.client
 import json
 from pathlib import Path
+import socket
 import sys
 import tempfile
 import tomllib
 import unittest
-import urllib.error
 import urllib.request
 from unittest import mock
 
@@ -139,25 +140,45 @@ class BrowserIsolationTests(unittest.TestCase):
                 "fixture", upstream.url, prefix="fixture--", is_default=True,
             )])
             with RouterHarness(root / "providers.json", root / "auth.json", root / "router.log") as local:
+                opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
                 for headers in (
                     {"Origin": "https://untrusted.invalid"},
                     {"Origin": "null"},
                     {"Sec-Fetch-Site": "cross-site"},
                     {"Host": "rebound.invalid"},
                 ):
-                    request = urllib.request.Request(
-                        local.url + "/responses", data=b'{"model":"fixture--shared-model","input":"hi"}',
-                        headers={"Content-Type": "text/plain", **headers}, method="POST",
-                    )
-                    with self.subTest(headers=headers), self.assertRaises(urllib.error.HTTPError) as raised:
-                        urllib.request.urlopen(request, timeout=5)
-                    self.assertEqual(raised.exception.code, 403)
-                with urllib.request.urlopen(local.url + "/healthz", timeout=5) as response:
+                    body = b'{"model":"fixture--shared-model","input":"hi"}'
+                    for method, path, payload, send_body in (
+                        ("POST", "/responses", body, True),
+                        ("POST", "/responses", body, False),
+                        ("GET", "/healthz", b"", True),
+                    ):
+                        with self.subTest(headers=headers, method=method, send_body=send_body):
+                            request_headers = {
+                                "Host": f"127.0.0.1:{local.server.server_port}",
+                                "Content-Type": "text/plain", "Content-Length": str(len(payload)),
+                                "Connection": "close", **headers,
+                            }
+                            request = (f"{method} {path} HTTP/1.1\r\n" + "".join(
+                                f"{name}: {value}\r\n" for name, value in request_headers.items()
+                            ) + "\r\n").encode("ascii")
+                            # Send the tiny fixture in one write: urllib splits headers/body,
+                            # so an immediate denial can race its second send and reset the
+                            # socket on Windows. The headers-only case separately proves
+                            # denial happens without waiting for or routing the POST body.
+                            with socket.create_connection(("127.0.0.1", local.server.server_port), timeout=5) as connection:
+                                connection.sendall(request + (payload if send_body else b""))
+                                with http.client.HTTPResponse(connection) as response:
+                                    response.begin()
+                                    self.assertEqual(response.status, 403)
+                                    self.assertEqual(json.loads(response.read())["error"]["type"], "cross_origin_request_denied")
+                                    self.assertIsNone(response.headers.get("Access-Control-Allow-Origin"))
+                with opener.open(local.url + "/healthz", timeout=5) as response:
                     self.assertEqual(response.status, 200)
                     self.assertEqual(response.headers["X-Content-Type-Options"], "nosniff")
                     self.assertEqual(response.headers["Cache-Control"], "no-store")
                 same_origin = urllib.request.Request(local.url + "/healthz", headers={"Origin": local.url})
-                with urllib.request.urlopen(same_origin, timeout=5) as response:
+                with opener.open(same_origin, timeout=5) as response:
                     self.assertEqual(response.status, 200)
             self.assertEqual(upstream.requests, [])
 

@@ -66,6 +66,28 @@ class RuntimeCommandTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertIn("not found", result.stderr)
 
+    def test_account_model_preparation_works_without_system_python(self) -> None:
+        helper = ((Path(ARTIFACT) / "_internal") if ARTIFACT else ROOT) / "CodexHistorySync" / "validate_codex_profile.py"
+        with tempfile.TemporaryDirectory(prefix="sota models ") as directory:
+            root = Path(directory).resolve()
+            config = root / "config.toml"
+            retained = 'forced_login_method="chatgpt"\ncli_auth_credentials_store="file"\npersonality="none"\n'
+            original = retained + 'model_catalog_json="old.json"\nmodel="old-fixture-model"\n'
+            config.write_text(original, encoding="utf-8")
+            arguments = ("-I", "-S", "-B", str(helper), "--profile", "Plus", "--root", str(root), "--chatgpt-direct")
+            migrated = self.call_runtime(*arguments, "--prepare-official-models")
+            self.assertEqual(migrated.returncode, 0, migrated.stdout + migrated.stderr)
+            report = json.loads(migrated.stdout)
+            self.assertTrue(report["valid"])
+            self.assertTrue(report["repair"]["changed"])
+            self.assertEqual(Path(report["repair"]["backup_path"]).read_text(encoding="utf-8"), original)
+            self.assertEqual(config.read_text(encoding="utf-8"), retained)
+            self.assertFalse((root / "auth.json").exists())
+            before = config.read_bytes()
+            validated = self.call_runtime(*arguments)
+            self.assertEqual(validated.returncode, 0, validated.stdout + validated.stderr)
+            self.assertEqual(config.read_bytes(), before)
+
     def test_tcl_tk_data_is_usable_by_the_bundled_runtime(self) -> None:
         result = self.call_runtime("-c", "import tkinter; root=tkinter.Tk(); root.withdraw(); root.update_idletasks(); root.destroy(); print('tk-ready')")
         self.assertEqual(result.returncode, 0, result.stderr)

@@ -279,7 +279,7 @@ def validate_chatgpt_direct_profile(
     provider = _provider(data, "openai")
     for field in (
         "base_url", "env_key", "experimental_bearer_token", "http_headers",
-        "env_http_headers", "auth", "gateway_oauth",
+        "env_http_headers", "auth", "gateway_oauth", "model_catalog_url",
     ):
         if field in provider:
             return False, "unexpected_openai_provider_override"
@@ -287,6 +287,99 @@ def validate_chatgpt_direct_profile(
         return False, "openai_auth_disabled"
     return True, "ok"
 
+
+
+def _remove_root_assignment(text: str, field: str) -> str:
+    """Remove one root TOML value, preserving all other parsed values and text.
+
+    A regex alone could edit a profile or a line inside a multiline prompt.
+    Accept a candidate only when parsing proves the intended root-only change.
+    """
+    expected = tomllib.loads(text)
+    if field not in expected:
+        return text
+    del expected[field]
+    key = re.escape(field)
+    starts = re.compile(r'(?m)^[ \t]*(?:' + key + '|"' + key + '"|\'' + key + r"')[ \t]*=")
+    endings = [match.end() for match in re.finditer(r"\n", text)] + [len(text)]
+    for match in starts.finditer(text):
+        for end in endings:
+            if end <= match.start():
+                continue
+            candidate = text[:match.start()] + text[end:]
+            try:
+                if tomllib.loads(candidate) == expected:
+                    return candidate
+            except ValueError:
+                continue
+    raise ValueError("Cannot safely remove root model setting")
+
+
+def prepare_chatgpt_official_models(
+    root: Path, protected_root: Path | None = None
+) -> dict[str, Any]:
+    """Explicit, narrow migration; ordinary validation remains read-only.
+
+    The launcher calls this only after normal app exit, while holding its
+    lifecycle/history leases. Remove a static catalog and the model selections
+    made under it, then leave future discovery, caching, and defaults to Codex.
+    Never fetch or hard-code a model list, change credentials, or touch SOTA.
+    """
+    report: dict[str, Any] = {
+        "valid": False, "reason": "official_model_preparation_failed",
+        "mode": "official_account_model_discovery", "changed": False,
+        "removed_fields": [],
+    }
+    valid, reason = validate_chatgpt_direct_profile(root, protected_root)
+    if not valid:
+        return {**report, "reason": reason}
+    config_path = root / "config.toml"
+    temporary: Path | None = None
+    try:
+        resolved_root = root.resolve()
+        if config_path.resolve() != resolved_root / "config.toml":
+            return {**report, "reason": "config_path_outside_account_profile"}
+        auth_path = root / "auth.json"
+        if auth_path.exists():
+            auth = json.loads(auth_path.read_bytes())
+            if not isinstance(auth, dict) or auth.get("auth_mode") != "chatgpt":
+                return {**report, "reason": "incompatible_account_credentials"}
+        original = config_path.read_bytes()
+        text = original.decode("utf-8")
+        parsed = tomllib.loads(text)
+        if "model_catalog_json" not in parsed:
+            return {**report, "valid": True, "reason": "ok"}
+        removed = [field for field in ("model_catalog_json", "model", "review_model")
+                   if field in parsed]
+        for field in removed:
+            text = _remove_root_assignment(text, field)
+        # A second semantic check bounds the entire migration, not just each edit.
+        if tomllib.loads(text) != {key: value for key, value in parsed.items() if key not in removed}:
+            return {**report, "reason": "unexpected_model_config_change"}
+        if config_path.read_bytes() != original:
+            return {**report, "reason": "config_changed_during_preparation"}
+        fd, name = tempfile.mkstemp(prefix="config.toml.before-official-models-", suffix=".bak", dir=root)
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(original)
+            stream.flush()
+            os.fsync(stream.fileno())
+        report["backup_path"] = name
+        fd, name = tempfile.mkstemp(prefix=".official-model-config-", dir=root)
+        temporary = Path(name)
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(text.encode("utf-8"))
+            stream.flush()
+            os.fsync(stream.fileno())
+        if config_path.read_bytes() != original:
+            return {**report, "reason": "config_changed_during_preparation"}
+        os.replace(temporary, config_path)
+        return {**report, "valid": True, "reason": "ok", "changed": True,
+                "removed_fields": removed}
+    except (OSError, ValueError):
+        return report
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def main() -> int:
@@ -298,7 +391,12 @@ def main() -> int:
     parser.add_argument("--timeout-seconds", type=float, default=2.0)
     parser.add_argument(
         "--chatgpt-direct", action="store_true",
-        help="Read-only validation of the separate official-account profile; never repair config.",
+        help="Read-only validation of the separate official-account profile unless explicit model preparation is requested.",
+    )
+    parser.add_argument(
+        "--prepare-official-models", action="store_true",
+        help=("Explicitly back up and remove a static account model catalog and its selected models. "
+              "Requires --profile Plus --chatgpt-direct and an idle account profile; never edits credentials."),
     )
     parser.add_argument(
         "--repair",
@@ -314,7 +412,14 @@ def main() -> int:
     repair_report: dict[str, Any] | None = None
     model_provider: str | None = None
     try:
-        if args.chatgpt_direct:
+        if args.prepare_official_models:
+            if (args.profile != "Plus" or not args.chatgpt_direct or args.repair
+                    or args.probe_cockpit or args.catalog is not None):
+                valid, reason = False, "official_models_require_direct_plus_profile"
+            else:
+                repair_report = prepare_chatgpt_official_models(args.root)
+                valid, reason = repair_report["valid"], repair_report["reason"]
+        elif args.chatgpt_direct:
             if args.profile != "Plus" or args.repair or args.probe_cockpit:
                 valid, reason = False, "chatgpt_direct_requires_readonly_plus_profile"
             else:

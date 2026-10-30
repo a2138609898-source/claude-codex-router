@@ -1,5 +1,5 @@
 #ifndef AppVersion
-  #define AppVersion "0.2.1"
+  #define AppVersion "0.2.4"
 #endif
 #ifndef BundleRoot
   #error BundleRoot must point to the validated application bundle

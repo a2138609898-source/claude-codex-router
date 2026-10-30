@@ -12,7 +12,7 @@
 
 首次打开选择 Codex App 或 Claude Desktop，添加自己的供应商地址、密钥和模型，保存并应用。
 对应的官方桌面客户端需另行安装。升级安装和卸载保留个人配置；换电脑需要重新填写自己的密钥。
-[安装说明](docs/WINDOWS-INSTALL.md) · [版本记录](CHANGELOG.md) · [维护架构](docs/ARCHITECTURE.md) · [本版验证](docs/VALIDATION-0.2.3.md)
+[安装说明](docs/WINDOWS-INSTALL.md) · [版本记录](CHANGELOG.md) · [维护架构](docs/ARCHITECTURE.md) · [本版验证](docs/VALIDATION-0.2.4.md)
 
 项目当前支持 Windows 10/11、PowerShell 5.1 或 PowerShell 7、CPython 3.11+。它使用 Windows DPAPI、
 `msvcrt` 文件锁和 Win32 进程 API，因此不是跨平台项目；但源码目录可以放在任意路径，部署路径、Python
@@ -31,7 +31,11 @@ Codex 各自只能填**一个**网关地址。所以在本地立一个收口：
 
 管理器的「GPT 账号直登」使用独立账号 profile（默认 `.codex-plus`）打开同一个 Codex App；
 「切回 / 重启 SOTA」继续使用原 SOTA profile。账号登录、供应商、模型配置和密钥分开保存，
-切换不会复制凭据、重置配置或停止 SOTA 后台路由。
+切换不会复制凭据、重置供应商设置或停止 SOTA 后台路由。
+
+账号模式的模型列表、默认模型和可用权限由官方客户端自动发现，不维护固定的免费账号模型表。
+若历史配置仍引用本地静态模型目录，正常退出并取得锁后会先备份，再撤销该目录及其旧模型选择；
+其余配置不改，没有覆盖时也不会重置后续手动选择。SOTA/API 的自定义模型目录不受影响。
 
 两个方向都会在 App 及其后台完全退出后补齐本地对话：打开账号版时读取 SOTA 历史，切回 SOTA
 时返回账号侧新增及续写。已有对话 ID、名称、项目、置顶和归档状态会保留；双方独立续写时保留分支，
@@ -214,7 +218,7 @@ cd CodexSotaManager
 
 ```powershell
 .\setup.ps1
-.\Build-Release.ps1 -Version 0.2.3
+.\Build-Release.ps1 -Version 0.2.4
 ```
 
 构建需要 Inno Setup 6.4 或更新版本。输出的 `release/` 包含安装程序、便携 ZIP 和 SHA-256 校验文件。
